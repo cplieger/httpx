@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -464,10 +465,8 @@ func RedirectPolicyFunc(cfg *RedirectConfig) func(*http.Request, []*http.Request
 			return errors.New("too many redirects")
 		}
 		host := req.URL.Hostname()
-		for _, h := range cfg.AllowedHosts {
-			if host == h {
-				return nil
-			}
+		if slices.Contains(cfg.AllowedHosts, host) {
+			return nil
 		}
 		for _, s := range cfg.AllowedSuffixes {
 			if strings.HasSuffix(host, s) {
