@@ -59,7 +59,7 @@ func TestRetryOnRateLimit(t *testing.T) {
 	t.Run("success on first call", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := RetryOnRateLimit(context.Background(), 3, 5*time.Second, func() error {
+		err := RetryOnRateLimit(context.Background(), 3, 5*time.Second, func(_ context.Context) error {
 			calls++
 			return nil
 		})
@@ -75,7 +75,7 @@ func TestRetryOnRateLimit(t *testing.T) {
 		t.Parallel()
 		calls := 0
 		wantErr := errors.New("permanent failure")
-		err := RetryOnRateLimit(context.Background(), 3, 5*time.Second, func() error {
+		err := RetryOnRateLimit(context.Background(), 3, 5*time.Second, func(_ context.Context) error {
 			calls++
 			return wantErr
 		})
@@ -90,7 +90,7 @@ func TestRetryOnRateLimit(t *testing.T) {
 	t.Run("rate-limit error retries", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := RetryOnRateLimit(context.Background(), 3, 5*time.Second, func() error {
+		err := RetryOnRateLimit(context.Background(), 3, 5*time.Second, func(_ context.Context) error {
 			calls++
 			if calls < 3 {
 				return &RateLimitError{Msg: "slow", RetryAfter: time.Millisecond}
@@ -108,7 +108,7 @@ func TestRetryOnRateLimit(t *testing.T) {
 	t.Run("exhausts attempts returns last error", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := RetryOnRateLimit(context.Background(), 2, 5*time.Second, func() error {
+		err := RetryOnRateLimit(context.Background(), 2, 5*time.Second, func(_ context.Context) error {
 			calls++
 			return &RateLimitError{Msg: "slow", RetryAfter: time.Millisecond}
 		})
@@ -128,7 +128,7 @@ func TestRetryOnRateLimit(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(context.Background())
 		calls := 0
-		err := RetryOnRateLimit(ctx, 5, 5*time.Second, func() error {
+		err := RetryOnRateLimit(ctx, 5, 5*time.Second, func(_ context.Context) error {
 			calls++
 			if calls == 1 {
 				cancel()
@@ -142,7 +142,23 @@ func TestRetryOnRateLimit(t *testing.T) {
 			t.Fatalf("expected at most 2 calls with cancellation, got %d", calls)
 		}
 	})
+
+	t.Run("context is passed to fn", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.WithValue(context.Background(), ctxKey{}, "test-value")
+		err := RetryOnRateLimit(ctx, 1, time.Second, func(fnCtx context.Context) error {
+			if fnCtx.Value(ctxKey{}) != "test-value" {
+				t.Error("context not propagated to fn")
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 }
+
+type ctxKey struct{}
 
 func TestRetryWithBackoff(t *testing.T) {
 	t.Parallel()
@@ -239,4 +255,116 @@ func TestHTTPStatusError_preserves_wire_format(t *testing.T) {
 	if got != "HTTP 503" {
 		t.Errorf("HTTPStatusError{503}.Error() = %q, want %q", got, "HTTP 503")
 	}
+}
+
+func TestPermanentError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wraps and unwraps", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New("bad config")
+		pe := Permanent(inner)
+		if pe == nil {
+			t.Fatal("Permanent(non-nil) returned nil")
+		}
+		if pe.Error() != "bad config" {
+			t.Errorf("Error() = %q, want %q", pe.Error(), "bad config")
+		}
+		if !errors.Is(pe, inner) {
+			t.Error("errors.Is(pe, inner) = false")
+		}
+		var target *PermanentError
+		if !errors.As(pe, &target) {
+			t.Error("errors.As(*PermanentError) = false")
+		}
+	})
+
+	t.Run("nil returns nil", func(t *testing.T) {
+		t.Parallel()
+		if Permanent(nil) != nil {
+			t.Error("Permanent(nil) should return nil")
+		}
+	})
+
+	t.Run("IsPermanent", func(t *testing.T) {
+		t.Parallel()
+		if IsPermanent(errors.New("normal")) {
+			t.Error("normal error should not be permanent")
+		}
+		if !IsPermanent(Permanent(errors.New("x"))) {
+			t.Error("Permanent error should be permanent")
+		}
+	})
+
+	t.Run("IsTransient returns false for PermanentError", func(t *testing.T) {
+		t.Parallel()
+		pe := Permanent(&HTTPStatusError{Code: 503})
+		if IsTransient(pe) {
+			t.Error("PermanentError wrapping transient should not be transient")
+		}
+	})
+
+	t.Run("RetryWithBackoff does not retry PermanentError", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		_, err := RetryWithBackoff(context.Background(), 5, time.Millisecond, "test", func(_ context.Context) (string, error) {
+			calls++
+			return "", Permanent(errors.New("stop"))
+		})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if calls != 1 {
+			t.Errorf("calls = %d, want 1 (PermanentError not retried)", calls)
+		}
+	})
+}
+
+func TestExponentialBackoff(t *testing.T) {
+	t.Parallel()
+
+	t.Run("produces increasing delays", func(t *testing.T) {
+		t.Parallel()
+		b := NewExponentialBackoff(WithInitialInterval(10 * time.Millisecond))
+		prev := time.Duration(0)
+		for range 5 {
+			d := b.NextBackOff()
+			if d == BackoffStop {
+				t.Fatal("unexpected BackoffStop")
+			}
+			if d < prev/4 && prev > 0 {
+				t.Errorf("delay %v too small relative to prev %v", d, prev)
+			}
+			prev = d
+		}
+	})
+
+	t.Run("MaxElapsedTime stops", func(t *testing.T) {
+		t.Parallel()
+		b := NewExponentialBackoff(
+			WithInitialInterval(time.Millisecond),
+			WithMaxElapsedTime(5*time.Millisecond),
+		)
+		time.Sleep(10 * time.Millisecond)
+		d := b.NextBackOff()
+		if d != BackoffStop {
+			t.Errorf("expected BackoffStop after MaxElapsedTime, got %v", d)
+		}
+	})
+
+	t.Run("Reset restarts timer", func(t *testing.T) {
+		t.Parallel()
+		b := NewExponentialBackoff(
+			WithInitialInterval(time.Millisecond),
+			WithMaxElapsedTime(50*time.Millisecond),
+		)
+		time.Sleep(60 * time.Millisecond)
+		if d := b.NextBackOff(); d != BackoffStop {
+			t.Fatalf("expected stop, got %v", d)
+		}
+		b.Reset()
+		if d := b.NextBackOff(); d == BackoffStop {
+			t.Fatal("after Reset, should not stop immediately")
+		}
+	})
 }

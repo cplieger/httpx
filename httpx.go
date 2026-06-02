@@ -94,6 +94,125 @@ func (e *StatusError) Is(target error) bool {
 	return false
 }
 
+// --- PermanentError ---
+
+// PermanentError wraps an error to signal that it should NOT be retried,
+// regardless of other retry policies. Mirrors cenkalti/backoff.PermanentError.
+// Use Permanent(err) to wrap.
+type PermanentError struct {
+	Err error
+}
+
+func (e *PermanentError) Error() string { return e.Err.Error() }
+func (e *PermanentError) Unwrap() error { return e.Err }
+
+// Is allows errors.Is matching against other PermanentErrors.
+func (e *PermanentError) Is(target error) bool {
+	_, ok := target.(*PermanentError)
+	return ok
+}
+
+// Permanent wraps err to indicate it should never be retried.
+// Mirrors cenkalti/backoff.Permanent().
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &PermanentError{Err: err}
+}
+
+// IsPermanent reports whether err (or any wrapped error) is a *PermanentError.
+func IsPermanent(err error) bool {
+	var pe *PermanentError
+	return errors.As(err, &pe)
+}
+
+// --- Backoff strategy interface ---
+
+// Backoff is a pluggable backoff strategy. NextBackOff returns the duration to
+// wait before the next retry. Return BackoffStop to signal no more retries.
+// Mirrors cenkalti/backoff.BackOff.
+type Backoff interface {
+	// NextBackOff returns the next wait duration, or BackoffStop to stop.
+	NextBackOff() time.Duration
+	// Reset restores the strategy to its initial state.
+	Reset()
+}
+
+// BackoffStop signals that no more retries should be made.
+const BackoffStop time.Duration = -1
+
+// --- ExponentialBackoff with functional options ---
+
+// expBackoffCfg holds configuration for ExponentialBackoff.
+type expBackoffCfg struct {
+	initialInterval time.Duration
+	maxElapsedTime  time.Duration
+}
+
+// ExpBackoffOption configures an ExponentialBackoff.
+type ExpBackoffOption func(*expBackoffCfg)
+
+// WithInitialInterval sets the first backoff duration. Default: DefaultBaseDelay.
+func WithInitialInterval(d time.Duration) ExpBackoffOption {
+	return func(c *expBackoffCfg) { c.initialInterval = d }
+}
+
+// WithMaxElapsedTime caps total retry time for the backoff. Zero means no cap.
+func WithMaxElapsedTime(d time.Duration) ExpBackoffOption {
+	return func(c *expBackoffCfg) { c.maxElapsedTime = d }
+}
+
+// ExponentialBackoff implements Backoff with jittered exponential backoff.
+// This is the default strategy used throughout httpx.
+type ExponentialBackoff struct {
+	startTime       time.Time
+	initialInterval time.Duration
+	maxElapsedTime  time.Duration
+	current         time.Duration
+}
+
+// NewExponentialBackoff creates an ExponentialBackoff with functional options.
+func NewExponentialBackoff(opts ...ExpBackoffOption) *ExponentialBackoff {
+	cfg := expBackoffCfg{
+		initialInterval: DefaultBaseDelay,
+	}
+	for _, o := range opts {
+		if o != nil {
+			o(&cfg)
+		}
+	}
+	b := &ExponentialBackoff{
+		initialInterval: cfg.initialInterval,
+		maxElapsedTime:  cfg.maxElapsedTime,
+	}
+	b.Reset()
+	return b
+}
+
+// NextBackOff returns the next jittered backoff duration, or BackoffStop if
+// MaxElapsedTime has been exceeded.
+func (b *ExponentialBackoff) NextBackOff() time.Duration {
+	if b.current == 0 {
+		b.Reset()
+	}
+	if b.maxElapsedTime > 0 && time.Since(b.startTime) >= b.maxElapsedTime {
+		return BackoffStop
+	}
+	wait := JitteredBackoff(b.current)
+	b.current = SafeDouble(b.current)
+	return wait
+}
+
+// Reset restores the backoff to its initial state.
+func (b *ExponentialBackoff) Reset() {
+	if b.initialInterval <= 0 {
+		b.initialInterval = DefaultBaseDelay
+	}
+	b.current = b.initialInterval
+	b.startTime = time.Now()
+}
+
 // --- Constants ---
 
 const (
@@ -116,7 +235,9 @@ const redirectCap = 5
 // --- Retry-After parsing ---
 
 // ParseRetryAfter parses a Retry-After header value (delta-seconds or HTTP-date).
-// Returns zero for missing/malformed values. Caps at RetryAfterCap.
+// Returns zero for missing/malformed values. Caps at RetryAfterCap for safety
+// (prevents unbounded waits in retry loops). For raw uncapped values, use
+// ParseRetryAfterResponse.
 func ParseRetryAfter(h string) time.Duration {
 	if h == "" {
 		return 0
@@ -125,8 +246,12 @@ func ParseRetryAfter(h string) time.Duration {
 		if n <= 0 {
 			return 0
 		}
-		d := time.Duration(n) * time.Second
-		return min(d, RetryAfterCap)
+		// Cap before multiplication to prevent int64 overflow.
+		capSecs := int(RetryAfterCap / time.Second)
+		if n > capSecs {
+			return RetryAfterCap
+		}
+		return time.Duration(n) * time.Second
 	}
 	if t, err := http.ParseTime(h); err == nil {
 		if d := time.Until(t); d > 0 {
@@ -137,15 +262,22 @@ func ParseRetryAfter(h string) time.Duration {
 }
 
 // ParseRetryAfterResponse parses the Retry-After header from an *http.Response.
-// Returns zero if absent or unparseable. Does NOT cap (preserves raw duration).
+// Returns zero if absent or unparseable. Does NOT cap — preserves the raw
+// duration so callers (e.g., CheckHTTPStatus) can make their own decisions.
+// For capped values suitable for retry loops, use ParseRetryAfter.
 func ParseRetryAfterResponse(resp *http.Response) time.Duration {
 	ra := resp.Header.Get("Retry-After")
 	if ra == "" {
 		return 0
 	}
 	if secs, err := strconv.Atoi(ra); err == nil {
-		if secs < 0 {
+		if secs <= 0 {
 			return 0
+		}
+		// Guard against int64 overflow: max representable seconds in time.Duration.
+		const maxSecs = int(^uint(0)>>1) / int(time.Second)
+		if secs > maxSecs {
+			return time.Duration(maxSecs) * time.Second
 		}
 		return time.Duration(secs) * time.Second
 	}
@@ -184,7 +316,11 @@ func CheckHTTPStatus(resp *http.Response) error {
 
 // --- Backoff helpers ---
 
-// JitteredBackoff returns a duration in [backoff/2, backoff].
+// JitteredBackoff returns a duration in [backoff/2, backoff] using the "equal
+// jitter" strategy (per AWS Builders' Library). Full jitter and decorrelated
+// jitter are intentionally not provided — equal jitter is the recommended
+// default for HTTP retry as it avoids thundering herd while maintaining a
+// minimum backoff floor.
 func JitteredBackoff(backoff time.Duration) time.Duration {
 	if backoff <= 0 {
 		return backoff
@@ -224,10 +360,13 @@ func SleepCtx(ctx context.Context, d time.Duration) error {
 // --- Transient classification ---
 
 // IsTransient returns true for errors likely caused by temporary server or
-// network issues worth retrying. Auth, rate-limit, and context errors are
-// never transient.
+// network issues worth retrying. Auth, rate-limit, permanent, and context
+// errors are never transient.
 func IsTransient(err error) bool {
 	if err == nil {
+		return false
+	}
+	if IsPermanent(err) {
 		return false
 	}
 	var authErr *AuthError
@@ -262,6 +401,8 @@ func IsTransient(err error) bool {
 
 // RetryWithBackoff retries fn up to maxRetries times with jittered exponential
 // backoff. Non-transient errors are returned immediately.
+// Logging uses slog.Default() and cannot be overridden per-call; control output
+// via slog.SetDefault().
 func RetryWithBackoff[T any](ctx context.Context, maxRetries int, baseDelay time.Duration,
 	label string, fn func(ctx context.Context) (T, error)) (T, error) {
 	var zero T
@@ -299,10 +440,11 @@ func RetryWithBackoff[T any](ctx context.Context, maxRetries int, baseDelay time
 
 // RetryOnRateLimit retries fn up to maxAttempts times when it returns a
 // *RateLimitError. Non-rate-limit errors are returned immediately.
-func RetryOnRateLimit(ctx context.Context, maxAttempts int, maxWait time.Duration, fn func() error) error {
+// The context is passed to fn on each attempt.
+func RetryOnRateLimit(ctx context.Context, maxAttempts int, maxWait time.Duration, fn func(ctx context.Context) error) error {
 	var lastErr error
 	for attempt := range maxAttempts {
-		lastErr = fn()
+		lastErr = fn(ctx)
 		if lastErr == nil {
 			return nil
 		}
@@ -324,103 +466,166 @@ func RetryOnRateLimit(ctx context.Context, maxAttempts int, maxWait time.Duratio
 	return lastErr
 }
 
-// --- HTTP GET with retry (from registry-stats) ---
+// --- HTTP GET with retry (functional options) ---
 
-// Options configures a single Retry call.
-type Options struct {
-	SetHeaders   func(*http.Request)
-	BaseDelay    time.Duration
-	MaxAttempts  int
-	MaxBodyBytes int64
+// retryCfg holds internal configuration for a single Retry call.
+type retryCfg struct {
+	setHeaders   func(*http.Request)
+	logger       *slog.Logger
+	baseDelay    time.Duration
+	maxBodyBytes int64
+	maxAttempts  int
+}
+
+// Option configures a Retry call.
+type Option func(*retryCfg)
+
+// WithMaxAttempts sets the maximum number of attempts (including the first).
+// Default: DefaultMaxAttempts (3).
+func WithMaxAttempts(n int) Option {
+	return func(c *retryCfg) { c.maxAttempts = n }
+}
+
+// WithBaseDelay sets the initial backoff delay. Default: DefaultBaseDelay (1s).
+func WithBaseDelay(d time.Duration) Option {
+	return func(c *retryCfg) { c.baseDelay = d }
+}
+
+// WithMaxBodyBytes sets the maximum response body size to read.
+// Default: DefaultMaxBodyBytes (10 MB).
+func WithMaxBodyBytes(n int64) Option {
+	return func(c *retryCfg) { c.maxBodyBytes = n }
+}
+
+// WithHeaders sets a function that is called to set headers on each request.
+func WithHeaders(fn func(*http.Request)) Option {
+	return func(c *retryCfg) { c.setHeaders = fn }
+}
+
+// WithLogger sets the logger for retry diagnostics. Default: slog.Default().
+func WithLogger(l *slog.Logger) Option {
+	return func(c *retryCfg) { c.logger = l }
 }
 
 // Retry performs an HTTP GET with bounded exponential-backoff retry on
 // 429 and 5xx responses. 4xx (non-429) and transport errors are returned
 // immediately. Honors Retry-After (capped at RetryAfterCap).
-func Retry(ctx context.Context, client *http.Client, reqURL string, opts Options) ([]byte, error) {
-	maxAttempts := opts.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = DefaultMaxAttempts
+func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Option) ([]byte, error) {
+	cfg := retryCfg{
+		maxAttempts:  DefaultMaxAttempts,
+		baseDelay:    DefaultBaseDelay,
+		maxBodyBytes: DefaultMaxBodyBytes,
 	}
-	baseDelay := opts.BaseDelay
-	if baseDelay <= 0 {
-		baseDelay = DefaultBaseDelay
+	for _, o := range opts {
+		if o != nil {
+			o(&cfg)
+		}
 	}
-	maxBody := opts.MaxBodyBytes
-	if maxBody <= 0 {
-		maxBody = DefaultMaxBodyBytes
+	if cfg.maxAttempts <= 0 {
+		cfg.maxAttempts = DefaultMaxAttempts
+	}
+	if cfg.baseDelay <= 0 {
+		cfg.baseDelay = DefaultBaseDelay
+	}
+	if cfg.maxBodyBytes <= 0 {
+		cfg.maxBodyBytes = DefaultMaxBodyBytes
+	}
+	log := cfg.logger
+	if log == nil {
+		log = slog.Default()
 	}
 
 	start := time.Now()
 	var lastErr error
 	var overrideWait time.Duration
-	for attempt := range maxAttempts {
+	backoff := cfg.baseDelay
+	for attempt := range cfg.maxAttempts {
 		if attempt > 0 {
 			delay := overrideWait
 			if delay <= 0 {
-				delay = time.Duration(1<<attempt)*baseDelay +
-					time.Duration(rand.IntN(500))*time.Millisecond //nolint:gosec // G404: backoff jitter
+				delay = JitteredBackoff(backoff)
 			}
-			overrideWait = 0
-			timer := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return nil, ctx.Err()
-			case <-timer.C:
+			if err := SleepCtx(ctx, delay); err != nil {
+				return nil, err
 			}
+			backoff = SafeDouble(backoff)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+		body, retryAfter, err := retryAttempt(ctx, client, reqURL, &cfg)
+		if body != nil {
+			if elapsed := time.Since(start); elapsed > 10*time.Second {
+				log.Warn("slow upstream response", "url", reqURL, "duration", elapsed.Round(time.Millisecond))
+			}
+			return body, nil
 		}
-		if opts.SetHeaders != nil {
-			opts.SetHeaders(req)
+		if err != nil && !isRetryStatus(err) {
+			return nil, err
 		}
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			slog.Debug("http request failed, will retry",
-				"url", reqURL, "attempt", attempt+1, "max_attempts", maxAttempts, "error", err)
-			continue
-		}
-		if resp.StatusCode == http.StatusTooManyRequests {
-			overrideWait = ParseRetryAfter(resp.Header.Get("Retry-After"))
-			slog.Debug("rate limited by upstream",
-				"url", reqURL, "attempt", attempt+1, "retry_after", overrideWait)
-			Drain(resp.Body)
-			resp.Body.Close()
-			lastErr = &StatusError{Code: resp.StatusCode, URL: reqURL}
-			continue
-		}
-		if resp.StatusCode >= 500 {
-			Drain(resp.Body)
-			resp.Body.Close()
-			lastErr = &StatusError{Code: resp.StatusCode, URL: reqURL}
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			Drain(resp.Body)
-			resp.Body.Close()
-			return nil, &StatusError{Code: resp.StatusCode, URL: reqURL}
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("read response: %w", err)
-		}
-		if elapsed := time.Since(start); elapsed > 10*time.Second {
-			slog.Warn("slow upstream response", "url", reqURL, "duration", elapsed.Round(time.Millisecond))
-		}
-		return body, nil
+		lastErr = err
+		overrideWait = retryAfter
+		log.Debug("http request failed, will retry",
+			"url", reqURL, "attempt", attempt+1, "max_attempts", cfg.maxAttempts, "error", err)
 	}
 	elapsed := time.Since(start)
-	slog.Warn("http retries exhausted",
-		"url", reqURL, "attempts", maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", lastErr)
+	log.Warn("http retries exhausted",
+		"url", reqURL, "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", lastErr)
 	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), lastErr)
 }
 
-// --- Body drain ---
+// retryAttempt performs a single HTTP GET attempt. Returns (body, 0, nil) on
+// success, (nil, retryAfter, err) on retryable failure, or (nil, 0, err) on
+// permanent failure.
+func retryAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *retryCfg) ([]byte, time.Duration, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
+	if err != nil {
+		return nil, 0, fmt.Errorf("create request: %w", err)
+	}
+	if cfg.setHeaders != nil {
+		cfg.setHeaders(req)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if !IsTransient(err) {
+			return nil, 0, err
+		}
+		return nil, 0, &retryableError{err: err}
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		ra := ParseRetryAfter(resp.Header.Get("Retry-After"))
+		Drain(resp.Body)
+		resp.Body.Close()
+		return nil, ra, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}
+	}
+	if resp.StatusCode >= 500 {
+		Drain(resp.Body)
+		resp.Body.Close()
+		return nil, 0, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}
+	}
+	if resp.StatusCode != http.StatusOK {
+		Drain(resp.Body)
+		resp.Body.Close()
+		return nil, 0, &StatusError{Code: resp.StatusCode, URL: reqURL}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, cfg.maxBodyBytes))
+	resp.Body.Close()
+	if err != nil {
+		return nil, 0, fmt.Errorf("read response: %w", err)
+	}
+	return body, 0, nil
+}
+
+// retryableError is an internal marker for errors that should be retried.
+type retryableError struct{ err error }
+
+func (e *retryableError) Error() string { return e.err.Error() }
+func (e *retryableError) Unwrap() error { return e.err }
+
+// isRetryStatus reports whether an error from retryAttempt is retryable.
+func isRetryStatus(err error) bool {
+	var re *retryableError
+	return errors.As(err, &re)
+}
+
+// --- Body helpers ---
 
 // Drain reads and discards up to 64 KB of a response body to enable
 // HTTP connection reuse.
@@ -430,33 +635,68 @@ func Drain(body io.ReadCloser) {
 	}
 }
 
-// DrainClose reads remaining bytes (up to 4 KB) from rc before closing it.
+// DrainClose reads remaining bytes (up to drainLimit) from rc before closing it.
 func DrainClose(rc io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(rc, 4096))
+	_, _ = io.Copy(io.Discard, io.LimitReader(rc, drainLimit))
 	rc.Close()
 }
 
-// --- Redirect allowlist ---
+// LimitedBody wraps resp.Body with an io.LimitReader capped at limit bytes,
+// preserving the original Close method.
+func LimitedBody(resp *http.Response, limit int64) io.ReadCloser {
+	return &limitedReadCloser{
+		Reader: io.LimitReader(resp.Body, limit),
+		Closer: resp.Body,
+	}
+}
 
-// RedirectConfig holds the configurable redirect policy settings.
-type RedirectConfig struct {
-	// AllowedHosts is the set of exact hostnames allowed as redirect targets.
-	AllowedHosts []string
-	// AllowedSuffixes is the set of domain suffixes allowed (e.g. ".docker.com").
-	AllowedSuffixes []string
-	// MaxHops is the maximum number of redirect hops (default: 5).
-	MaxHops int
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// --- Redirect allowlist (functional options) ---
+
+// redirectCfg holds internal configuration for the redirect policy.
+type redirectCfg struct {
+	allowedHosts    []string
+	allowedSuffixes []string
+	maxHops         int
+}
+
+// RedirectOption configures a redirect policy created by RedirectPolicyFunc.
+type RedirectOption func(*redirectCfg)
+
+// WithAllowedHosts sets the exact hostnames allowed as redirect targets.
+func WithAllowedHosts(hosts ...string) RedirectOption {
+	return func(c *redirectCfg) { c.allowedHosts = hosts }
+}
+
+// WithAllowedSuffixes sets the domain suffixes allowed (e.g. ".docker.com").
+func WithAllowedSuffixes(suffixes ...string) RedirectOption {
+	return func(c *redirectCfg) { c.allowedSuffixes = suffixes }
+}
+
+// WithMaxHops sets the maximum number of redirect hops. Default: 5.
+func WithMaxHops(n int) RedirectOption {
+	return func(c *redirectCfg) { c.maxHops = n }
 }
 
 // RedirectPolicyFunc returns a CheckRedirect function configured with the
-// given allowlist. If cfg is nil, all redirects are refused.
-func RedirectPolicyFunc(cfg *RedirectConfig) func(*http.Request, []*http.Request) error {
-	if cfg == nil {
+// given options. With no options, all redirects are refused.
+func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Request) error {
+	cfg := redirectCfg{}
+	for _, o := range opts {
+		if o != nil {
+			o(&cfg)
+		}
+	}
+	if len(cfg.allowedHosts) == 0 && len(cfg.allowedSuffixes) == 0 {
 		return func(_ *http.Request, _ []*http.Request) error {
 			return errors.New("redirects not allowed")
 		}
 	}
-	maxHops := cfg.MaxHops
+	maxHops := cfg.maxHops
 	if maxHops <= 0 {
 		maxHops = redirectCap
 	}
@@ -465,10 +705,10 @@ func RedirectPolicyFunc(cfg *RedirectConfig) func(*http.Request, []*http.Request
 			return errors.New("too many redirects")
 		}
 		host := req.URL.Hostname()
-		if slices.Contains(cfg.AllowedHosts, host) {
+		if slices.Contains(cfg.allowedHosts, host) {
 			return nil
 		}
-		for _, s := range cfg.AllowedSuffixes {
+		for _, s := range cfg.allowedSuffixes {
 			if strings.HasSuffix(host, s) {
 				return nil
 			}
@@ -477,9 +717,27 @@ func RedirectPolicyFunc(cfg *RedirectConfig) func(*http.Request, []*http.Request
 	}
 }
 
-// RedirectPolicy is a default redirect policy allowing docker.com and github.com.
+// DefaultRedirectPolicy is the default redirect policy: it denies cross-host
+// redirects, allowing only redirects to the same host as the original request.
 // For custom allowlists, use RedirectPolicyFunc.
-func RedirectPolicy(req *http.Request, via []*http.Request) error {
+func DefaultRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if len(via) >= redirectCap {
+		return errors.New("too many redirects")
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	origHost := via[0].URL.Hostname()
+	if req.URL.Hostname() == origHost {
+		return nil
+	}
+	return fmt.Errorf("refusing redirect to %s", req.URL.Hostname())
+}
+
+// DockerGitHubRedirectPolicy is an OPTIONAL example redirect policy allowing
+// docker.com and github.com hosts. Use it by assigning to Client.CheckRedirect
+// or pass RedirectOption values to RedirectPolicyFunc for other allowlists.
+func DockerGitHubRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) >= redirectCap {
 		return errors.New("too many redirects")
 	}
@@ -496,15 +754,23 @@ func RedirectPolicy(req *http.Request, via []*http.Request) error {
 	}
 }
 
+// RedirectPolicy is a legacy alias for DockerGitHubRedirectPolicy, kept for
+// backward compatibility. New code should use DefaultRedirectPolicy (same-host
+// only, used by NewClient) or DockerGitHubRedirectPolicy explicitly.
+//
+// Deprecated: Use DefaultRedirectPolicy or DockerGitHubRedirectPolicy directly.
+var RedirectPolicy = DockerGitHubRedirectPolicy
+
 // --- Client helpers ---
 
-// NewClient returns an *http.Client with the given timeout and the default
-// RedirectPolicy. For custom redirect allowlists, configure CheckRedirect
-// with RedirectPolicyFunc.
+// NewClient returns an *http.Client with the given timeout and the
+// DefaultRedirectPolicy (same-host only). For custom redirect allowlists,
+// configure CheckRedirect with RedirectPolicyFunc or assign
+// DockerGitHubRedirectPolicy.
 func NewClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:       timeout,
-		CheckRedirect: RedirectPolicy,
+		CheckRedirect: DefaultRedirectPolicy,
 	}
 }
 

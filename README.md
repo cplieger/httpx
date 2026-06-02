@@ -1,43 +1,154 @@
 # httpx
+
+[![CI](https://github.com/cplieger/httpx/actions/workflows/ci.yaml/badge.svg)](https://github.com/cplieger/httpx/actions/workflows/ci.yaml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx.svg)](https://pkg.go.dev/github.com/cplieger/httpx)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
+
 > Resilient outbound-HTTP toolkit for Go: retry, backoff, transient-error classification, and more.
 
-A standalone library extracted from subflux and registry-stats providing jittered exponential backoff, transient-error classification, Retry-After parsing, HTTP status mapping, secret redaction, body draining, and a configurable redirect allowlist. Zero dependencies beyond the Go standard library and pgregory.net/rapid (test only).
+A resilient outbound-HTTP toolkit for Go providing jittered exponential backoff, transient-error classification, Retry-After parsing, HTTP status mapping, secret redaction, body draining, a transparent retrying `http.RoundTripper` with body replay, and a configurable redirect allowlist. Zero dependencies beyond the Go standard library and pgregory.net/rapid (test only).
 
 ## Install
-<!-- TODO: registry/pull link -->
+
 `go get github.com/cplieger/httpx@latest`
 
 ## Usage
 ```go
 // Simple GET with retry
-body, err := httpx.Retry(ctx, http.DefaultClient, url, httpx.Options{
-    MaxAttempts: 3,
-    BaseDelay:   time.Second,
-})
+body, err := httpx.Retry(ctx, http.DefaultClient, url,
+    httpx.WithMaxAttempts(3),
+    httpx.WithBaseDelay(time.Second),
+)
 
 // Generic retry with backoff
 result, err := httpx.RetryWithBackoff(ctx, 3, time.Second, "fetch", func(ctx context.Context) (T, error) {
     return doWork(ctx)
 })
 
+// Transparent retrying RoundTripper (mirrors hashicorp/go-retryablehttp)
+rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
+    httpx.WithMaxRetries(3),
+    httpx.WithRTBaseDelay(time.Second),
+    httpx.WithOnRetry(func(attempt int, req *http.Request, resp *http.Response, err error) {
+        log.Printf("retry #%d for %s", attempt, req.URL)
+    }),
+    httpx.WithPrepareRetry(func(req *http.Request) error {
+        req.Header.Set("Authorization", "Bearer "+freshToken())
+        return nil
+    }),
+)
+client := rt.StandardClient()
+
+// Retry POST/PUT with body replay (opt-in, mirrors go-retryablehttp)
+rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
+    httpx.WithMaxRetries(3),
+    httpx.WithRetryNonIdempotent(true),
+)
+client := rt.StandardClient()
+payload := []byte(`{"key":"value"}`)
+req, _ := http.NewRequest("POST", url, bytes.NewReader(payload))
+req.GetBody = func() (io.ReadCloser, error) {
+    return io.NopCloser(bytes.NewReader(payload)), nil
+}
+resp, err := client.Do(req)
+
+// PermanentError — signal "do not retry" (mirrors cenkalti/backoff)
+if configErr != nil {
+    return httpx.Permanent(configErr) // will not be retried
+}
+
+// Pluggable backoff strategy
+rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
+    httpx.WithBackoff(httpx.NewExponentialBackoff(
+        httpx.WithInitialInterval(500*time.Millisecond),
+        httpx.WithMaxElapsedTime(30*time.Second),
+    )),
+)
+
+// Custom redirect policy
+policy := httpx.RedirectPolicyFunc(
+    httpx.WithAllowedHosts("api.example.com"),
+    httpx.WithAllowedSuffixes(".cdn.example.com"),
+    httpx.WithMaxHops(3),
+)
+
 // Transient error classification
 if httpx.IsTransient(err) { /* safe to retry */ }
+
+// Limit response body size
+rc := httpx.LimitedBody(resp, 1<<20) // 1 MB cap
+defer rc.Close()
 ```
 
 ## API
-- `Retry` — HTTP GET with exponential backoff on 429/5xx
+
+### Retry
+- `Retry` — HTTP GET with exponential backoff on 429/5xx (functional options: `WithMaxAttempts`, `WithBaseDelay`, `WithMaxBodyBytes`, `WithHeaders`, `WithLogger`)
 - `RetryWithBackoff[T]` — generic retry with jittered exponential backoff
-- `RetryOnRateLimit` — retry on `*RateLimitError` only
-- `IsTransient` — classify errors as transient (retryable)
+- `RetryOnRateLimit` — retry on `*RateLimitError` only (passes ctx to fn)
+- `NewRetryRoundTripper` — create a retrying `http.RoundTripper` (functional options: `WithMaxRetries`, `WithRTBaseDelay`, `WithRTMaxElapsedTime`, `WithBackoff`, `WithCheckRetry`, `WithOnRetry`, `WithPrepareRetry`, `WithRetryNonIdempotent`)
+- `StandardClient()` — returns `*http.Client` using the `RetryRoundTripper`
+
+### Hooks & Policies
+- `CheckRetry` — pluggable retry policy: `func(ctx, resp, err) (bool, error)`
+- `OnRetry` — per-attempt callback for observability/metrics
+- `PrepareRetry` — mutate request before retry (e.g., re-sign tokens)
+
+### Backoff Strategy
+- `Backoff` — pluggable backoff interface: `NextBackOff() time.Duration` + `Reset()` (mirrors cenkalti/backoff)
+- `NewExponentialBackoff` — create jittered exponential backoff (functional options: `WithInitialInterval`, `WithMaxElapsedTime`)
+- `BackoffStop` — sentinel value to signal "stop retrying"
+
+### Error Control
+- `Permanent(err)` — wrap error to signal "do not retry" (mirrors cenkalti/backoff)
+- `IsPermanent(err)` — check if error is wrapped as permanent
+- `PermanentError` — the wrapper type (supports `errors.Is`/`errors.As`/`Unwrap`)
+
+### Classification & Parsing
+- `IsTransient` — classify errors as transient (retryable); respects `PermanentError`
 - `CheckHTTPStatus` — map HTTP status to typed errors
 - `ParseRetryAfter` / `ParseRetryAfterResponse` — parse Retry-After header
-- `JitteredBackoff` / `SafeDouble` / `SleepCtx` — backoff primitives
-- `Drain` / `DrainClose` — body drain for connection reuse
-- `RedirectPolicy` / `RedirectPolicyFunc` — configurable redirect allowlist
+
+### Backoff Primitives
+- `JitteredBackoff` — equal jitter `[backoff/2, backoff]`
+- `SafeDouble` / `SleepCtx` — overflow-safe doubling, context-aware sleep
+
+### Body Helpers
+- `Drain` / `DrainClose` — body drain for connection reuse (64 KB limit)
+- `LimitedBody` — wrap response body with a size cap
+
+### Redirect Policies
+- `DefaultRedirectPolicy` — same-host-only redirect policy (used by `NewClient`)
+- `DockerGitHubRedirectPolicy` — optional example policy for docker.com/github.com
+- `RedirectPolicyFunc` — build a custom redirect allowlist (functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithMaxHops`)
+
+### Client Helpers
 - `NewClient` / `Close` — preconfigured HTTP client
+
+### Secret Redaction
 - `RedactTransportError` / `RedactSecret` — secret redaction
-- `AuthError` / `RateLimitError` / `HTTPStatusError` / `StatusError` — error types
+
+### Error Types
+- `AuthError` / `RateLimitError` / `HTTPStatusError` / `StatusError`
 - `ErrRateLimited` / `ErrServerError` — sentinel errors
+- `PermanentError` — do-not-retry sentinel wrapper
+
+## Logging
+
+`Retry` logs via `log/slog`. Pass `WithLogger` to override the default logger for `Retry` calls. `RetryWithBackoff` and `Drain` use `slog.Default()` and cannot be overridden per-call.
+
+## Unsupported by Design (SKIP List)
+
+The following features are intentionally not provided:
+
+| Feature | Rationale |
+|---------|-----------|
+| Circuit breaker | Orthogonal pattern excluded by all comparables. Compose externally with sony/gobreaker. |
+| Retry budget / token bucket | None of the comparables implement it. Disproportionate complexity (~150 LOC + shared mutable state) for a focused library. |
+| Multiple jitter strategies (full, decorrelated) | Equal jitter is the recommended default per AWS Builders' Library. Full jitter risks near-zero delays. |
+| `ErrorHandler` for exhaustion | Current `fmt.Errorf("retries exhausted: %w", lastErr)` is sufficient. Callers unwrap. |
+| Response body on error | Adds API complexity (ownership of body close). Use `RetryWithBackoff[T]` with custom logic. |
+| Idempotency key injection | Application-level concern, not a retry library's responsibility. |
 
 ## License
 GPL-3.0 — see [LICENSE](LICENSE).

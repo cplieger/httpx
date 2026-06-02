@@ -16,8 +16,8 @@ import (
 	"github.com/cplieger/httpx"
 )
 
-func shortOpts() httpx.Options {
-	return httpx.Options{BaseDelay: time.Millisecond, MaxBodyBytes: 10 << 20}
+func shortOpts() []httpx.Option {
+	return []httpx.Option{httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(10 << 20)}
 }
 
 func TestRetry_success_first_try(t *testing.T) {
@@ -26,7 +26,7 @@ func TestRetry_success_first_try(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts())
+	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err != nil {
 		t.Fatalf("Retry: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestRetry_error_status_fails_fast(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()); err == nil {
+	if _, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...); err == nil {
 		t.Error("expected error for 404")
 	}
 }
@@ -69,7 +69,7 @@ func TestRetry_recovers_after_retryable_status(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts())
+			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 			if err != nil {
 				t.Fatalf("Retry after retry = %v, want nil", err)
 			}
@@ -91,7 +91,7 @@ func TestRetry_exhausts_on_persistent_failure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts())
+	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatalf("Retry after all retries = nil, want error")
 	}
@@ -123,8 +123,7 @@ func TestRetry_aborts_on_context_cancellation(t *testing.T) {
 		cancel()
 	}()
 
-	opts := httpx.Options{BaseDelay: 100 * time.Millisecond, MaxBodyBytes: 10 << 20}
-	_, err := httpx.Retry(ctx, srv.Client(), srv.URL, opts)
+	_, err := httpx.Retry(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(100*time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
 	if err == nil {
 		t.Fatalf("Retry after ctx cancel = nil, want error")
 	}
@@ -145,8 +144,7 @@ func TestRetry_body_size_limit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	opts := httpx.Options{BaseDelay: time.Millisecond, MaxBodyBytes: 10 << 20}
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, opts)
+	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
 	if err != nil {
 		t.Fatalf("Retry: %v", err)
 	}
@@ -169,7 +167,7 @@ func TestRetry_honors_retry_after(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts())
+	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("Retry = %v, want nil", err)
@@ -259,12 +257,11 @@ func TestRedirectPolicy(t *testing.T) {
 }
 
 func TestRedirectPolicyFunc(t *testing.T) {
-	cfg := &httpx.RedirectConfig{
-		AllowedHosts:    []string{"example.com"},
-		AllowedSuffixes: []string{".example.org"},
-		MaxHops:         3,
-	}
-	policy := httpx.RedirectPolicyFunc(cfg)
+	policy := httpx.RedirectPolicyFunc(
+		httpx.WithAllowedHosts("example.com"),
+		httpx.WithAllowedSuffixes(".example.org"),
+		httpx.WithMaxHops(3),
+	)
 
 	makeReq := func(host string) *http.Request {
 		u, _ := url.Parse("https://" + host + "/path")
@@ -302,10 +299,10 @@ func TestRedirectPolicyFunc(t *testing.T) {
 		})
 	}
 
-	// nil config refuses all
-	nilPolicy := httpx.RedirectPolicyFunc(nil)
+	// no options refuses all
+	nilPolicy := httpx.RedirectPolicyFunc()
 	if err := nilPolicy(makeReq("example.com"), nil); err == nil {
-		t.Error("nil config should refuse all redirects")
+		t.Error("no-options policy should refuse all redirects")
 	}
 }
 
@@ -317,9 +314,17 @@ func TestNewClient_wires_timeout_and_redirect_policy(t *testing.T) {
 	if c.CheckRedirect == nil {
 		t.Fatal("CheckRedirect is nil")
 	}
-	u, _ := url.Parse("https://evil.com/x")
-	if err := c.CheckRedirect(&http.Request{URL: u}, nil); err == nil {
+	// DefaultRedirectPolicy denies cross-host redirects.
+	origURL, _ := url.Parse("https://example.com/start")
+	redirURL, _ := url.Parse("https://evil.com/x")
+	via := []*http.Request{{URL: origURL}}
+	if err := c.CheckRedirect(&http.Request{URL: redirURL}, via); err == nil {
 		t.Error("CheckRedirect(evil.com) = nil, want error")
+	}
+	// Same-host redirect is allowed.
+	sameURL, _ := url.Parse("https://example.com/other")
+	if err := c.CheckRedirect(&http.Request{URL: sameURL}, via); err != nil {
+		t.Errorf("CheckRedirect(same host) = %v, want nil", err)
 	}
 }
 
@@ -413,7 +418,7 @@ func TestCheckHTTPStatus_429_parses_http_date(t *testing.T) {
 	}
 }
 
-// --- StatusError tests from registry-stats ---
+// --- StatusError tests ---
 
 func TestStatusError_Error(t *testing.T) {
 	err := &httpx.StatusError{Code: 503, URL: "http://example.com/x"}
@@ -472,7 +477,7 @@ func TestRetry_returns_typed_StatusError_on_exhaustion(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts())
+	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -494,7 +499,7 @@ func TestRetry_returns_typed_StatusError_rate_limited(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts())
+	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -509,7 +514,7 @@ func TestRetry_4xx_returns_typed_StatusError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts())
+	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -525,6 +530,77 @@ func TestRetry_4xx_returns_typed_StatusError(t *testing.T) {
 	}
 }
 
+func TestDefaultRedirectPolicy_same_host_allowed(t *testing.T) {
+	origURL, _ := url.Parse("https://example.com/start")
+	redirURL, _ := url.Parse("https://example.com/other")
+	via := []*http.Request{{URL: origURL}}
+	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, via); err != nil {
+		t.Errorf("same-host redirect should be allowed, got %v", err)
+	}
+}
+
+func TestDefaultRedirectPolicy_cross_host_refused(t *testing.T) {
+	origURL, _ := url.Parse("https://example.com/start")
+	redirURL, _ := url.Parse("https://evil.com/x")
+	via := []*http.Request{{URL: origURL}}
+	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, via); err == nil {
+		t.Error("cross-host redirect should be refused")
+	}
+}
+
+func TestDefaultRedirectPolicy_first_redirect_no_via(t *testing.T) {
+	redirURL, _ := url.Parse("https://anywhere.com/x")
+	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, nil); err != nil {
+		t.Errorf("first redirect (no via) should be allowed, got %v", err)
+	}
+}
+
+func TestDefaultRedirectPolicy_too_many_hops(t *testing.T) {
+	origURL, _ := url.Parse("https://example.com/start")
+	redirURL, _ := url.Parse("https://example.com/x")
+	via := make([]*http.Request, 5)
+	for i := range via {
+		via[i] = &http.Request{URL: origURL}
+	}
+	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, via); err == nil {
+		t.Error("should refuse after 5 hops")
+	}
+}
+
+func TestLimitedBody_limits_read(t *testing.T) {
+	body := io.NopCloser(strings.NewReader("hello world, this is a long body"))
+	resp := &http.Response{Body: body}
+	lr := httpx.LimitedBody(resp, 5)
+	data, err := io.ReadAll(lr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("got %q, want %q", data, "hello")
+	}
+}
+
+func TestLimitedBody_close_propagates(t *testing.T) {
+	closed := false
+	body := &trackingCloser{Reader: strings.NewReader("data"), onClose: func() { closed = true }}
+	resp := &http.Response{Body: body}
+	lr := httpx.LimitedBody(resp, 100)
+	lr.Close()
+	if !closed {
+		t.Error("Close did not propagate to underlying body")
+	}
+}
+
+type trackingCloser struct {
+	io.Reader
+	onClose func()
+}
+
+func (tc *trackingCloser) Close() error {
+	tc.onClose()
+	return nil
+}
+
 func TestRetry_non200_statusCodes(t *testing.T) {
 	tests := []struct {
 		status int
@@ -538,7 +614,7 @@ func TestRetry_non200_statusCodes(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts())
+			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 			if err == nil {
 				t.Fatalf("nil error for status %d", tt.status)
 			}
@@ -552,3 +628,22 @@ func TestRetry_non200_statusCodes(t *testing.T) {
 		})
 	}
 }
+
+func TestRetry_non_transient_transport_error_fails_fast(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return nil, errors.New("permanent transport failure")
+		}),
+	}
+	_, err := httpx.Retry(t.Context(), client, "http://example.com/test", shortOpts()...)
+	if err == nil {
+		t.Fatal("expected error for non-transient transport error")
+	}
+	if strings.Contains(err.Error(), "retries exhausted") {
+		t.Error("non-transient transport error should fail fast, not exhaust retries")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
