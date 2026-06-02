@@ -100,8 +100,13 @@ func FuzzRedactTransportError(f *testing.F) {
 			}
 			return
 		}
-		if secret != "" && result != nil && !strings.Contains("REDACTED", secret) {
-			if strings.Contains(result.Error(), secret) {
+		if secret != "" && result != nil {
+			// Secrets are replaced by the "REDACTED" marker; strip the markers
+			// before checking so a substring incidentally formed by the marker and
+			// surrounding text (e.g. secret " R" in "...: REDACTED") is not a false
+			// positive. A genuine leak survives outside the marker.
+			stripped := strings.ReplaceAll(result.Error(), "REDACTED", "")
+			if strings.Contains(stripped, secret) {
 				t.Fatalf("output leaks secret: %q", result.Error())
 			}
 		}
