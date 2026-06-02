@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"math"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,26 @@ func FuzzParseRetryAfter(f *testing.F) {
 	})
 }
 
+func FuzzParseRetryAfterResponse(f *testing.F) {
+	f.Add("")
+	f.Add("60")
+	f.Add("-1")
+	f.Add("0")
+	f.Add("3600")
+	f.Add("garbage!@#$%")
+
+	f.Fuzz(func(t *testing.T, val string) {
+		resp := &http.Response{Header: http.Header{}}
+		if val != "" {
+			resp.Header.Set("Retry-After", val)
+		}
+		d := ParseRetryAfterResponse(resp)
+		if d < 0 {
+			t.Fatalf("ParseRetryAfterResponse(%q) returned negative: %v", val, d)
+		}
+	})
+}
+
 func FuzzRedactTransportError(f *testing.F) {
 	f.Add("connection refused", "prefix", "mykey123")
 	f.Add("", "prefix", "")
@@ -79,9 +100,9 @@ func FuzzRedactTransportError(f *testing.F) {
 			}
 			return
 		}
-		if secret != "" && result != nil {
+		if secret != "" && result != nil && !strings.Contains("REDACTED", secret) {
 			if strings.Contains(result.Error(), secret) {
-				t.Fatalf("output contains secret: %q", result.Error())
+				t.Fatalf("output leaks secret: %q", result.Error())
 			}
 		}
 	})
