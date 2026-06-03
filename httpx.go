@@ -682,6 +682,13 @@ func WithMaxHops(n int) RedirectOption {
 	return func(c *redirectCfg) { c.maxHops = n }
 }
 
+// hostMatchesSuffix reports whether host matches the given dot-prefixed suffix.
+// The suffix must start with ".". It matches if host equals the suffix without
+// the leading dot, or if host ends with the suffix.
+func hostMatchesSuffix(host, suffix string) bool {
+	return host == suffix[1:] || strings.HasSuffix(host, suffix)
+}
+
 // RedirectPolicyFunc returns a CheckRedirect function configured with the
 // given options. With no options, all redirects are refused.
 func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Request) error {
@@ -700,6 +707,14 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 	if maxHops <= 0 {
 		maxHops = redirectCap
 	}
+	// Normalize suffixes to start with "." to prevent substring bypass.
+	normalized := make([]string, len(cfg.allowedSuffixes))
+	for i, s := range cfg.allowedSuffixes {
+		if !strings.HasPrefix(s, ".") {
+			s = "." + s
+		}
+		normalized[i] = s
+	}
 	return func(req *http.Request, via []*http.Request) error {
 		if len(via) >= maxHops {
 			return errors.New("too many redirects")
@@ -708,8 +723,8 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 		if slices.Contains(cfg.allowedHosts, host) {
 			return nil
 		}
-		for _, s := range cfg.allowedSuffixes {
-			if strings.HasSuffix(host, s) {
+		for _, s := range normalized {
+			if hostMatchesSuffix(host, s) {
 				return nil
 			}
 		}

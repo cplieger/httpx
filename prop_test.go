@@ -3,6 +3,7 @@ package httpx
 import (
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -58,6 +59,9 @@ func FuzzParseRetryAfter(f *testing.F) {
 		d := ParseRetryAfter(val)
 		if d < 0 {
 			t.Fatalf("ParseRetryAfter(%q) returned negative: %v", val, d)
+		}
+		if d > RetryAfterCap {
+			t.Fatalf("ParseRetryAfter(%q) = %v exceeds cap %v", val, d, RetryAfterCap)
 		}
 	})
 }
@@ -138,3 +142,56 @@ func FuzzSafeDouble(f *testing.F) {
 type testError struct{ msg string }
 
 func (e *testError) Error() string { return e.msg }
+
+func FuzzRedirectPolicyFunc(f *testing.F) {
+	f.Add("sub.docker.com", ".docker.com", "exact.host.com")
+	f.Add("maliciousdocker.com", ".docker.com", "")
+	f.Add("docker.com", "docker.com", "")
+	f.Add("evil.com", ".example.org", "good.com")
+
+	f.Fuzz(func(t *testing.T, host, suffix, allowedHost string) {
+		if host == "" || suffix == "" {
+			return
+		}
+		// Skip hosts that would produce invalid URLs.
+		u, err := url.Parse("http://" + host + "/path")
+		if err != nil || u.Hostname() == "" {
+			return
+		}
+		host = u.Hostname() // use normalized hostname
+
+		var opts []RedirectOption
+		if allowedHost != "" {
+			opts = append(opts, WithAllowedHosts(allowedHost))
+		}
+		opts = append(opts, WithAllowedSuffixes(suffix))
+		policy := RedirectPolicyFunc(opts...)
+
+		req := &http.Request{URL: u}
+		via := []*http.Request{{URL: &url.URL{Host: "origin.com"}}}
+		err = policy(req, via)
+
+		if err == nil {
+			// Policy accepted — verify invariant.
+			if host == allowedHost {
+				return // exact match is fine
+			}
+			// Must match the normalized suffix.
+			norm := suffix
+			if !strings.HasPrefix(norm, ".") {
+				norm = "." + norm
+			}
+			if !hostMatchesSuffix(host, norm) {
+				t.Fatalf("policy accepted host %q but it doesn't match suffix %q or allowedHost %q", host, suffix, allowedHost)
+			}
+		}
+	})
+}
+
+func mustParseURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
