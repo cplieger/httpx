@@ -19,3 +19,8 @@ go.work.sum
 .idea/
 .vscode/
 *.swp
+
+# Kiro skill artifacts (code-review, refactor, steering-maintenance)
+**/.code-review/
+**/.refactor/
+**/.steering-maintenance/
