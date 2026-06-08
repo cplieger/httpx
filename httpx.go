@@ -404,7 +404,8 @@ func IsTransient(err error) bool {
 // Logging uses slog.Default() and cannot be overridden per-call; control output
 // via slog.SetDefault().
 func RetryWithBackoff[T any](ctx context.Context, maxRetries int, baseDelay time.Duration,
-	label string, fn func(ctx context.Context) (T, error)) (T, error) {
+	label string, fn func(ctx context.Context) (T, error),
+) (T, error) {
 	var zero T
 	var lastErr error
 	backoff := baseDelay

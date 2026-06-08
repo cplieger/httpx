@@ -187,4 +187,3 @@ func FuzzRedirectPolicyFunc(f *testing.F) {
 		}
 	})
 }
-
