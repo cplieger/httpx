@@ -13,6 +13,7 @@ A resilient outbound-HTTP toolkit for Go providing jittered exponential backoff,
 `go get github.com/cplieger/httpx@latest`
 
 ## Usage
+
 ```go
 // Simple GET with retry
 body, err := httpx.Retry(ctx, http.DefaultClient, url,
@@ -83,6 +84,7 @@ defer rc.Close()
 ## API
 
 ### Retry
+
 - `Retry` — HTTP GET with exponential backoff on 429/5xx (functional options: `WithMaxAttempts`, `WithBaseDelay`, `WithMaxBodyBytes`, `WithHeaders`, `WithLogger`)
 - `RetryWithBackoff[T]` — generic retry with jittered exponential backoff
 - `RetryOnRateLimit` — retry on `*RateLimitError` only (passes ctx to fn)
@@ -90,45 +92,55 @@ defer rc.Close()
 - `StandardClient()` — returns `*http.Client` using the `RetryRoundTripper`
 
 ### Hooks & Policies
+
 - `CheckRetry` — pluggable retry policy: `func(ctx, resp, err) (bool, error)`
 - `OnRetry` — per-attempt callback for observability/metrics
 - `PrepareRetry` — mutate request before retry (e.g., re-sign tokens)
 
 ### Backoff Strategy
+
 - `Backoff` — pluggable backoff interface: `NextBackOff() time.Duration` + `Reset()` (mirrors cenkalti/backoff)
 - `NewExponentialBackoff` — create jittered exponential backoff (functional options: `WithInitialInterval`, `WithMaxElapsedTime`)
 - `BackoffStop` — sentinel value to signal "stop retrying"
 
 ### Error Control
+
 - `Permanent(err)` — wrap error to signal "do not retry" (mirrors cenkalti/backoff)
 - `IsPermanent(err)` — check if error is wrapped as permanent
 - `PermanentError` — the wrapper type (supports `errors.Is`/`errors.As`/`Unwrap`)
 
 ### Classification & Parsing
+
 - `IsTransient` — classify errors as transient (retryable); respects `PermanentError`
 - `CheckHTTPStatus` — map HTTP status to typed errors
 - `ParseRetryAfter` / `ParseRetryAfterResponse` — parse Retry-After header
 
 ### Backoff Primitives
+
 - `JitteredBackoff` — equal jitter `[backoff/2, backoff]`
 - `SafeDouble` / `SleepCtx` — overflow-safe doubling, context-aware sleep
 
 ### Body Helpers
+
 - `Drain` / `DrainClose` — body drain for connection reuse (64 KB limit)
 - `LimitedBody` — wrap response body with a size cap
 
 ### Redirect Policies
+
 - `DefaultRedirectPolicy` — same-host-only redirect policy (used by `NewClient`)
 - `DockerGitHubRedirectPolicy` — optional example policy for docker.com/github.com
 - `RedirectPolicyFunc` — build a custom redirect allowlist (functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithMaxHops`)
 
 ### Client Helpers
+
 - `NewClient` / `Close` — preconfigured HTTP client
 
 ### Secret Redaction
+
 - `RedactTransportError` / `RedactSecret` — secret redaction
 
 ### Error Types
+
 - `AuthError` / `RateLimitError` / `HTTPStatusError` / `StatusError`
 - `ErrRateLimited` / `ErrServerError` — sentinel errors
 - `PermanentError` — do-not-retry sentinel wrapper
@@ -151,4 +163,5 @@ The following features are intentionally not provided:
 | Idempotency key injection | Application-level concern, not a retry library's responsibility. |
 
 ## License
+
 GPL-3.0 — see [LICENSE](LICENSE).
