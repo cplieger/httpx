@@ -80,7 +80,7 @@ type StatusError struct {
 }
 
 func (e *StatusError) Error() string {
-	return fmt.Sprintf("HTTP %d from %s", e.Code, e.URL)
+	return fmt.Sprintf("HTTP %d from %s", e.Code, redactURL(e.URL))
 }
 
 // Is reports whether this StatusError matches ErrRateLimited or ErrServerError.
@@ -554,22 +554,22 @@ func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Opti
 		body, retryAfter, err := retryAttempt(ctx, client, reqURL, &cfg)
 		if body != nil {
 			if elapsed := time.Since(start); elapsed > 10*time.Second {
-				log.Warn("slow upstream response", "url", reqURL, "duration", elapsed.Round(time.Millisecond))
+				log.Warn("slow upstream response", "url", redactURL(reqURL), "duration", elapsed.Round(time.Millisecond))
 			}
 			return body, nil
 		}
 		if err != nil && !isRetryStatus(err) {
-			return nil, err
+			return nil, logSafeError(err)
 		}
 		lastErr = err
 		overrideWait = retryAfter
 		log.Debug("http request failed, will retry",
-			"url", reqURL, "attempt", attempt+1, "max_attempts", cfg.maxAttempts, "error", err)
+			"url", redactURL(reqURL), "attempt", attempt+1, "max_attempts", cfg.maxAttempts, "error", logSafeError(err))
 	}
 	elapsed := time.Since(start)
 	log.Warn("http retries exhausted",
-		"url", reqURL, "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", lastErr)
-	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), lastErr)
+		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", logSafeError(lastErr))
+	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), logSafeError(lastErr))
 }
 
 // retryAttempt performs a single HTTP GET attempt. Returns (body, 0, nil) on
@@ -826,4 +826,44 @@ func RedactTransportError(err error, prefix, secret string) error {
 // RedactSecret replaces occurrences of secret in err's message with "REDACTED".
 func RedactSecret(err error, secret string) error {
 	return RedactTransportError(err, "", secret)
+}
+
+// redactURL returns a log-safe rendering of rawURL. It masks the userinfo
+// password (like url.URL.Redacted, mirroring the go-retryablehttp CVE-2024-6104
+// fix) and replaces every query value with "REDACTED" (query values commonly
+// carry api keys, tokens, and signatures — the same default .NET 9's
+// IHttpClientFactory adopted). Query keys, scheme, host, and path are kept for
+// debugging; the fragment is dropped. Unparseable input yields a fixed
+// placeholder rather than risk logging a raw secret-bearing string.
+func redactURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "[unparseable url]"
+	}
+	if u.RawQuery != "" {
+		q := u.Query()
+		for k := range q {
+			q[k] = []string{"REDACTED"}
+		}
+		u.RawQuery = q.Encode()
+	}
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.Redacted()
+}
+
+// logSafeError returns an error whose message is safe to log. A transport
+// *url.Error embeds the full request URL (with any userinfo/query secrets), so
+// it is reduced to its underlying cause. *StatusError already renders a
+// redacted URL via Error(), so it (and everything else) passes through
+// unchanged — preserving errors.Is/As chains for callers.
+func logSafeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
 }
