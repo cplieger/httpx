@@ -149,6 +149,16 @@ defer rc.Close()
 
 `Retry` logs via `log/slog`. Pass `WithLogger` to override the default logger for `Retry` calls. `RetryWithBackoff` and `Drain` use `slog.Default()` and cannot be overridden per-call.
 
+### URL redaction in logs and errors
+
+To avoid leaking credentials into logs (CWE-532, the class of [go-retryablehttp CVE-2024-6104](https://discuss.hashicorp.com/t/hcsec-2024-12-go-retryablehttp-can-leak-basic-auth-credentials-to-log-files/68027)), `Retry` never logs or returns a raw request URL:
+
+- Every logged `url` attribute is redacted — the userinfo password is masked (like `url.URL.Redacted`) and query values are replaced with `REDACTED` (query values commonly carry api keys, tokens, and signatures — the same default [.NET 9's `IHttpClientFactory`](https://learn.microsoft.com/en-us/dotnet/core/compatibility/networking/9.0/query-redaction-logs) adopted). Query keys, scheme, host, and path are kept for debugging.
+- `StatusError.Error()` renders that same redacted URL, so the secret stays out of returned errors too; the raw `StatusError.URL` field remains available for programmatic use.
+- Transport errors (`*url.Error`, which embed the full URL) are reduced to their underlying cause before logging.
+
+The `RoundTripper` performs no URL logging of its own — wire any logging through its `WithOnRetry` hook, where redaction is the caller's responsibility.
+
 ## Unsupported by Design (SKIP List)
 
 The following features are intentionally not provided:
