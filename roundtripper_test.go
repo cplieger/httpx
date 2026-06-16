@@ -593,7 +593,7 @@ func TestRetryRoundTripper_custom_Backoff(t *testing.T) {
 	bo := &testBackoff{delays: []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}}
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
 		httpx.WithMaxRetries(5),
-		httpx.WithBackoff(bo),
+		httpx.WithBackoffFunc(func() httpx.Backoff { return bo }),
 	)
 	client := rt.StandardClient()
 
@@ -621,7 +621,7 @@ func TestRetryRoundTripper_Backoff_Stop(t *testing.T) {
 	bo := &testBackoff{delays: []time.Duration{time.Millisecond}}
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
 		httpx.WithMaxRetries(10),
-		httpx.WithBackoff(bo),
+		httpx.WithBackoffFunc(func() httpx.Backoff { return bo }),
 	)
 	client := rt.StandardClient()
 

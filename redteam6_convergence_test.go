@@ -220,14 +220,9 @@ func TestR6_Clone_HostPreserved(t *testing.T) {
 	resp.Body.Close()
 }
 
-// --- Shared Backoff: heavy concurrent race with -race detector ---
+// --- Per-request backoff factory: heavy concurrent load with -race detector ---
 
-func TestR6_SharedBackoff_HeavyRace(t *testing.T) {
-	sharedBo := httpx.NewExponentialBackoff(
-		httpx.WithInitialInterval(time.Millisecond),
-		httpx.WithMaxElapsedTime(10*time.Millisecond),
-	)
-
+func TestR6_PerRequestBackoff_HeavyRace(t *testing.T) {
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusServiceUnavailable,
@@ -238,7 +233,12 @@ func TestR6_SharedBackoff_HeavyRace(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithMaxRetries(20),
-		httpx.WithBackoff(sharedBo),
+		httpx.WithBackoffFunc(func() httpx.Backoff {
+			return httpx.NewExponentialBackoff(
+				httpx.WithInitialInterval(time.Millisecond),
+				httpx.WithMaxElapsedTime(10*time.Millisecond),
+			)
+		}),
 	)
 
 	var wg sync.WaitGroup

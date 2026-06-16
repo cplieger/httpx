@@ -244,7 +244,7 @@ func TestRetryRoundTripper_BackoffStop_returns_last_error(t *testing.T) {
 	bo := &immediateStopBackoff{}
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithMaxRetries(10),
-		httpx.WithBackoff(bo),
+		httpx.WithBackoffFunc(func() httpx.Backoff { return bo }),
 	)
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com", http.NoBody)
@@ -281,9 +281,9 @@ func TestParseRetryAfter_negative_returns_zero(t *testing.T) {
 	}
 }
 
-// --- P1: Concurrent use of RetryRoundTripper with shared Backoff must not race ---
+// --- P1: Concurrent use of RetryRoundTripper with a per-request backoff factory must not race ---
 
-func TestRetryRoundTripper_concurrent_shared_backoff_no_race(t *testing.T) {
+func TestRetryRoundTripper_concurrent_backoff_factory_no_race(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		n := calls.Add(1)
@@ -301,10 +301,12 @@ func TestRetryRoundTripper_concurrent_shared_backoff_no_race(t *testing.T) {
 		}, nil
 	})
 
-	bo := httpx.NewExponentialBackoff(httpx.WithInitialInterval(time.Millisecond))
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithMaxRetries(3),
-		httpx.WithBackoff(bo),
+		// Fresh instance per request: no shared mutable backoff state.
+		httpx.WithBackoffFunc(func() httpx.Backoff {
+			return httpx.NewExponentialBackoff(httpx.WithInitialInterval(time.Millisecond))
+		}),
 	)
 
 	var wg sync.WaitGroup

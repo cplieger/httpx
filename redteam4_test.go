@@ -271,9 +271,9 @@ func TestR4_RoundTripper_DrainsDiscardedBodies(t *testing.T) {
 	// If we get here without hanging, draining worked
 }
 
-// --- (B) RE-ATTACK: Shared-Backoff race ---
+// --- (B) RE-ATTACK: per-request backoff factory under concurrency ---
 
-func TestR4_SharedBackoff_Race(t *testing.T) {
+func TestR4_PerRequestBackoff_Race(t *testing.T) {
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusServiceUnavailable,
@@ -282,14 +282,14 @@ func TestR4_SharedBackoff_Race(t *testing.T) {
 		}, nil
 	})
 
-	sharedBo := httpx.NewExponentialBackoff(
-		httpx.WithInitialInterval(time.Millisecond),
-		httpx.WithMaxElapsedTime(50*time.Millisecond),
-	)
-
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithMaxRetries(5),
-		httpx.WithBackoff(sharedBo),
+		httpx.WithBackoffFunc(func() httpx.Backoff {
+			return httpx.NewExponentialBackoff(
+				httpx.WithInitialInterval(time.Millisecond),
+				httpx.WithMaxElapsedTime(50*time.Millisecond),
+			)
+		}),
 	)
 
 	var wg sync.WaitGroup

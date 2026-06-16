@@ -62,12 +62,15 @@ if configErr != nil {
     return httpx.Permanent(configErr) // will not be retried
 }
 
-// Pluggable backoff strategy
+// Pluggable backoff strategy (factory invoked once per request, so each
+// request gets its own independent backoff progression)
 rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
-    httpx.WithBackoff(httpx.NewExponentialBackoff(
-        httpx.WithInitialInterval(500*time.Millisecond),
-        httpx.WithMaxElapsedTime(30*time.Second),
-    )),
+    httpx.WithBackoffFunc(func() httpx.Backoff {
+        return httpx.NewExponentialBackoff(
+            httpx.WithInitialInterval(500*time.Millisecond),
+            httpx.WithMaxElapsedTime(30*time.Second),
+        )
+    }),
 )
 
 // Custom redirect policy
@@ -92,7 +95,7 @@ defer rc.Close()
 - `Retry` — HTTP GET with exponential backoff on 429/5xx (functional options: `WithMaxAttempts`, `WithBaseDelay`, `WithMaxBodyBytes`, `WithHeaders`, `WithLogger`)
 - `RetryWithBackoff[T]` — generic retry with jittered exponential backoff
 - `RetryOnRateLimit` — retry on `*RateLimitError` only (passes ctx to fn)
-- `NewRetryRoundTripper` — create a retrying `http.RoundTripper` (functional options: `WithMaxRetries`, `WithRTBaseDelay`, `WithRTMaxElapsedTime`, `WithBackoff`, `WithCheckRetry`, `WithOnRetry`, `WithPrepareRetry`, `WithRetryNonIdempotent`)
+- `NewRetryRoundTripper` — create a retrying `http.RoundTripper` (functional options: `WithMaxRetries`, `WithRTBaseDelay`, `WithRTMaxElapsedTime`, `WithBackoffFunc`, `WithCheckRetry`, `WithOnRetry`, `WithPrepareRetry`, `WithRetryNonIdempotent`)
 - `StandardClient()` — returns `*http.Client` using the `RetryRoundTripper`
 
 ### Hooks & Policies
@@ -104,6 +107,7 @@ defer rc.Close()
 ### Backoff Strategy
 
 - `Backoff` — pluggable backoff interface: `NextBackOff() time.Duration` + `Reset()` (mirrors cenkalti/backoff)
+- `WithBackoffFunc(func() Backoff)` — supply a factory that is called per-request to produce a fresh `Backoff` instance (renamed from `WithBackoff(Backoff)` to fix a shared-state concurrency bug where multiple goroutines sharing a `StandardClient()` corrupted each other's backoff progression; the mutex is gone — the fix is inherent in per-request instantiation)
 - `NewExponentialBackoff` — create jittered exponential backoff (functional options: `WithInitialInterval`, `WithMaxElapsedTime`)
 - `BackoffStop` — sentinel value to signal "stop retrying"
 

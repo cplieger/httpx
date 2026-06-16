@@ -511,6 +511,25 @@ func WithLogger(l *slog.Logger) Option {
 // Retry performs an HTTP GET with bounded exponential-backoff retry on
 // 429 and 5xx responses. 4xx (non-429) and transport errors are returned
 // immediately. Honors Retry-After (capped at RetryAfterCap).
+//
+// Retry deliberately keeps its own retry loop rather than delegating to
+// RetryRoundTripper.RoundTrip. It is a decorator over the same shared
+// primitives (JitteredBackoff, SafeDouble, SleepCtx, ParseRetryAfter,
+// IsTransient, Drain), not a thin wrapper over the RoundTripper cycle, because
+// Retry carries behavior the transparent RoundTripper has no equivalent for and
+// which must stay byte-for-byte stable for existing consumers:
+//   - []byte return with the body capped at cfg.maxBodyBytes (the RoundTripper
+//     hands back an *http.Response and never reads the body);
+//   - URL/secret redaction on every log "url" attr (redactURL) and every
+//     returned/wrapped error (logSafeError, StatusError.Error()), the
+//     CWE-532 hardening the RoundTripper path does not perform;
+//   - rich per-attempt slog logging plus the "retries exhausted after %s: %w"
+//     wrapper, which the RoundTripper exposes only as an OnRetry hook;
+//   - classification of every 5xx (not just 502/503/504) as retryable and of
+//     any non-200 as a permanent *StatusError.
+//
+// Routing Retry through RoundTrip would silently change one or more of these,
+// so the loop is intentionally not merged (see plan A3 / side-finding #4).
 func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Option) ([]byte, error) {
 	cfg := retryCfg{
 		maxAttempts:  DefaultMaxAttempts,
