@@ -75,8 +75,9 @@ func TestR3_ParseRetryAfter_OverflowBoundary(t *testing.T) {
 	}
 }
 
-// Verify Backoff mutex: concurrent calls with shared ExponentialBackoff.
-func TestR3_SharedBackoff_ConcurrentMutex(t *testing.T) {
+// Verify per-request backoff factory: concurrent calls each get an independent
+// ExponentialBackoff instance (no shared mutable state, no mutex needed).
+func TestR3_PerRequestBackoff_Concurrent(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		n := calls.Add(1)
@@ -94,13 +95,14 @@ func TestR3_SharedBackoff_ConcurrentMutex(t *testing.T) {
 		}, nil
 	})
 
-	bo := httpx.NewExponentialBackoff(
-		httpx.WithInitialInterval(time.Millisecond),
-		httpx.WithMaxElapsedTime(50*time.Millisecond),
-	)
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithMaxRetries(5),
-		httpx.WithBackoff(bo),
+		httpx.WithBackoffFunc(func() httpx.Backoff {
+			return httpx.NewExponentialBackoff(
+				httpx.WithInitialInterval(time.Millisecond),
+				httpx.WithMaxElapsedTime(50*time.Millisecond),
+			)
+		}),
 	)
 
 	var wg sync.WaitGroup

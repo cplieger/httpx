@@ -62,14 +62,9 @@ func TestR5_Clone_HeaderMapIsolation(t *testing.T) {
 	}
 }
 
-// --- Shared Backoff concurrent Reset race (more aggressive) ---
+// --- Per-request backoff factory under aggressive concurrency ---
 
-func TestR5_SharedBackoff_ConcurrentReset_Aggressive(t *testing.T) {
-	sharedBo := httpx.NewExponentialBackoff(
-		httpx.WithInitialInterval(time.Millisecond),
-		httpx.WithMaxElapsedTime(20*time.Millisecond),
-	)
-
+func TestR5_PerRequestBackoff_Aggressive(t *testing.T) {
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusServiceUnavailable,
@@ -80,7 +75,12 @@ func TestR5_SharedBackoff_ConcurrentReset_Aggressive(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithMaxRetries(10),
-		httpx.WithBackoff(sharedBo),
+		httpx.WithBackoffFunc(func() httpx.Backoff {
+			return httpx.NewExponentialBackoff(
+				httpx.WithInitialInterval(time.Millisecond),
+				httpx.WithMaxElapsedTime(20*time.Millisecond),
+			)
+		}),
 	)
 
 	var wg sync.WaitGroup

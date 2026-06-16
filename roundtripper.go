@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 )
 
@@ -31,7 +30,7 @@ type rtCfg struct {
 	checkRetry         CheckRetry
 	onRetry            OnRetry
 	prepareRetry       PrepareRetry
-	backoff            Backoff
+	backoffFunc        func() Backoff
 	baseDelay          time.Duration
 	maxRetries         int
 	maxElapsedTime     time.Duration
@@ -58,9 +57,25 @@ func WithRTMaxElapsedTime(d time.Duration) RTOption {
 	return func(c *rtCfg) { c.maxElapsedTime = d }
 }
 
-// WithBackoff sets a custom backoff strategy. When set, BaseDelay is ignored.
-func WithBackoff(b Backoff) RTOption {
-	return func(c *rtCfg) { c.backoff = b }
+// WithBackoffFunc sets a factory that returns a fresh custom backoff strategy
+// for each request. When set, BaseDelay is ignored.
+//
+// The factory is invoked once per RoundTrip, so every request drives its own
+// independent Backoff instance. This is required for correctness under the
+// documented shared-transport pattern (one StandardClient fanned across
+// goroutines): a single long-lived Backoff would have its progression rewound
+// and advanced concurrently by unrelated requests. Return a new instance (e.g.
+// NewExponentialBackoff(...)) from the factory; the fresh instance needs no
+// Reset.
+//
+// This replaces the former WithBackoff(Backoff) option. The rename is a hard
+// break with no deprecated shim: the previous option had zero external
+// consumers (verified across the workspace), so preserving a shim would add
+// permanent public surface for no benefit. Callers migrate by wrapping their
+// constructor in a closure: WithBackoffFunc(func() Backoff { return
+// NewExponentialBackoff(opts...) }).
+func WithBackoffFunc(f func() Backoff) RTOption {
+	return func(c *rtCfg) { c.backoffFunc = f }
 }
 
 // WithCheckRetry sets a custom retry policy. If nil, the default policy
@@ -99,12 +114,11 @@ type RetryRoundTripper struct {
 	checkRetry         CheckRetry
 	onRetry            OnRetry
 	prepareRetry       PrepareRetry
-	backoff            Backoff
+	backoffFunc        func() Backoff
 	baseDelay          time.Duration
 	maxRetries         int
 	maxElapsedTime     time.Duration
 	retryNonIdempotent bool
-	mu                 sync.Mutex
 }
 
 // NewRetryRoundTripper creates a RetryRoundTripper wrapping next with the
@@ -127,7 +141,7 @@ func NewRetryRoundTripper(next http.RoundTripper, opts ...RTOption) *RetryRoundT
 		checkRetry:         cfg.checkRetry,
 		onRetry:            cfg.onRetry,
 		prepareRetry:       cfg.prepareRetry,
-		backoff:            cfg.backoff,
+		backoffFunc:        cfg.backoffFunc,
 		baseDelay:          cfg.baseDelay,
 		maxRetries:         cfg.maxRetries,
 		maxElapsedTime:     cfg.maxElapsedTime,
@@ -220,11 +234,8 @@ func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	maxRetries := rt.getMaxRetries()
 
 	var bo Backoff
-	if rt.backoff != nil {
-		bo = rt.backoff
-		rt.mu.Lock()
-		bo.Reset()
-		rt.mu.Unlock()
+	if rt.backoffFunc != nil {
+		bo = rt.backoffFunc()
 	}
 	backoff := rt.getBaseDelay()
 	start := time.Now()
@@ -288,9 +299,9 @@ func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, 
 
 	var wait time.Duration
 	if bo != nil {
-		rt.mu.Lock()
+		// bo is a per-request instance (from rt.backoffFunc), so advancing it
+		// here needs no lock — no other goroutine shares it.
 		w := bo.NextBackOff()
-		rt.mu.Unlock()
 		if w == BackoffStop {
 			drainResp(resp)
 			if lastErr != nil {
