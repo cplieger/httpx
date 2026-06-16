@@ -237,7 +237,6 @@ func TestRetry_does_not_sleep_before_first_attempt(t *testing.T) {
 
 	// when
 	body, err := httpx.Retry(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(10*time.Second))
-
 	// then: the first attempt must NOT sleep, so the fast response returns
 	// before the deadline. A `> 0` -> `>= 0` mutant sleeps ~10s before the
 	// first request and blows the 100ms deadline.
