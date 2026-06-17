@@ -19,8 +19,8 @@ import (
 // exactly one goroutine (the request that the factory minted it for), so
 // reading seq after wg.Wait() is race-free.
 type recordingBackoff struct {
-	step int
 	seq  []int
+	step int
 }
 
 func (b *recordingBackoff) NextBackOff() time.Duration {

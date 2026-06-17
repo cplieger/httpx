@@ -216,24 +216,24 @@ func TestR3_GetBody_ErrorMidSequence(t *testing.T) {
 
 func TestR3_IsTransient_AllBranches(t *testing.T) {
 	tests := []struct {
-		name string
 		err  error
+		name string
 		want bool
 	}{
-		{"nil", nil, false},
-		{"permanent", httpx.Permanent(errors.New("x")), false},
-		{"auth", &httpx.AuthError{Msg: "bad"}, false},
-		{"ratelimit", &httpx.RateLimitError{Msg: "slow"}, false},
-		{"context.Canceled", context.Canceled, false},
-		{"context.DeadlineExceeded", context.DeadlineExceeded, false},
-		{"transient-true", &httpx.HTTPStatusError{Code: 503}, true},
-		{"transient-false", &httpx.HTTPStatusError{Code: 400}, false},
-		{"unexpected EOF", io.ErrUnexpectedEOF, true},
-		{"wrapped permanent", fmt.Errorf("wrap: %w", httpx.Permanent(errors.New("x"))), false},
-		{"wrapped auth", fmt.Errorf("wrap: %w", &httpx.AuthError{Msg: "x"}), false},
-		{"wrapped ratelimit", fmt.Errorf("wrap: %w", &httpx.RateLimitError{Msg: "x"}), false},
-		{"wrapped transient-true", fmt.Errorf("wrap: %w", &httpx.HTTPStatusError{Code: 502}), true},
-		{"wrapped context.Canceled", fmt.Errorf("wrap: %w", context.Canceled), false},
+		{name: "nil", err: nil, want: false},
+		{name: "permanent", err: httpx.Permanent(errors.New("x")), want: false},
+		{name: "auth", err: &httpx.AuthError{Msg: "bad"}, want: false},
+		{name: "ratelimit", err: &httpx.RateLimitError{Msg: "slow"}, want: false},
+		{name: "context.Canceled", err: context.Canceled, want: false},
+		{name: "context.DeadlineExceeded", err: context.DeadlineExceeded, want: false},
+		{name: "transient-true", err: &httpx.HTTPStatusError{Code: 503}, want: true},
+		{name: "transient-false", err: &httpx.HTTPStatusError{Code: 400}, want: false},
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
+		{name: "wrapped permanent", err: fmt.Errorf("wrap: %w", httpx.Permanent(errors.New("x"))), want: false},
+		{name: "wrapped auth", err: fmt.Errorf("wrap: %w", &httpx.AuthError{Msg: "x"}), want: false},
+		{name: "wrapped ratelimit", err: fmt.Errorf("wrap: %w", &httpx.RateLimitError{Msg: "x"}), want: false},
+		{name: "wrapped transient-true", err: fmt.Errorf("wrap: %w", &httpx.HTTPStatusError{Code: 502}), want: true},
+		{name: "wrapped context.Canceled", err: fmt.Errorf("wrap: %w", context.Canceled), want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

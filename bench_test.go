@@ -26,9 +26,9 @@ func (s *stubRT) RoundTrip(*http.Request) (*http.Response, error) {
 
 // failThenSucceedRT fails the first N calls, then succeeds.
 type failThenSucceedRT struct {
-	failCount   int64 // how many times to fail
-	calls       atomic.Int64
 	successResp *http.Response
+	failCount   int64
+	calls       atomic.Int64
 }
 
 func (f *failThenSucceedRT) RoundTrip(*http.Request) (*http.Response, error) {
