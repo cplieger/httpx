@@ -171,14 +171,14 @@ The `RoundTripper` performs no URL logging of its own — wire any logging throu
 
 The following features are intentionally not provided:
 
-| Feature | Rationale |
-|---------|-----------|
-| Circuit breaker | Orthogonal pattern excluded by all comparables. Compose externally with sony/gobreaker. |
-| Retry budget / token bucket | None of the comparables implement it. Disproportionate complexity (~150 LOC + shared mutable state) for a focused library. |
-| Multiple jitter strategies (full, decorrelated) | Equal jitter is the recommended default per AWS Builders' Library. Full jitter risks near-zero delays. |
-| `ErrorHandler` for exhaustion | Current `fmt.Errorf("retries exhausted: %w", lastErr)` is sufficient. Callers unwrap. |
-| Response body on error | Adds API complexity (ownership of body close). Use `RetryWithBackoff[T]` with custom logic. |
-| Idempotency key injection | Application-level concern, not a retry library's responsibility. |
+| Feature                                         | Rationale                                                                                                                  |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Circuit breaker                                 | Orthogonal pattern excluded by all comparables. Compose externally with sony/gobreaker.                                    |
+| Retry budget / token bucket                     | None of the comparables implement it. Disproportionate complexity (~150 LOC + shared mutable state) for a focused library. |
+| Multiple jitter strategies (full, decorrelated) | Equal jitter is the recommended default per AWS Builders' Library. Full jitter risks near-zero delays.                     |
+| `ErrorHandler` for exhaustion                   | Current `fmt.Errorf("retries exhausted: %w", lastErr)` is sufficient. Callers unwrap.                                      |
+| Response body on error                          | Adds API complexity (ownership of body close). Use `RetryWithBackoff[T]` with custom logic.                                |
+| Idempotency key injection                       | Application-level concern, not a retry library's responsibility.                                                           |
 
 ## License
 
