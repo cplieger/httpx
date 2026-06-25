@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 // This file targets specific surviving mutants found by the weekly gremlins
@@ -196,7 +196,7 @@ func TestRetry_zero_max_body_bytes_defaults_to_full_body(t *testing.T) {
 	}
 }
 
-func TestRetry_positive_max_body_bytes_limits_body(t *testing.T) {
+func TestRetry_positive_max_body_bytes_errors_when_exceeded(t *testing.T) {
 	t.Parallel()
 
 	// given: a server returning an 11-byte body and a 5-byte cap
@@ -208,15 +208,20 @@ func TestRetry_positive_max_body_bytes_limits_body(t *testing.T) {
 	// when
 	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
 		httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(5))
-	if err != nil {
-		t.Fatalf("Retry = %v, want nil", err)
-	}
 
-	// then: a positive cap must be preserved, truncating the body to 5 bytes.
-	// A `<= 0` -> `> 0` negation mutant would replace 5 with the 10MB default
-	// and return the full body.
-	if string(body) != "hello" {
-		t.Errorf("Retry(maxBodyBytes=5) body = %q, want %q", body, "hello")
+	// then: a positive cap must be preserved; an 11-byte body over the 5-byte
+	// cap fails loud with *ResponseTooLargeError{Limit:5} (v2 no longer
+	// truncates). A `<= 0` -> `> 0` negation mutant would replace 5 with the
+	// 10MB default, leaving the 11-byte body under the cap and returning it.
+	if body != nil {
+		t.Errorf("Retry(maxBodyBytes=5) body = %q, want nil", body)
+	}
+	var tooLarge *httpx.ResponseTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("Retry(maxBodyBytes=5) error = %v, want *ResponseTooLargeError", err)
+	}
+	if tooLarge.Limit != 5 {
+		t.Errorf("ResponseTooLargeError.Limit = %d, want 5", tooLarge.Limit)
 	}
 }
 
@@ -315,6 +320,31 @@ func TestRetry_retry_debug_log_reports_one_indexed_attempt(t *testing.T) {
 	}
 }
 
+// --- RetryWithBackoff: L428 `baseDelay <= 0` coercion boundary ---
+
+func TestRetryWithBackoff_zero_base_delay_defaults_to_base(t *testing.T) {
+	t.Parallel()
+
+	// given: a zero base delay and a context deadline far shorter than
+	// DefaultBaseDelay (1s)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// when: fn always fails transiently
+	_, err := httpx.RetryWithBackoff(ctx, 2, 0, "test", func(_ context.Context) (string, error) {
+		return "", &httpx.HTTPStatusError{Code: 503}
+	})
+
+	// then: a zero base delay must be coerced to DefaultBaseDelay (1s), so the
+	// pre-retry sleep blows the 100ms deadline and surfaces the context error.
+	// A `<= 0` -> `< 0` boundary mutant (or a deleted coercion) leaves the delay
+	// at zero; the retry then runs instantly and the call exhausts attempts with
+	// the 503 instead.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("RetryWithBackoff(baseDelay=0) = %v, want context.DeadlineExceeded (delay defaulted)", err)
+	}
+}
+
 // --- RetryWithBackoff: L415/L416/L432/L427 (logging via slog.Default) ---
 //
 // RetryWithBackoff logs through slog.Default(), so these tests swap the default
@@ -362,10 +392,10 @@ func TestRetryWithBackoff_success_after_one_retry_logs_attempt_counts(t *testing
 	}
 	logged := buf.String()
 
-	// then: the first-failure warn reports the 1-indexed attempt (attempt+1==1).
+	// then: the first-failure debug line reports the 1-indexed attempt (attempt+1==1).
 	// A `+` -> `-`/`*`/`/` mutant logs attempt=-1 or attempt=0 (L432).
 	if !strings.Contains(logged, "attempt=1") {
-		t.Errorf("retry-warn log = %q, want attribute attempt=1", logged)
+		t.Errorf("retry debug log = %q, want attribute attempt=1", logged)
 	}
 	// the post-retry success must be logged (L415 negation), ...
 	if !strings.Contains(logged, "succeeded after retry") {
@@ -377,13 +407,13 @@ func TestRetryWithBackoff_success_after_one_retry_logs_attempt_counts(t *testing
 	}
 }
 
-func TestRetryWithBackoff_no_retry_warn_after_final_attempt(t *testing.T) {
+func TestRetryWithBackoff_no_retry_log_after_final_attempt(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
 	slog.SetDefault(bufLogger(&buf))
 	defer slog.SetDefault(prev)
 
-	// given: fn always fails transiently, with exactly 2 retries allowed
+	// given: fn always fails transiently, with exactly 2 attempts allowed
 	calls := 0
 	_, err := httpx.RetryWithBackoff(context.Background(), 2, time.Microsecond, "lbl",
 		func(_ context.Context) (string, error) {
@@ -397,11 +427,11 @@ func TestRetryWithBackoff_no_retry_warn_after_final_attempt(t *testing.T) {
 		t.Fatalf("fn calls = %d, want 2", calls)
 	}
 
-	// then: exactly one "failed, retrying" warn fires — the break before the
-	// final attempt suppresses the second. A mutated break guard
-	// (`maxRetries-1` -> `maxRetries`/`maxRetries+1`) logs (and sleeps) twice.
+	// then: exactly one "failed, retrying" debug line fires — the break before
+	// the final attempt suppresses the second. A mutated break guard
+	// (`maxAttempts-1` -> `maxAttempts`/`maxAttempts+1`) logs (and sleeps) twice.
 	if got := strings.Count(buf.String(), "failed, retrying"); got != 1 {
-		t.Errorf("retry-warn count = %d, want 1\n%s", got, buf.String())
+		t.Errorf("retry-log count = %d, want 1\n%s", got, buf.String())
 	}
 }
 
@@ -467,7 +497,7 @@ func TestRetryRoundTripper_zero_base_delay_defaults_to_base(t *testing.T) {
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(0), httpx.WithMaxRetries(1))
+		httpx.WithRTBaseDelay(0), httpx.WithRTMaxAttempts(2))
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
@@ -500,7 +530,7 @@ func TestRetryRoundTripper_default_backoff_doubles_between_retries(t *testing.T)
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(120*time.Millisecond), httpx.WithMaxRetries(3))
+		httpx.WithRTBaseDelay(120*time.Millisecond), httpx.WithRTMaxAttempts(4))
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
@@ -536,7 +566,7 @@ func TestRetryRoundTripper_zero_max_elapsed_does_not_cap(t *testing.T) {
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(time.Millisecond), httpx.WithMaxRetries(2))
+		httpx.WithRTBaseDelay(time.Millisecond), httpx.WithRTMaxAttempts(3))
 	client := rt.StandardClient()
 
 	// when
@@ -570,7 +600,7 @@ func TestRetryRoundTripper_large_max_elapsed_allows_fast_retry(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 		httpx.WithRTMaxElapsedTime(10*time.Second))
 	client := rt.StandardClient()
 
@@ -605,7 +635,7 @@ func TestRetryRoundTripper_429_without_retry_after_uses_backoff(t *testing.T) {
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(10*time.Second), httpx.WithMaxRetries(1))
+		httpx.WithRTBaseDelay(10*time.Second), httpx.WithRTMaxAttempts(2))
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
@@ -636,7 +666,7 @@ func TestRetryRoundTripper_sleep_error_aborts_with_bare_context_error(t *testing
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(10*time.Second), httpx.WithMaxRetries(1))
+		httpx.WithRTBaseDelay(10*time.Second), httpx.WithRTMaxAttempts(2))
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
@@ -660,5 +690,24 @@ func TestRetryRoundTripper_sleep_error_aborts_with_bare_context_error(t *testing
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("RoundTrip err = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+type errDrainBody struct{}
+
+func (errDrainBody) Read([]byte) (int, error) { return 0, errors.New("read boom") }
+
+func (errDrainBody) Close() error { return nil }
+
+// TestDrain_logs_on_non_eof_read_error must NOT run in parallel: it swaps
+// slog.Default() to capture the drain-failure debug line.
+func TestDrain_logs_on_non_eof_read_error(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
+	httpx.Drain(errDrainBody{})
+	if !strings.Contains(buf.String(), "failed to drain response body") {
+		t.Errorf("Drain(erroring body) logged %q, want drain-failure debug line", buf.String())
 	}
 }

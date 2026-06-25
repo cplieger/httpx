@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 // === ROUND 5 CONVERGENCE: Final adversarial sweep ===
@@ -47,7 +47,7 @@ func TestR5_Clone_HeaderMapIsolation(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(3),
+		httpx.WithRTMaxAttempts(4),
 	)
 	origReq, _ := http.NewRequest(http.MethodGet, "http://example.com/headerisolation", http.NoBody)
 	resp, err := rt.RoundTrip(origReq)
@@ -74,7 +74,7 @@ func TestR5_PerRequestBackoff_Aggressive(t *testing.T) {
 	})
 
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(10),
+		httpx.WithRTMaxAttempts(11),
 		httpx.WithBackoffFunc(func() httpx.Backoff {
 			return httpx.NewExponentialBackoff(
 				httpx.WithInitialInterval(time.Millisecond),
@@ -118,9 +118,9 @@ func TestR5_ParseRetryAfter_ExactBoundary(t *testing.T) {
 	}
 }
 
-// --- WithMaxRetries(0) with WithCheckRetry custom policy ---
+// --- WithRTMaxAttempts(0) with WithCheckRetry custom policy ---
 
-func TestR5_WithMaxRetries_Zero_CustomCheckRetry(t *testing.T) {
+func TestR5_WithRTMaxAttempts_Zero_CustomCheckRetry(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		calls.Add(1)
@@ -128,18 +128,18 @@ func TestR5_WithMaxRetries_Zero_CustomCheckRetry(t *testing.T) {
 	})
 
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(0),
+		httpx.WithRTMaxAttempts(0),
 		httpx.WithCheckRetry(func(_ context.Context, _ *http.Response, _ error) (bool, error) {
-			return true, nil // always retry — but maxRetries=0 should prevent it
+			return true, nil // always retry — but maxAttempts clamps to 1, so it can't
 		}),
 	)
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/zero-custom", http.NoBody)
 	_, err := rt.RoundTrip(req) //nolint:bodyclose // error path, no response body
 	if err == nil {
-		t.Fatal("expected error with 0 retries")
+		t.Fatal("expected error from the single clamped attempt")
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("WithMaxRetries(0)+custom CheckRetry: calls=%d, want 1", got)
+		t.Fatalf("WithRTMaxAttempts(0)+custom CheckRetry: calls=%d, want 1 (clamped to one attempt)", got)
 	}
 }
 
@@ -166,7 +166,7 @@ func TestR5_Drain_HugeBody_NoBlock(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 	)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -189,7 +189,7 @@ func (b neverEnding) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// --- Retry function: WithMaxAttempts(0) and negative should fallback to default ---
+// --- Retry function: WithMaxAttempts(0)/negative clamps to a single attempt ---
 
 func TestR5_Retry_MaxAttempts_ZeroAndNegative(t *testing.T) {
 	for _, maxAttempts := range []int{0, -1, -100} {
@@ -208,9 +208,9 @@ func TestR5_Retry_MaxAttempts_ZeroAndNegative(t *testing.T) {
 			httpx.WithBaseDelay(time.Millisecond),
 			httpx.WithMaxAttempts(maxAttempts))
 		cancel()
-		// Should fallback to DefaultMaxAttempts (3)
-		if got := calls.Load(); got != 3 {
-			t.Fatalf("WithMaxAttempts(%d): calls=%d, want 3 (default)", maxAttempts, got)
+		// A degenerate count clamps to 1 (try once) — never the old coerce-to-3.
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("WithMaxAttempts(%d): calls=%d, want 1 (clamped to a single attempt)", maxAttempts, got)
 		}
 	}
 }
@@ -231,7 +231,7 @@ func TestR5_MaxElapsedTime_Abort(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(100), // lots of retries allowed
+		httpx.WithRTMaxAttempts(101), // lots of retries allowed
 		httpx.WithRTMaxElapsedTime(15*time.Millisecond),
 	)
 

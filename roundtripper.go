@@ -32,7 +32,7 @@ type rtCfg struct {
 	prepareRetry       PrepareRetry
 	backoffFunc        func() Backoff
 	baseDelay          time.Duration
-	maxRetries         int
+	maxAttempts        int
 	maxElapsedTime     time.Duration
 	retryNonIdempotent bool
 }
@@ -40,10 +40,12 @@ type rtCfg struct {
 // RTOption configures a RetryRoundTripper via NewRetryRoundTripper.
 type RTOption func(*rtCfg)
 
-// WithMaxRetries sets the maximum number of retries (not counting the initial
-// request). Default: 2 (3 total attempts).
-func WithMaxRetries(n int) RTOption {
-	return func(c *rtCfg) { c.maxRetries = n }
+// WithRTMaxAttempts sets the maximum number of attempts (TOTAL, including the
+// initial request). Default: DefaultMaxAttempts (3). A value below 1 is treated
+// as 1, so the request is always sent at least once. This counts total
+// attempts, not retries-beyond-first.
+func WithRTMaxAttempts(n int) RTOption {
+	return func(c *rtCfg) { c.maxAttempts = n }
 }
 
 // WithRTBaseDelay sets the initial backoff delay for the round-tripper
@@ -58,7 +60,7 @@ func WithRTMaxElapsedTime(d time.Duration) RTOption {
 }
 
 // WithBackoffFunc sets a factory that returns a fresh custom backoff strategy
-// for each request. When set, BaseDelay is ignored.
+// for each request. When set, the round-tripper's base delay is ignored.
 //
 // The factory is invoked once per RoundTrip, so every request drives its own
 // independent Backoff instance. This is required for correctness under the
@@ -67,13 +69,6 @@ func WithRTMaxElapsedTime(d time.Duration) RTOption {
 // and advanced concurrently by unrelated requests. Return a new instance (e.g.
 // NewExponentialBackoff(...)) from the factory; the fresh instance needs no
 // Reset.
-//
-// This replaces the former WithBackoff(Backoff) option. The rename is a hard
-// break with no deprecated shim: the previous option had zero external
-// consumers (verified across the workspace), so preserving a shim would add
-// permanent public surface for no benefit. Callers migrate by wrapping their
-// constructor in a closure: WithBackoffFunc(func() Backoff { return
-// NewExponentialBackoff(opts...) }).
 func WithBackoffFunc(f func() Backoff) RTOption {
 	return func(c *rtCfg) { c.backoffFunc = f }
 }
@@ -105,10 +100,11 @@ func WithRetryNonIdempotent(enable bool) RTOption {
 //
 // By default, only idempotent methods (GET, HEAD, OPTIONS, TRACE) are retried.
 // Use WithRetryNonIdempotent to also retry POST/PUT/PATCH/DELETE when the
-// request has a GetBody function for body replay (mirrors go-retryablehttp).
+// request has a GetBody function for body replay.
 //
-// Mirrors hashicorp/go-retryablehttp RoundTripper but operates directly on
-// stdlib *http.Request without requiring a custom request type.
+// Inspired by hashicorp/go-retryablehttp, but operates directly on stdlib
+// *http.Request without a custom request type, and counts TOTAL attempts
+// (WithRTMaxAttempts) rather than go-retryablehttp's retries-beyond-first.
 type RetryRoundTripper struct {
 	next               http.RoundTripper
 	checkRetry         CheckRetry
@@ -116,7 +112,7 @@ type RetryRoundTripper struct {
 	prepareRetry       PrepareRetry
 	backoffFunc        func() Backoff
 	baseDelay          time.Duration
-	maxRetries         int
+	maxAttempts        int
 	maxElapsedTime     time.Duration
 	retryNonIdempotent bool
 }
@@ -125,8 +121,8 @@ type RetryRoundTripper struct {
 // given options. If next is nil, http.DefaultTransport is used.
 func NewRetryRoundTripper(next http.RoundTripper, opts ...RTOption) *RetryRoundTripper {
 	cfg := rtCfg{
-		baseDelay:  DefaultBaseDelay,
-		maxRetries: DefaultMaxAttempts - 1,
+		baseDelay:   DefaultBaseDelay,
+		maxAttempts: DefaultMaxAttempts,
 	}
 	for _, o := range opts {
 		if o != nil {
@@ -143,7 +139,7 @@ func NewRetryRoundTripper(next http.RoundTripper, opts ...RTOption) *RetryRoundT
 		prepareRetry:       cfg.prepareRetry,
 		backoffFunc:        cfg.backoffFunc,
 		baseDelay:          cfg.baseDelay,
-		maxRetries:         cfg.maxRetries,
+		maxAttempts:        cfg.maxAttempts,
 		maxElapsedTime:     cfg.maxElapsedTime,
 		retryNonIdempotent: cfg.retryNonIdempotent,
 	}
@@ -172,13 +168,18 @@ func (rt *RetryRoundTripper) canRetry(req *http.Request) bool {
 	return req.GetBody != nil
 }
 
-// defaultCheckRetry is the built-in retry policy: retry on transient transport
-// errors and retryable HTTP status codes (429, 502, 503, 504).
+// defaultCheckRetry is the built-in retry policy for RetryRoundTripper.
+// It retries transient transport errors and the following HTTP status codes:
+// 429 (Too Many Requests), 502 (Bad Gateway), 503 (Service Unavailable),
+// 504 (Gateway Timeout).
+//
+// This is deliberately narrower than the one-shot Retry helper, which retries
+// every 5xx (including 500), and narrower than hashicorp/go-retryablehttp
+// (all 5xx except 501). A 500 Internal Server Error is NOT retried by default;
+// supply WithCheckRetry to broaden the set when an upstream returns transient
+// 500s.
 func defaultCheckRetry(_ context.Context, resp *http.Response, err error) (bool, error) {
 	if err != nil {
-		if IsPermanent(err) {
-			return false, nil
-		}
 		return IsTransient(err), nil
 	}
 	if resp != nil {
@@ -193,11 +194,13 @@ func defaultCheckRetry(_ context.Context, resp *http.Response, err error) (bool,
 	return false, nil
 }
 
-func (rt *RetryRoundTripper) getMaxRetries() int {
-	if rt.maxRetries < 0 {
-		return DefaultMaxAttempts - 1
+// getMaxAttempts returns the total attempt count, clamped to a minimum of 1 so
+// the request is always sent at least once (never a silent zero-attempt no-op).
+func (rt *RetryRoundTripper) getMaxAttempts() int {
+	if rt.maxAttempts < 1 {
+		return 1
 	}
-	return rt.maxRetries
+	return rt.maxAttempts
 }
 
 func (rt *RetryRoundTripper) getBaseDelay() time.Duration {
@@ -224,6 +227,12 @@ func (rt *RetryRoundTripper) getCheckRetry() CheckRetry {
 // RoundTrip implements http.RoundTripper. It retries eligible requests on
 // transient failures with jittered exponential backoff, honoring Retry-After.
 // Per the http.RoundTripper contract, the caller's request is never mutated.
+//
+// When retries are exhausted the final response is returned, not an error:
+// if the last attempt produced a retryable response (e.g. a 503), RoundTrip
+// returns that *http.Response with a nil error, exactly as a non-retried
+// request would. The caller owns the returned body (must Close it) and MUST
+// inspect resp.StatusCode - a nil error does not imply a 2xx response.
 func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !rt.canRetry(req) {
 		return rt.transport().RoundTrip(req)
@@ -231,7 +240,7 @@ func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 	ctx := req.Context()
 	check := rt.getCheckRetry()
-	maxRetries := rt.getMaxRetries()
+	maxAttempts := rt.getMaxAttempts()
 
 	var bo Backoff
 	if rt.backoffFunc != nil {
@@ -243,7 +252,7 @@ func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	var resp *http.Response
 	var err error
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := range maxAttempts {
 		if attempt > 0 {
 			if abortErr := rt.sleepBeforeRetry(ctx, attempt, req, resp, err, backoff, bo, start); abortErr != nil {
 				return nil, abortErr
@@ -274,10 +283,10 @@ func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 			drainResp(resp)
 			return nil, checkErr
 		}
-		if !shouldRetry || ctx.Err() != nil {
-			if !shouldRetry {
-				return resp, err
-			}
+		if !shouldRetry {
+			return resp, err
+		}
+		if ctx.Err() != nil {
 			drainResp(resp)
 			return nil, ctx.Err()
 		}
@@ -286,15 +295,11 @@ func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return resp, err
 }
 
-// sleepBeforeRetry handles the pre-retry logic: hook, drain, wait, prepare.
+// sleepBeforeRetry handles the pre-retry logic: hook, compute wait, honor
+// Retry-After, enforce the elapsed-time budget, drain, sleep.
 func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, req *http.Request, resp *http.Response, lastErr error, backoff time.Duration, bo Backoff, start time.Time) error {
 	if rt.onRetry != nil {
 		rt.onRetry(attempt, req, resp, lastErr)
-	}
-
-	if rt.maxElapsedTime > 0 && time.Since(start) >= rt.maxElapsedTime {
-		drainResp(resp)
-		return fmt.Errorf("max elapsed time %s exceeded: %w", rt.maxElapsedTime, lastErr)
 	}
 
 	var wait time.Duration
@@ -314,10 +319,33 @@ func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, 
 		wait = JitteredBackoff(backoff)
 	}
 
-	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+	// Honor Retry-After on any retryable response (429, 502, 503, 504).
+	// ParseRetryAfter caps at RetryAfterCap, so a hostile header cannot force
+	// an unbounded wait. Honored per RFC for 503/429; 502/504 is a pragmatic,
+	// harmless extension.
+	if resp != nil {
 		if ra := ParseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
 			wait = ra
 		}
+	}
+
+	// maxElapsedTime is a hard ceiling. Check it AFTER computing the final wait
+	// (including any honored Retry-After): if sleeping would push total retry
+	// time to or past the budget, abort now rather than overshoot it. An
+	// honored Retry-After can dwarf the remaining budget, so the pre-wait
+	// elapsed alone is not a sufficient guard. This subsumes the
+	// already-exceeded case (wait >= 0).
+	// Compare without adding so a near-MaxInt64 wait cannot overflow the sum
+	// (CWE-190): abort if the elapsed time already meets the budget, or if the
+	// remaining budget is <= wait. maxElapsedTime-elapsed is computed only when
+	// elapsed < maxElapsedTime, so it stays positive and cannot underflow.
+	if elapsed := time.Since(start); rt.maxElapsedTime > 0 &&
+		(elapsed >= rt.maxElapsedTime || wait >= rt.maxElapsedTime-elapsed) {
+		drainResp(resp)
+		if lastErr != nil {
+			return fmt.Errorf("max elapsed time %s exceeded: %w", rt.maxElapsedTime, lastErr)
+		}
+		return fmt.Errorf("max elapsed time %s exceeded", rt.maxElapsedTime)
 	}
 
 	drainResp(resp)
@@ -332,13 +360,20 @@ func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, 
 // drainResp drains and closes a response body if present.
 func drainResp(resp *http.Response) {
 	if resp != nil && resp.Body != nil {
-		Drain(resp.Body)
-		resp.Body.Close()
+		DrainClose(resp.Body)
 	}
 }
 
 // StandardClient returns an *http.Client using this RetryRoundTripper as its
 // Transport. Mirrors hashicorp/go-retryablehttp StandardClient().
+//
+// The returned client sets no Client.Timeout. Bound every request with a context
+// deadline (http.NewRequestWithContext) or configure the wrapped transport's own
+// timeouts: without one, a stalled upstream blocks RoundTrip indefinitely, the
+// retry loop never advances (it is suspended inside the transport), and because
+// the RoundTripper logs nothing itself the stall is silent. A Client.Timeout is
+// intentionally NOT set here because it would cap total time across all retries,
+// conflicting with WithRTMaxElapsedTime.
 func (rt *RetryRoundTripper) StandardClient() *http.Client {
 	return &http.Client{Transport: rt}
 }

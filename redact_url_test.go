@@ -93,3 +93,38 @@ func TestLogSafeError(t *testing.T) {
 		t.Errorf("StatusError still leaked the secret: %q", got2.Error())
 	}
 }
+
+func TestRedactTransportError_unwraps_url_error_and_drops_url(t *testing.T) {
+	ue := &url.Error{
+		Op:  "Get",
+		URL: "https://user:pw@host.example/api?apikey=supersecret",
+		Err: errors.New("dial tcp: connection refused"),
+	}
+	got := RedactTransportError(ue, "fetch", "supersecret")
+	if got == nil {
+		t.Fatal("RedactTransportError(*url.Error) = nil, want error")
+	}
+	msg := got.Error()
+	for _, leak := range []string{"supersecret", "host.example", "apikey", "pw"} {
+		if strings.Contains(msg, leak) {
+			t.Errorf("RedactTransportError leaked %q: %q", leak, msg)
+		}
+	}
+	if !strings.Contains(msg, "connection refused") {
+		t.Errorf("RedactTransportError = %q, want cause preserved", msg)
+	}
+}
+
+func TestRedactSecret_replaces_secret_occurrences(t *testing.T) {
+	got := RedactSecret(errors.New("auth failed: apikey=supersecret123 rejected"), "supersecret123")
+	if got == nil {
+		t.Fatal("RedactSecret = nil, want error")
+	}
+	msg := got.Error()
+	if strings.Contains(msg, "supersecret123") {
+		t.Errorf("RedactSecret = %q, must not contain the secret", msg)
+	}
+	if !strings.Contains(msg, "REDACTED") {
+		t.Errorf("RedactSecret = %q, want REDACTED in place of secret", msg)
+	}
+}

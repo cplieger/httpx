@@ -1,6 +1,6 @@
 # httpx
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx.svg)](https://pkg.go.dev/github.com/cplieger/httpx)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx/v2.svg)](https://pkg.go.dev/github.com/cplieger/httpx/v2)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/httpx)](https://github.com/cplieger/httpx/blob/main/go.mod)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/httpx)](https://goreportcard.com/report/github.com/cplieger/httpx)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/coverage.json)](https://github.com/cplieger/httpx/actions/workflows/coverage.yml)
@@ -14,7 +14,7 @@ A resilient outbound-HTTP toolkit for Go providing jittered exponential backoff,
 
 ## Install
 
-`go get github.com/cplieger/httpx@latest`
+`go get github.com/cplieger/httpx/v2@latest`
 
 ## Usage
 
@@ -30,9 +30,9 @@ result, err := httpx.RetryWithBackoff(ctx, 3, time.Second, "fetch", func(ctx con
     return doWork(ctx)
 })
 
-// Transparent retrying RoundTripper (mirrors hashicorp/go-retryablehttp)
+// Transparent retrying RoundTripper (inspired by hashicorp/go-retryablehttp)
 rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
-    httpx.WithMaxRetries(3),
+    httpx.WithRTMaxAttempts(4),
     httpx.WithRTBaseDelay(time.Second),
     httpx.WithOnRetry(func(attempt int, req *http.Request, resp *http.Response, err error) {
         log.Printf("retry #%d for %s", attempt, req.URL)
@@ -44,9 +44,9 @@ rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
 )
 client := rt.StandardClient()
 
-// Retry POST/PUT with body replay (opt-in, mirrors go-retryablehttp)
+// Retry POST/PUT with body replay (opt-in, inspired by go-retryablehttp)
 rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
-    httpx.WithMaxRetries(3),
+    httpx.WithRTMaxAttempts(4),
     httpx.WithRetryNonIdempotent(true),
 )
 client := rt.StandardClient()
@@ -92,10 +92,10 @@ defer rc.Close()
 
 ### Retry
 
-- `Retry` — HTTP GET with exponential backoff on 429/5xx (functional options: `WithMaxAttempts`, `WithBaseDelay`, `WithMaxBodyBytes`, `WithHeaders`, `WithLogger`)
+- `Retry` — HTTP GET with exponential backoff on 429/5xx **and transient transport errors** (timeouts, connection resets, DNS failures — see `IsTransient`); 4xx (non-429) and non-transient transport errors return immediately (functional options: `WithMaxAttempts`, `WithBaseDelay`, `WithMaxBodyBytes`, `WithHeaders`, `WithLogger`). Counts **total** attempts (a non-positive count clamps to 1).
 - `RetryWithBackoff[T]` — generic retry with jittered exponential backoff
 - `RetryOnRateLimit` — retry on `*RateLimitError` only (passes ctx to fn)
-- `NewRetryRoundTripper` — create a retrying `http.RoundTripper` (functional options: `WithMaxRetries`, `WithRTBaseDelay`, `WithRTMaxElapsedTime`, `WithBackoffFunc`, `WithCheckRetry`, `WithOnRetry`, `WithPrepareRetry`, `WithRetryNonIdempotent`)
+- `NewRetryRoundTripper` — create a retrying `http.RoundTripper` (functional options: `WithRTMaxAttempts`, `WithRTBaseDelay`, `WithRTMaxElapsedTime`, `WithBackoffFunc`, `WithCheckRetry`, `WithOnRetry`, `WithPrepareRetry`, `WithRetryNonIdempotent`)
 - `StandardClient()` — returns `*http.Client` using the `RetryRoundTripper`
 
 ### Hooks & Policies
@@ -150,12 +150,15 @@ defer rc.Close()
 ### Error Types
 
 - `AuthError` / `RateLimitError` / `HTTPStatusError` / `StatusError`
+- `ResponseTooLargeError` — returned by `Retry` when the response exceeds `WithMaxBodyBytes` (carries `Limit`; no body is returned)
 - `ErrRateLimited` / `ErrServerError` — sentinel errors
 - `PermanentError` — do-not-retry sentinel wrapper
 
 ## Logging
 
-`Retry` logs via `log/slog`. Pass `WithLogger` to override the default logger for `Retry` calls. `RetryWithBackoff` and `Drain` use `slog.Default()` and cannot be overridden per-call.
+`Retry` logs via `log/slog`. Pass `WithLogger` to override the default logger for `Retry` calls. `RetryWithBackoff`, `RetryOnRateLimit`, and `Drain` use `slog.Default()` and cannot be overridden per-call.
+
+Per-attempt "retrying" lines are logged at **Debug** — a retry that recovers is normal operation, not a degraded state. Only the terminal "retries exhausted" / "rate limit retries exhausted" lines are at **Warn**. `Retry` also emits a **Warn** "slow upstream response" when a single attempt's response takes longer than 10s (timed per attempt, so backoff sleeps are not counted as upstream latency). The `RetryRoundTripper` logs nothing itself — observe its retries through the `WithOnRetry` hook.
 
 ### URL redaction in logs and errors
 
@@ -167,18 +170,26 @@ To avoid leaking credentials into logs (CWE-532, the class of [go-retryablehttp 
 
 The `RoundTripper` performs no URL logging of its own — wire any logging through its `WithOnRetry` hook, where redaction is the caller's responsibility.
 
+## Retry exhaustion
+
+`Retry` and the `RetryRoundTripper` report exhaustion differently — match your error handling to the one you use:
+
+- **`Retry`** returns `nil` body and a wrapped error: `retries exhausted after <elapsed>: <lastErr>` (unwrap with `errors.Is`/`errors.As`). A response that overflows `WithMaxBodyBytes` returns `*ResponseTooLargeError` (no body).
+- **`RetryRoundTripper`** returns the **last response with a nil error**, even when that response is a retryable 5xx (e.g. a 503) — mirroring how a non-retried request behaves. A caller that checks only `err != nil` will treat an exhausted 503 as success, so **inspect `resp.StatusCode` and close the body**. (A budget abort via `WithRTMaxElapsedTime` or a `BackoffStop` does return an error.)
+
 ## Unsupported by Design (SKIP List)
 
 The following features are intentionally not provided:
 
-| Feature                                         | Rationale                                                                                                                  |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Circuit breaker                                 | Orthogonal pattern excluded by all comparables. Compose externally with sony/gobreaker.                                    |
-| Retry budget / token bucket                     | None of the comparables implement it. Disproportionate complexity (~150 LOC + shared mutable state) for a focused library. |
-| Multiple jitter strategies (full, decorrelated) | Equal jitter is the recommended default per AWS Builders' Library. Full jitter risks near-zero delays.                     |
-| `ErrorHandler` for exhaustion                   | Current `fmt.Errorf("retries exhausted: %w", lastErr)` is sufficient. Callers unwrap.                                      |
-| Response body on error                          | Adds API complexity (ownership of body close). Use `RetryWithBackoff[T]` with custom logic.                                |
-| Idempotency key injection                       | Application-level concern, not a retry library's responsibility.                                                           |
+| Feature                                                              | Rationale                                                                                                                                               |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Circuit breaker                                                      | Orthogonal pattern excluded by all comparables. Compose externally with sony/gobreaker.                                                                 |
+| Retry budget / token bucket                                          | None of the comparables implement it. Disproportionate complexity (~150 LOC + shared mutable state) for a focused library.                              |
+| Multiple jitter strategies (full, decorrelated)                      | Equal jitter is the recommended default per AWS Builders' Library. Full jitter risks near-zero delays.                                                  |
+| `ErrorHandler` for exhaustion                                        | Current `fmt.Errorf("retries exhausted: %w", lastErr)` is sufficient. Callers unwrap.                                                                   |
+| Response body on error                                               | Adds API complexity (ownership of body close). Use `RetryWithBackoff[T]` with custom logic.                                                             |
+| Idempotency key injection                                            | Application-level concern, not a retry library's responsibility.                                                                                        |
+| Configurable Retry-After cap / per-call `WithLogger` on the generics | A raisable cap would regress the fixed-60s DoS ceiling; a per-call logger on the positional generics forces an options refactor for no consumer demand. |
 
 ## License
 

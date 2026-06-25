@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 // === ROUND 5: Nil-option panic regression + edge-case option values ===
@@ -69,9 +69,9 @@ func TestR5_NilOption_RedirectOption(t *testing.T) {
 	}
 }
 
-// --- WithMaxRetries(negative) handling ---
+// --- WithRTMaxAttempts(negative) handling ---
 
-func TestR5_WithMaxRetries_Negative(t *testing.T) {
+func TestR5_WithRTMaxAttempts_Negative(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		calls.Add(1)
@@ -82,7 +82,7 @@ func TestR5_WithMaxRetries_Negative(t *testing.T) {
 		}, nil
 	})
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(-1),
+		httpx.WithRTMaxAttempts(-1),
 		httpx.WithRTBaseDelay(time.Millisecond),
 	)
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/neg", http.NoBody)
@@ -90,9 +90,10 @@ func TestR5_WithMaxRetries_Negative(t *testing.T) {
 	if resp != nil {
 		resp.Body.Close()
 	}
-	// Negative should fallback to default (2 retries = 3 attempts)
-	if got := calls.Load(); got != 3 {
-		t.Fatalf("WithMaxRetries(-1): calls=%d, want 3 (default)", got)
+	// Negative clamps to 1: a single attempt, never a silent no-op and never
+	// the old coerce-to-default-3.
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("WithRTMaxAttempts(-1): calls=%d, want 1 (clamped to a single attempt)", got)
 	}
 }
 
@@ -145,7 +146,7 @@ func TestR5_WithRTBaseDelay_Zero(t *testing.T) {
 	})
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(0),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -157,9 +158,9 @@ func TestR5_WithRTBaseDelay_Zero(t *testing.T) {
 	resp.Body.Close()
 }
 
-// --- WithMaxRetries(0) round-1 fix verification ---
+// --- WithRTMaxAttempts(0) clamp verification ---
 
-func TestR5_WithMaxRetries_Zero_Verify(t *testing.T) {
+func TestR5_WithRTMaxAttempts_Zero_Verify(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		calls.Add(1)
@@ -169,13 +170,13 @@ func TestR5_WithMaxRetries_Zero_Verify(t *testing.T) {
 			Header:     http.Header{},
 		}, nil
 	})
-	rt := httpx.NewRetryRoundTripper(transport, httpx.WithMaxRetries(0))
+	rt := httpx.NewRetryRoundTripper(transport, httpx.WithRTMaxAttempts(0))
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/zeroretry", http.NoBody)
 	resp, _ := rt.RoundTrip(req)
 	if resp != nil {
 		resp.Body.Close()
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("WithMaxRetries(0): calls=%d, want 1", got)
+		t.Fatalf("WithRTMaxAttempts(0): calls=%d, want 1 (clamped to a single attempt)", got)
 	}
 }

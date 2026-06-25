@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 // --- P0: RoundTripper must not mutate the caller's request ---
@@ -35,7 +35,7 @@ func TestRetryRoundTripper_does_not_mutate_caller_request(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 		httpx.WithPrepareRetry(func(req *http.Request) error {
 			req.Header.Set("X-Mutated", "yes")
 			return nil
@@ -82,7 +82,7 @@ func TestRetryRoundTripper_clone_isolates_body(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 		httpx.WithRetryNonIdempotent(true),
 	)
 
@@ -127,7 +127,7 @@ func TestRetryRoundTripper_GetBody_error_aborts(t *testing.T) {
 	wantErr := errors.New("body source closed")
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(3),
+		httpx.WithRTMaxAttempts(4),
 		httpx.WithRetryNonIdempotent(true),
 	)
 
@@ -165,7 +165,7 @@ func TestRetryRoundTripper_context_cancel_mid_backoff_prompt(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(5*time.Second),
-		httpx.WithMaxRetries(10),
+		httpx.WithRTMaxAttempts(11),
 	)
 
 	go func() {
@@ -207,7 +207,7 @@ func TestRetryRoundTripper_drains_discarded_response_bodies(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(3),
+		httpx.WithRTMaxAttempts(4),
 	)
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com", http.NoBody)
@@ -243,7 +243,7 @@ func TestRetryRoundTripper_BackoffStop_returns_last_error(t *testing.T) {
 
 	bo := &immediateStopBackoff{}
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(10),
+		httpx.WithRTMaxAttempts(11),
 		httpx.WithBackoffFunc(func() httpx.Backoff { return bo }),
 	)
 
@@ -302,7 +302,7 @@ func TestRetryRoundTripper_concurrent_backoff_factory_no_race(t *testing.T) {
 	})
 
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(3),
+		httpx.WithRTMaxAttempts(4),
 		// Fresh instance per request: no shared mutable backoff state.
 		httpx.WithBackoffFunc(func() httpx.Backoff {
 			return httpx.NewExponentialBackoff(httpx.WithInitialInterval(time.Millisecond))
