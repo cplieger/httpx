@@ -57,3 +57,10 @@ func TestGkHttpxU1_sleepBeforeRetry_surfaces_sleep_error(t *testing.T) {
 		t.Fatalf("sleepBeforeRetry(cancelled ctx) = %v, want errors.Is(err, context.Canceled)", got)
 	}
 }
+
+func TestRetryRoundTripper_transport_defaults_when_next_nil(t *testing.T) {
+	rt := &RetryRoundTripper{} // zero value: next == nil
+	if got := rt.transport(); got != http.DefaultTransport {
+		t.Errorf("(&RetryRoundTripper{}).transport() = %v, want http.DefaultTransport", got)
+	}
+}

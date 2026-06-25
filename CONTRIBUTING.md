@@ -32,6 +32,12 @@ don't send a PR that quietly adds it.
 
 ## Design invariants to preserve
 
+- **One retry-count model: total attempts, minimum 1.** Every entry point
+  (`Retry`, `RetryWithBackoff`, `RetryOnRateLimit`, `RetryRoundTripper`) counts
+  the TOTAL number of executions including the first; a non-positive count
+  clamps to 1 (try exactly once) — never a silent zero-attempt no-op and never a
+  coercion to the default. `v2_test.go` pins the exact counts for
+  `maxAttempts ∈ {0,1,2,3}`; keep them green.
 - **Equal jitter only.** `JitteredBackoff` returns `[backoff/2, backoff]` (AWS
   Builders' Library default). Full jitter risks near-zero delays and is
   excluded on purpose.
@@ -45,6 +51,17 @@ don't send a PR that quietly adds it.
   via `req.Clone(ctx)` per attempt; body replay goes through `req.GetBody`.
   Retrying non-idempotent methods is opt-in (`WithRetryNonIdempotent(true)` plus
   a `GetBody`).
+- **Per-request backoff, no shared state.** `WithBackoffFunc` is a factory
+  invoked once per `RoundTrip`, so each request drives its own `Backoff`
+  instance; `RetryRoundTripper` holds no shared `Backoff` or mutex. Don't
+  reintroduce a shared backoff instance — it corrupts progression across
+  goroutines that share one `StandardClient()`.
+- **RoundTrip exhaustion returns the last response, not an error.** When retries
+  are exhausted, `RoundTrip` returns the last `*http.Response` with a nil error
+  (even a retryable 503), mirroring stdlib (a 5xx is not a transport error); only
+  a `WithRTMaxElapsedTime` abort or a `BackoffStop` returns an error. `Retry`, by
+  contrast, returns `retries exhausted: %w`. Preserve both contracts — consumers
+  branch on them.
 - **Overflow- and context-safety.** `SafeDouble` guards against `int64`
   overflow; `SleepCtx` is cancellation-aware; `ParseRetryAfter` caps at
   `RetryAfterCap`. Preserve these guards when touching backoff/parse code.

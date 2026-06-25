@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 func shortOpts() []httpx.Option {
@@ -144,12 +144,18 @@ func TestRetry_body_size_limit(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// The 11MB body exceeds the 10MB cap. v2 fails loud with
+	// *ResponseTooLargeError (no truncated body) and reports the cap via Limit.
 	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
-	if err != nil {
-		t.Fatalf("Retry: %v", err)
+	if body != nil {
+		t.Errorf("body = %d bytes, want nil (oversize body must not be truncated and returned)", len(body))
 	}
-	if len(body) != 10<<20 {
-		t.Errorf("body size = %d, want %d", len(body), 10<<20)
+	var tooLarge *httpx.ResponseTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("Retry(oversize) error = %v, want *ResponseTooLargeError", err)
+	}
+	if tooLarge.Limit != 10<<20 {
+		t.Errorf("ResponseTooLargeError.Limit = %d, want %d", tooLarge.Limit, int64(10<<20))
 	}
 }
 
@@ -177,6 +183,41 @@ func TestRetry_honors_retry_after(t *testing.T) {
 	}
 	if elapsed < 900*time.Millisecond {
 		t.Errorf("elapsed = %v, want >= 900ms (Retry-After: 1 honored)", elapsed)
+	}
+}
+
+// TestRetry_honors_retry_after_on_503 asserts the Retry helper waits the
+// server-requested Retry-After on a 5xx, not just on 429 (cycle-1 h-f4
+// extended honoring to every retryable 5xx via retryAttempt's >=500 branch).
+func TestRetry_honors_retry_after_on_503(t *testing.T) {
+	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(fmt.Sprintf("%d", status), func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if calls.Add(1) == 1 {
+					w.Header().Set("Retry-After", "1")
+					w.WriteHeader(status)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("ok"))
+			}))
+			defer srv.Close()
+
+			start := time.Now()
+			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("Retry = %v, want nil", err)
+			}
+			if string(body) != "ok" {
+				t.Errorf("body = %q, want ok", body)
+			}
+			// Retry-After: 1 must be honored on the 5xx, not just on 429.
+			if elapsed < 900*time.Millisecond {
+				t.Errorf("elapsed = %v, want >= 900ms (Retry-After: 1 honored on %d)", elapsed, status)
+			}
+		})
 	}
 }
 
@@ -213,7 +254,7 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-func TestRedirectPolicy(t *testing.T) {
+func TestDockerGitHubRedirectPolicy(t *testing.T) {
 	makeReq := func(host string) *http.Request {
 		u, _ := url.Parse("https://" + host + "/some/path")
 		return &http.Request{URL: u}
@@ -245,12 +286,12 @@ func TestRedirectPolicy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := httpx.RedirectPolicy(makeReq(tt.host), makeVia(tt.viaLen))
+			err := httpx.DockerGitHubRedirectPolicy(makeReq(tt.host), makeVia(tt.viaLen))
 			if tt.wantErr && err == nil {
-				t.Errorf("RedirectPolicy(%q, via=%d) = nil, want error", tt.host, tt.viaLen)
+				t.Errorf("DockerGitHubRedirectPolicy(%q, via=%d) = nil, want error", tt.host, tt.viaLen)
 			}
 			if !tt.wantErr && err != nil {
-				t.Errorf("RedirectPolicy(%q, via=%d) = %v, want nil", tt.host, tt.viaLen, err)
+				t.Errorf("DockerGitHubRedirectPolicy(%q, via=%d) = %v, want nil", tt.host, tt.viaLen, err)
 			}
 		})
 	}
@@ -647,3 +688,111 @@ func TestRetry_non_transient_transport_error_fails_fast(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestRetry_WithHeaders_appliesHeadersToRequest(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
+		httpx.WithBaseDelay(time.Millisecond),
+		httpx.WithHeaders(func(req *http.Request) {
+			req.Header.Set("Authorization", "Bearer token123")
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Retry = %v, want nil", err)
+	}
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want ok", body)
+	}
+	if gotAuth != "Bearer token123" {
+		t.Errorf("server saw Authorization = %q, want Bearer token123", gotAuth)
+	}
+}
+
+func TestRetry_retries_on_transient_transport_error(t *testing.T) {
+	var calls atomic.Int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Header:     http.Header{},
+			}, nil
+		}),
+	}
+	body, err := httpx.Retry(t.Context(), client, "http://example.com/x",
+		httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxAttempts(3))
+	if err != nil {
+		t.Fatalf("Retry = %v, want nil after transient transport error", err)
+	}
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want ok", body)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("transport calls = %d, want 2", got)
+	}
+}
+
+func TestRetry_create_request_error_fails_fast(t *testing.T) {
+	// DEL control character (0x7f) makes http.NewRequestWithContext fail;
+	// logSafeError drops the url.Error wrapper so the url-parse cause is returned.
+	_, err := httpx.Retry(t.Context(), http.DefaultClient, "http://example.com/\x7f",
+		httpx.WithBaseDelay(time.Millisecond))
+	if err == nil {
+		t.Fatal("Retry with malformed URL = nil, want error")
+	}
+	if strings.Contains(err.Error(), "retries exhausted") {
+		t.Errorf("error = %v, want fast-fail (not retries-exhausted wrap)", err)
+	}
+	if !strings.Contains(err.Error(), "invalid control character") {
+		t.Errorf("error = %v, want URL-parse failure cause", err)
+	}
+}
+
+func TestRetry_read_response_body_error(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       &errReadCloser{err: errors.New("read boom")},
+				Header:     http.Header{},
+			}, nil
+		}),
+	}
+	_, err := httpx.Retry(t.Context(), client, "http://example.com/x",
+		httpx.WithBaseDelay(time.Millisecond))
+	if err == nil {
+		t.Fatal("Retry with erroring body = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "read response") {
+		t.Errorf("error = %v, want containing read response", err)
+	}
+}
+
+func TestStatusError_Is_unrelated_target_returns_false(t *testing.T) {
+	se := &httpx.StatusError{Code: http.StatusTooManyRequests, URL: "http://example.com"}
+	if errors.Is(se, io.EOF) {
+		t.Error("errors.Is(StatusError{429}, io.EOF) = true, want false")
+	}
+	if errors.Is(se, context.Canceled) {
+		t.Error("errors.Is(StatusError{429}, context.Canceled) = true, want false")
+	}
+}
+
+func TestCheckHTTPStatus_informational_1xx_returns_nil(t *testing.T) {
+	t.Parallel()
+	if err := httpx.CheckHTTPStatus(&http.Response{StatusCode: http.StatusContinue, Header: http.Header{}}); err != nil {
+		t.Errorf("CheckHTTPStatus(100) = %v, want nil (sub-200 is not an error)", err)
+	}
+	if err := httpx.CheckHTTPStatus(&http.Response{StatusCode: 199, Header: http.Header{}}); err != nil {
+		t.Errorf("CheckHTTPStatus(199) = %v, want nil (sub-200 is not an error)", err)
+	}
+}

@@ -92,6 +92,11 @@ func TestGkHttpxFix2_ParseRetryAfterResponse_values(t *testing.T) {
 	if d := ParseRetryAfterResponse(gkHttpxFix2Resp(429, "9")); d != 9*time.Second {
 		t.Errorf("ParseRetryAfterResponse(\"9\") = %v, want 9s", d)
 	}
+	// l-f4: ParseRetryAfterResponse now trims whitespace via the shared
+	// parseRetryAfterValue ("  30  " previously parsed to 0 via a failed Atoi).
+	if d := ParseRetryAfterResponse(gkHttpxFix2Resp(429, "  30  ")); d != 30*time.Second {
+		t.Errorf("ParseRetryAfterResponse(\"  30  \") = %v, want 30s", d)
+	}
 	// Future date positive (kills the `d < 0` negation at line 300).
 	future := time.Now().Add(45 * time.Second).UTC().Format(http.TimeFormat)
 	if d := ParseRetryAfterResponse(gkHttpxFix2Resp(429, future)); d <= 0 {

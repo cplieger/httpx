@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 // === ROUND 3: FINAL ADVERSARIAL SWEEP ===
@@ -35,7 +35,7 @@ func TestR3_Clone_ConcurrentRoundTrips_NoRace(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(1),
+		httpx.WithRTMaxAttempts(2),
 		httpx.WithPrepareRetry(func(req *http.Request) error {
 			req.Header.Set("X-Attempt", "retry")
 			return nil
@@ -96,7 +96,7 @@ func TestR3_PerRequestBackoff_Concurrent(t *testing.T) {
 	})
 
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(5),
+		httpx.WithRTMaxAttempts(6),
 		httpx.WithBackoffFunc(func() httpx.Backoff {
 			return httpx.NewExponentialBackoff(
 				httpx.WithInitialInterval(time.Millisecond),
@@ -147,7 +147,7 @@ func TestR3_BodyReplay_FiveAttempts(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(5),
+		httpx.WithRTMaxAttempts(6),
 		httpx.WithRetryNonIdempotent(true),
 	)
 
@@ -187,7 +187,7 @@ func TestR3_GetBody_ErrorMidSequence(t *testing.T) {
 	wantErr := errors.New("stream exhausted")
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(5),
+		httpx.WithRTMaxAttempts(6),
 		httpx.WithRetryNonIdempotent(true),
 	)
 
@@ -278,7 +278,7 @@ func TestR3_RoundTripper_CancelDuringBackoff_NoLeak(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		rt := httpx.NewRetryRoundTripper(transport,
 			httpx.WithRTBaseDelay(time.Hour),
-			httpx.WithMaxRetries(10),
+			httpx.WithRTMaxAttempts(11),
 		)
 		go func() {
 			time.Sleep(time.Millisecond)
@@ -341,9 +341,9 @@ func TestR3_NegativeConfig(t *testing.T) {
 		}, nil
 	})
 
-	// Negative MaxRetries, negative BaseDelay.
+	// Negative maxAttempts, negative BaseDelay.
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(-5),
+		httpx.WithRTMaxAttempts(-5),
 		httpx.WithRTBaseDelay(-time.Second),
 	)
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/neg", http.NoBody)
@@ -409,7 +409,7 @@ func TestR3_ConcurrentAccess_AllFields(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(3),
+		httpx.WithRTMaxAttempts(4),
 		httpx.WithRetryNonIdempotent(true),
 		httpx.WithOnRetry(func(_ int, _ *http.Request, _ *http.Response, _ error) {
 			onRetryCalls.Add(1)
@@ -450,37 +450,59 @@ func TestR3_ConcurrentAccess_AllFields(t *testing.T) {
 	}
 }
 
-// --- RetryWithBackoff: zero/negative maxRetries ---
+// --- RetryWithBackoff: degenerate maxAttempts clamps to a single call ---
 
-func TestR3_RetryWithBackoff_ZeroMaxRetries(t *testing.T) {
-	_, err := httpx.RetryWithBackoff(t.Context(), 0, time.Millisecond, "test", func(_ context.Context) (int, error) {
-		t.Fatal("fn should not be called with maxRetries=0")
-		return 0, nil
+func TestR3_RetryWithBackoff_ZeroMaxAttempts(t *testing.T) {
+	var calls atomic.Int32
+	got, err := httpx.RetryWithBackoff(t.Context(), 0, time.Millisecond, "test", func(_ context.Context) (int, error) {
+		calls.Add(1)
+		return 42, nil
 	})
 	if err != nil {
-		t.Errorf("RetryWithBackoff(maxRetries=0) = %v, want nil", err)
+		t.Errorf("RetryWithBackoff(maxAttempts=0) = %v, want nil", err)
+	}
+	if got != 42 {
+		t.Errorf("result = %d, want 42 (the single clamped attempt's value)", got)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("fn calls = %d, want 1 (maxAttempts<1 clamps to 1, fn always runs once)", n)
 	}
 }
 
-func TestR3_RetryWithBackoff_NegativeMaxRetries(t *testing.T) {
-	_, err := httpx.RetryWithBackoff(t.Context(), -1, time.Millisecond, "test", func(_ context.Context) (int, error) {
-		t.Fatal("fn should not be called with negative maxRetries")
-		return 0, nil
+func TestR3_RetryWithBackoff_NegativeMaxAttempts(t *testing.T) {
+	var calls atomic.Int32
+	got, err := httpx.RetryWithBackoff(t.Context(), -1, time.Millisecond, "test", func(_ context.Context) (int, error) {
+		calls.Add(1)
+		return 7, nil
 	})
 	if err != nil {
-		t.Errorf("RetryWithBackoff(maxRetries=-1) = %v, want nil", err)
+		t.Errorf("RetryWithBackoff(maxAttempts=-1) = %v, want nil", err)
+	}
+	if got != 7 {
+		t.Errorf("result = %d, want 7 (the single clamped attempt's value)", got)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("fn calls = %d, want 1 (negative maxAttempts clamps to 1)", n)
 	}
 }
 
-// --- RetryOnRateLimit: zero/negative maxAttempts ---
+// --- RetryOnRateLimit: degenerate maxAttempts clamps to a single call ---
 
 func TestR3_RetryOnRateLimit_ZeroMaxAttempts(t *testing.T) {
+	var calls atomic.Int32
+	sentinel := &httpx.RateLimitError{Msg: "rl"}
 	err := httpx.RetryOnRateLimit(t.Context(), 0, time.Second, func(_ context.Context) error {
-		t.Fatal("fn should not be called with maxAttempts=0")
-		return nil
+		calls.Add(1)
+		return sentinel
 	})
-	if err != nil {
-		t.Errorf("RetryOnRateLimit(maxAttempts=0) = %v, want nil", err)
+	// maxAttempts<1 clamps to 1: fn runs exactly once and its error is returned
+	// (never a silent zero-attempt no-op returning nil).
+	var rlErr *httpx.RateLimitError
+	if !errors.As(err, &rlErr) {
+		t.Errorf("RetryOnRateLimit(maxAttempts=0) = %v, want the single attempt's *RateLimitError", err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("fn calls = %d, want 1 (maxAttempts<1 clamps to 1)", n)
 	}
 }
 
@@ -582,7 +604,7 @@ func TestR3_DefaultCheckRetry_via_RoundTripper(t *testing.T) {
 				Header:     http.Header{},
 			}, nil
 		})
-		rt := httpx.NewRetryRoundTripper(transport, httpx.WithRTBaseDelay(time.Millisecond), httpx.WithMaxRetries(2))
+		rt := httpx.NewRetryRoundTripper(transport, httpx.WithRTBaseDelay(time.Millisecond), httpx.WithRTMaxAttempts(3))
 		req, _ := http.NewRequest(http.MethodGet, "http://example.com", http.NoBody)
 		resp, _ := rt.RoundTrip(req)
 		if resp != nil {
@@ -604,7 +626,7 @@ func TestR3_DefaultCheckRetry_via_RoundTripper(t *testing.T) {
 				Header:     http.Header{},
 			}, nil
 		})
-		rt := httpx.NewRetryRoundTripper(transport, httpx.WithRTBaseDelay(time.Millisecond), httpx.WithMaxRetries(2))
+		rt := httpx.NewRetryRoundTripper(transport, httpx.WithRTBaseDelay(time.Millisecond), httpx.WithRTMaxAttempts(3))
 		req, _ := http.NewRequest(http.MethodGet, "http://example.com", http.NoBody)
 		resp, _ := rt.RoundTrip(req)
 		if resp != nil {

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 // recordingBackoff records, per instance, the ordered sequence of NextBackOff
@@ -44,12 +44,12 @@ func TestPerRequestBackoffFactory_IndependentProgression(t *testing.T) {
 	t.Parallel()
 
 	const (
-		goroutines = 50
-		maxRetries = 5
+		goroutines  = 50
+		maxAttempts = 6
 	)
 
-	// Transport always 503 so each request exhausts maxRetries retries,
-	// producing exactly maxRetries NextBackOff calls on its own instance.
+	// Transport always 503 so each request exhausts all maxAttempts attempts,
+	// producing exactly maxAttempts-1 NextBackOff calls on its own instance.
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusServiceUnavailable,
@@ -62,7 +62,7 @@ func TestPerRequestBackoffFactory_IndependentProgression(t *testing.T) {
 	var instances []*recordingBackoff
 
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(maxRetries),
+		httpx.WithRTMaxAttempts(maxAttempts),
 		httpx.WithBackoffFunc(func() httpx.Backoff {
 			b := &recordingBackoff{}
 			mu.Lock()
@@ -93,9 +93,9 @@ func TestPerRequestBackoffFactory_IndependentProgression(t *testing.T) {
 	}
 
 	// Each instance must show an INDEPENDENT progression: its own ordered
-	// sequence [0,1,...,maxRetries-1]. A shared instance would instead show one
-	// instance with goroutines*maxRetries calls (and interleaved steps).
-	want := make([]int, maxRetries)
+	// sequence [0,1,...,maxAttempts-2]. A shared instance would instead show one
+	// instance with goroutines*(maxAttempts-1) calls (and interleaved steps).
+	want := make([]int, maxAttempts-1)
 	for i := range want {
 		want[i] = i
 	}

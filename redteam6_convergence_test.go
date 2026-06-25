@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 // === ROUND 6 CONVERGENCE: Final adversarial sweep ===
@@ -44,7 +44,7 @@ func TestR6_GetBody_ReplayAcross5Retries(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(5),
+		httpx.WithRTMaxAttempts(6),
 		httpx.WithRetryNonIdempotent(true),
 	)
 
@@ -99,7 +99,7 @@ func TestR6_PrepareRetry_HeaderIsolation_PerAttempt(t *testing.T) {
 	var prepareAttempt atomic.Int32
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(4),
+		httpx.WithRTMaxAttempts(5),
 		httpx.WithPrepareRetry(func(req *http.Request) error {
 			n := prepareAttempt.Add(1)
 			// Each PrepareRetry sets a DIFFERENT token value
@@ -169,7 +169,7 @@ func TestR6_Clone_TrailersPreserved(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 	)
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/trailers", http.NoBody)
@@ -207,7 +207,7 @@ func TestR6_Clone_HostPreserved(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 	)
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/hostclone", http.NoBody)
@@ -232,7 +232,7 @@ func TestR6_PerRequestBackoff_HeavyRace(t *testing.T) {
 	})
 
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(20),
+		httpx.WithRTMaxAttempts(21),
 		httpx.WithBackoffFunc(func() httpx.Backoff {
 			return httpx.NewExponentialBackoff(
 				httpx.WithInitialInterval(time.Millisecond),
@@ -271,7 +271,7 @@ func TestR6_PrepareRetry_Error_NoLeak(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(3),
+		httpx.WithRTMaxAttempts(4),
 		httpx.WithPrepareRetry(func(req *http.Request) error {
 			req.Header.Set("X-Mutated", "yes")
 			return io.ErrUnexpectedEOF // always fail
@@ -310,7 +310,7 @@ func TestR6_NilCallbacks_NoPanic(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 		httpx.WithPrepareRetry(nil),
 		httpx.WithOnRetry(nil),
 		httpx.WithCheckRetry(nil),
@@ -340,7 +340,7 @@ func TestR6_GetBody_ErrorOnRewind(t *testing.T) {
 	var getBodyCalls atomic.Int32
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(5),
+		httpx.WithRTMaxAttempts(6),
 		httpx.WithRetryNonIdempotent(true),
 	)
 

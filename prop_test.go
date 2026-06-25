@@ -54,6 +54,9 @@ func FuzzParseRetryAfter(f *testing.F) {
 	f.Add("0")
 	f.Add("3600")
 	f.Add("garbage!@#$%")
+	f.Add("  30  ")
+	f.Add("\t60\n")
+	f.Add("Mon, 02 Jan 2006 15:04:05 GMT")
 
 	f.Fuzz(func(t *testing.T, val string) {
 		d := ParseRetryAfter(val)
@@ -73,6 +76,9 @@ func FuzzParseRetryAfterResponse(f *testing.F) {
 	f.Add("0")
 	f.Add("3600")
 	f.Add("garbage!@#$%")
+	f.Add("  30  ")
+	f.Add("\t60\n")
+	f.Add("Mon, 02 Jan 2006 15:04:05 GMT")
 
 	f.Fuzz(func(t *testing.T, val string) {
 		resp := &http.Response{Header: http.Header{}}
@@ -82,6 +88,23 @@ func FuzzParseRetryAfterResponse(f *testing.F) {
 		d := ParseRetryAfterResponse(resp)
 		if d < 0 {
 			t.Fatalf("ParseRetryAfterResponse(%q) returned negative: %v", val, d)
+		}
+		// Cross-function consistency invariant (cycle-1 l-f4 merged both onto
+		// the shared parseRetryAfterValue, so they must differ only by the cap):
+		// ParseRetryAfter(val) == min(ParseRetryAfterResponse(resp), cap).
+		// A tolerance absorbs the sub-microsecond clock drift between the two
+		// time.Until evaluations an HTTP-date value triggers; a real regression
+		// (either function ceasing to delegate, or the cap being dropped) moves
+		// the value by whole seconds, far past the margin.
+		capped := min(d, RetryAfterCap)
+		pra := ParseRetryAfter(val)
+		diff := pra - capped
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > 2*time.Second {
+			t.Fatalf("ParseRetryAfter(%q)=%v but min(ParseRetryAfterResponse, cap)=%v (diff %v): consistency broken",
+				val, pra, capped, diff)
 		}
 	})
 }

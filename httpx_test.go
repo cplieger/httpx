@@ -257,6 +257,15 @@ func TestHTTPStatusError_preserves_wire_format(t *testing.T) {
 	}
 }
 
+func TestResponseTooLargeError_Error_message(t *testing.T) {
+	t.Parallel()
+	got := (&ResponseTooLargeError{Limit: 1024}).Error()
+	want := "response body exceeds 1024 bytes"
+	if got != want {
+		t.Errorf("ResponseTooLargeError{Limit:1024}.Error() = %q, want %q", got, want)
+	}
+}
+
 func TestPermanentError(t *testing.T) {
 	t.Parallel()
 
@@ -367,4 +376,22 @@ func TestExponentialBackoff(t *testing.T) {
 			t.Fatal("after Reset, should not stop immediately")
 		}
 	})
+}
+
+func TestRetryWithBackoff_context_deadline_during_backoff_sleep(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	calls := 0
+	_, err := RetryWithBackoff(ctx, 3, 10*time.Second, "test",
+		func(_ context.Context) (string, error) {
+			calls++
+			return "", &HTTPStatusError{Code: 503}
+		})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RetryWithBackoff = %v, want context.DeadlineExceeded", err)
+	}
+	if calls != 1 {
+		t.Errorf("fn calls = %d, want 1 (deadline during first backoff sleep)", calls)
+	}
 }

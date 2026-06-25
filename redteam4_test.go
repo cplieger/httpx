@@ -12,15 +12,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx"
+	"github.com/cplieger/httpx/v2"
 )
 
 // === ROUND 4: POST-REFACTOR RED-TEAM ===
 
 // --- (A) REFACTOR-SPECIFIC: Default parity ---
 
-// TestR4_NewRetryRoundTripper_Defaults verifies no-option constructor yields
-// DefaultMaxAttempts-1 retries (2) and DefaultBaseDelay.
+// TestR4_NewRetryRoundTripper_Defaults verifies the no-option constructor
+// yields DefaultMaxAttempts (3) total attempts and DefaultBaseDelay.
 func TestR4_NewRetryRoundTripper_Defaults(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
@@ -39,7 +39,7 @@ func TestR4_NewRetryRoundTripper_Defaults(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	// DefaultMaxAttempts=3, so maxRetries=2, total attempts=3
+	// DefaultMaxAttempts=3 total attempts (initial + 2 retries).
 	if got := calls.Load(); got != 3 {
 		t.Fatalf("no-option NewRetryRoundTripper: calls=%d, want 3 (DefaultMaxAttempts)", got)
 	}
@@ -78,9 +78,11 @@ func TestR4_Retry_Defaults(t *testing.T) {
 	}
 }
 
-// TestR4_Retry_MaxBodyBytes_Default ensures default body limit is 10MB.
+// TestR4_Retry_MaxBodyBytes_Default ensures the default 10MB body limit is
+// enforced: an oversize body fails loud with *ResponseTooLargeError (v2 no
+// longer silently truncates) and reports the cap it hit via Limit.
 func TestR4_Retry_MaxBodyBytes_Default(t *testing.T) {
-	// Return body slightly larger than 10MB; verify we get exactly 10MB
+	// Return a body slightly larger than the 10MB default cap.
 	bigBody := make([]byte, 10<<20+100)
 	for i := range bigBody {
 		bigBody[i] = 'A'
@@ -95,11 +97,15 @@ func TestR4_Retry_MaxBodyBytes_Default(t *testing.T) {
 	client := &http.Client{Transport: transport}
 
 	body, err := httpx.Retry(t.Context(), client, "http://example.com/bigbody")
-	if err != nil {
-		t.Fatalf("Retry error: %v", err)
+	if body != nil {
+		t.Fatalf("default MaxBodyBytes: body=%d bytes, want nil (oversize must not return a truncated body)", len(body))
 	}
-	if int64(len(body)) != 10<<20 {
-		t.Fatalf("default MaxBodyBytes: got %d bytes, want %d", len(body), 10<<20)
+	var tooLarge *httpx.ResponseTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("Retry(oversize) error = %v, want *ResponseTooLargeError", err)
+	}
+	if tooLarge.Limit != 10<<20 {
+		t.Errorf("ResponseTooLargeError.Limit = %d, want %d", tooLarge.Limit, int64(10<<20))
 	}
 }
 
@@ -142,7 +148,7 @@ func TestR4_RedirectPolicyFunc_MaxHops_Default(t *testing.T) {
 
 // TestR4_RTOption_DoesNotAffect_Retry verifies RTOption type can't be passed to Retry.
 // This is a compile-time check; if it compiles, the types are distinct.
-// We just verify that setting WithMaxRetries on RT doesn't affect Retry's defaults.
+// We just verify that setting WithRTMaxAttempts on RT doesn't affect Retry's defaults.
 func TestR4_RTOption_DoesNotAffect_Retry(t *testing.T) {
 	var retryCalls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
@@ -211,7 +217,7 @@ func TestR4_RoundTripper_Clones_CallerRequest(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(2),
+		httpx.WithRTMaxAttempts(3),
 		httpx.WithPrepareRetry(func(req *http.Request) error {
 			req.Header.Set("X-Mutated", "yes")
 			return nil
@@ -259,7 +265,7 @@ func TestR4_RoundTripper_DrainsDiscardedBodies(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(3),
+		httpx.WithRTMaxAttempts(4),
 	)
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/drain", http.NoBody)
@@ -283,7 +289,7 @@ func TestR4_PerRequestBackoff_Race(t *testing.T) {
 	})
 
 	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithMaxRetries(5),
+		httpx.WithRTMaxAttempts(6),
 		httpx.WithBackoffFunc(func() httpx.Backoff {
 			return httpx.NewExponentialBackoff(
 				httpx.WithInitialInterval(time.Millisecond),
@@ -359,7 +365,7 @@ func TestR4_ContextCancel_MidBackoff(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(10*time.Second), // long delay
-		httpx.WithMaxRetries(5),
+		httpx.WithRTMaxAttempts(6),
 	)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -412,7 +418,7 @@ func TestR4_GetBody_Replay(t *testing.T) {
 
 	rt := httpx.NewRetryRoundTripper(transport,
 		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithMaxRetries(4),
+		httpx.WithRTMaxAttempts(5),
 		httpx.WithRetryNonIdempotent(true),
 	)
 
@@ -442,15 +448,15 @@ func TestR4_GetBody_Replay(t *testing.T) {
 
 func TestR4_NewRetryRoundTripper_NilTransport(t *testing.T) {
 	// Should not panic with nil transport
-	rt := httpx.NewRetryRoundTripper(nil, httpx.WithMaxRetries(0))
+	rt := httpx.NewRetryRoundTripper(nil, httpx.WithRTMaxAttempts(0))
 	if rt == nil {
 		t.Fatal("NewRetryRoundTripper(nil) returned nil")
 	}
 }
 
-// --- (A) REFACTOR-SPECIFIC: WithMaxRetries(0) means only 1 attempt ---
+// --- (A) REFACTOR-SPECIFIC: WithRTMaxAttempts(0) clamps to a single attempt ---
 
-func TestR4_WithMaxRetries_Zero(t *testing.T) {
+func TestR4_WithRTMaxAttempts_Zero(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		calls.Add(1)
@@ -461,15 +467,16 @@ func TestR4_WithMaxRetries_Zero(t *testing.T) {
 		}, nil
 	})
 
-	rt := httpx.NewRetryRoundTripper(transport, httpx.WithMaxRetries(0))
+	rt := httpx.NewRetryRoundTripper(transport, httpx.WithRTMaxAttempts(0))
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/once", http.NoBody)
 	resp, _ := rt.RoundTrip(req)
 	if resp != nil {
 		resp.Body.Close()
 	}
 
-	// WithMaxRetries(0) must mean no retries — only 1 attempt.
+	// WithRTMaxAttempts(0) clamps to 1 — exactly one attempt, no retries, and
+	// never a silent zero-attempt no-op.
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("WithMaxRetries(0): calls=%d, want 1 (no retries)", got)
+		t.Fatalf("WithRTMaxAttempts(0): calls=%d, want 1 (clamped to a single attempt)", got)
 	}
 }

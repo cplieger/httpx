@@ -53,7 +53,7 @@ func BenchmarkRetryRoundTripper_Success(b *testing.B) {
 		Body:       io.NopCloser(strings.NewReader("ok")),
 		Header:     http.Header{},
 	}
-	rt := NewRetryRoundTripper(&stubRT{resp: okResp}, WithMaxRetries(2))
+	rt := NewRetryRoundTripper(&stubRT{resp: okResp}, WithRTMaxAttempts(3))
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com", http.NoBody)
 
 	b.ResetTimer()
@@ -78,7 +78,7 @@ func BenchmarkRetryRoundTripper_RetryThenSuccess(b *testing.B) {
 	inner := &failThenSucceedRT{failCount: 1, successResp: okResp}
 	// Use zero-delay backoff to benchmark the retry machinery, not sleep.
 	zeroBackoff := &zeroBO{}
-	rt := NewRetryRoundTripper(inner, WithMaxRetries(3),
+	rt := NewRetryRoundTripper(inner, WithRTMaxAttempts(4),
 		WithBackoffFunc(func() Backoff { return zeroBackoff }))
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com", http.NoBody)
 
