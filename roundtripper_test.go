@@ -558,40 +558,6 @@ func TestRetryRoundTripper_HEAD_retried(t *testing.T) {
 	}
 }
 
-func TestRetryRoundTripper_MaxElapsedTime(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(50*time.Millisecond),
-		httpx.WithRTMaxAttempts(11),
-		httpx.WithRTMaxElapsedTime(80*time.Millisecond),
-	)
-	client := rt.StandardClient()
-
-	_, err := client.Get(srv.URL) //nolint:bodyclose // error path returns no body
-	if err == nil {
-		t.Fatal("expected error from MaxElapsedTime")
-	}
-	if !strings.Contains(err.Error(), "max elapsed time") {
-		t.Errorf("error = %v, want containing 'max elapsed time'", err)
-	}
-	// l-f8: the always-503 server drives the lastErr==nil branch of
-	// sleepBeforeRetry, which must return a clean message. A regression that
-	// re-wraps a nil lastErr as fmt.Errorf("...: %w", nil) renders
-	// "max elapsed time 80ms exceeded: %!w(<nil>)" — lock the clean form in.
-	if strings.Contains(err.Error(), "<nil>") || strings.Contains(err.Error(), "%!w") {
-		t.Errorf("clean nil-lastErr error expected, got %v", err)
-	}
-	if got := calls.Load(); got > 4 {
-		t.Errorf("calls = %d, want <= 4 with MaxElapsedTime", got)
-	}
-}
-
 func TestRetryRoundTripper_PermanentError_stops_retry(t *testing.T) {
 	var calls atomic.Int32
 	permErr := httpx.Permanent(errors.New("do not retry"))
@@ -615,82 +581,6 @@ func TestRetryRoundTripper_PermanentError_stops_retry(t *testing.T) {
 	}
 }
 
-// testBackoff is a simple Backoff implementation for testing.
-type testBackoff struct {
-	delays []time.Duration
-	idx    int
-}
-
-func (b *testBackoff) NextBackOff() time.Duration {
-	if b.idx >= len(b.delays) {
-		return httpx.BackoffStop
-	}
-	d := b.delays[b.idx]
-	b.idx++
-	return d
-}
-
-func (b *testBackoff) Reset() { b.idx = 0 }
-
-func TestRetryRoundTripper_custom_Backoff(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) <= 2 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	bo := &testBackoff{delays: []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}}
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTMaxAttempts(6),
-		httpx.WithBackoffFunc(func() httpx.Backoff { return bo }),
-	)
-	client := rt.StandardClient()
-
-	resp, err := client.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
-	}
-	if got := calls.Load(); got != 3 {
-		t.Errorf("calls = %d, want 3", got)
-	}
-}
-
-func TestRetryRoundTripper_Backoff_Stop(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-
-	bo := &testBackoff{delays: []time.Duration{time.Millisecond}}
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTMaxAttempts(11),
-		httpx.WithBackoffFunc(func() httpx.Backoff { return bo }),
-	)
-	client := rt.StandardClient()
-
-	resp, err := client.Get(srv.URL)
-	if err != nil {
-		// Backoff stop returns error.
-		return
-	}
-	if resp != nil {
-		resp.Body.Close()
-	}
-	if got := calls.Load(); got > 3 {
-		t.Errorf("calls = %d, want <= 3 with Backoff stop", got)
-	}
-}
-
 func TestRetryRoundTripper_GetBody_error_aborts_retry(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
@@ -707,7 +597,8 @@ func TestRetryRoundTripper_GetBody_error_aborts_retry(t *testing.T) {
 		httpx.WithRetryNonIdempotent(true),
 	)
 	req, _ := http.NewRequest(http.MethodPost, "http://example.com/x", strings.NewReader("payload"))
-	req.GetBody = func() (io.ReadCloser, error) { return nil, errors.New("rewind boom") }
+	wantErr := errors.New("rewind boom")
+	req.GetBody = func() (io.ReadCloser, error) { return nil, wantErr }
 	resp, err := rt.RoundTrip(req)
 	if resp != nil {
 		resp.Body.Close()
@@ -718,74 +609,8 @@ func TestRetryRoundTripper_GetBody_error_aborts_retry(t *testing.T) {
 	if !strings.Contains(err.Error(), "rewind request body") {
 		t.Errorf("error = %v, want containing rewind request body", err)
 	}
-	if got := calls.Load(); got != 1 {
-		t.Errorf("transport calls = %d, want 1", got)
-	}
-}
-
-func TestRetryRoundTripper_BackoffStop_returns_last_transport_error(t *testing.T) {
-	var calls atomic.Int32
-	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		calls.Add(1)
-		return nil, io.ErrUnexpectedEOF
-	})
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTMaxAttempts(6),
-		httpx.WithBackoffFunc(func() httpx.Backoff { return &testBackoff{} }),
-	)
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com/x", http.NoBody)
-	resp, err := rt.RoundTrip(req)
-	if resp != nil {
-		resp.Body.Close()
-	}
-	if err == nil {
-		t.Fatal("RoundTrip = nil, want last transport error on BackoffStop")
-	}
-	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Errorf("error = %v, want wrapping io.ErrUnexpectedEOF", err)
-	}
-	if got := calls.Load(); got != 1 {
-		t.Errorf("transport calls = %d, want 1", got)
-	}
-}
-
-func TestExponentialBackoff_zero_value_is_usable(t *testing.T) {
-	t.Parallel()
-	var b httpx.ExponentialBackoff
-	got := b.NextBackOff()
-	if got == httpx.BackoffStop {
-		t.Fatal("zero-value ExponentialBackoff.NextBackOff() = BackoffStop, want usable delay")
-	}
-	if got < httpx.DefaultBaseDelay/2 || got > httpx.DefaultBaseDelay {
-		t.Errorf("zero-value NextBackOff() = %v, want [%v, %v]",
-			got, httpx.DefaultBaseDelay/2, httpx.DefaultBaseDelay)
-	}
-}
-
-func TestRetryRoundTripper_MaxElapsedTime_wraps_transport_error(t *testing.T) {
-	var calls atomic.Int32
-	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		calls.Add(1)
-		return nil, io.ErrUnexpectedEOF
-	})
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(time.Hour),
-		httpx.WithRTMaxAttempts(3),
-		httpx.WithRTMaxElapsedTime(time.Millisecond),
-	)
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com/elapsed-transport-err", http.NoBody)
-	resp, err := rt.RoundTrip(req)
-	if resp != nil {
-		resp.Body.Close()
-	}
-	if err == nil {
-		t.Fatal("RoundTrip = nil, want max-elapsed-time error")
-	}
-	if !strings.Contains(err.Error(), "max elapsed time") {
-		t.Errorf("error = %v, want containing 'max elapsed time'", err)
-	}
-	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Errorf("error = %v, want errors.Is(err, io.ErrUnexpectedEOF)", err)
+	if !errors.Is(err, wantErr) {
+		t.Errorf("error = %v, want wrapping the GetBody error", err)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("transport calls = %d, want 1", got)
@@ -825,5 +650,146 @@ func TestRetryRoundTripper_cancel_after_retryable_response_skips_onRetry(t *test
 	}
 	if got := onRetryCalls.Load(); got != 0 {
 		t.Errorf("OnRetry calls = %d, want 0 (no retry once context is cancelled)", got)
+	}
+}
+
+// TestRetryRoundTripper_defaultCheckRetry_status_table pins the built-in policy:
+// 429/502/503/504 retry; 200/4xx and (notably) 500 do NOT. The 500 exclusion is
+// a documented divergence from the one-shot Retry helper.
+func TestRetryRoundTripper_defaultCheckRetry_status_table(t *testing.T) {
+	t.Parallel()
+	statusCalls := func(t *testing.T, code, wantCalls int) {
+		t.Helper()
+		var calls atomic.Int32
+		transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{
+				StatusCode: code,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     http.Header{},
+			}, nil
+		})
+		rt := httpx.NewRetryRoundTripper(transport, httpx.WithRTBaseDelay(time.Millisecond), httpx.WithRTMaxAttempts(3))
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com", http.NoBody)
+		resp, _ := rt.RoundTrip(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if got := int(calls.Load()); got != wantCalls {
+			t.Errorf("code %d: calls = %d, want %d", code, got, wantCalls)
+		}
+	}
+	for _, code := range []int{200, 400, 401, 403, 404, 500} {
+		statusCalls(t, code, 1) // not retried
+	}
+	for _, code := range []int{429, 502, 503, 504} {
+		statusCalls(t, code, 3) // retried to exhaustion
+	}
+}
+
+// TestRetryRoundTripper_nil_callbacks_no_panic verifies that explicitly passing
+// nil hooks (WithPrepareRetry(nil)/WithOnRetry(nil)/WithCheckRetry(nil)) is safe:
+// nil onRetry/prepareRetry are skipped and a nil checkRetry falls back to the
+// default policy.
+func TestRetryRoundTripper_nil_callbacks_no_panic(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		if calls.Add(1) < 2 {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     http.Header{},
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Header:     http.Header{},
+		}, nil
+	})
+
+	rt := httpx.NewRetryRoundTripper(transport,
+		httpx.WithRTBaseDelay(time.Millisecond),
+		httpx.WithRTMaxAttempts(3),
+		httpx.WithPrepareRetry(nil),
+		httpx.WithOnRetry(nil),
+		httpx.WithCheckRetry(nil),
+	)
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/nilcb", http.NoBody)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("nil callbacks caused error: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestRetryRoundTripper_nil_transport_does_not_panic verifies the constructor
+// falls back to http.DefaultTransport when next is nil.
+func TestRetryRoundTripper_nil_transport_does_not_panic(t *testing.T) {
+	t.Parallel()
+	rt := httpx.NewRetryRoundTripper(nil, httpx.WithRTMaxAttempts(1))
+	if rt == nil {
+		t.Fatal("NewRetryRoundTripper(nil) returned nil")
+	}
+}
+
+// TestRetryRoundTripper_maxAttempts_zero_with_custom_checkRetry verifies the
+// attempt clamp dominates: even an always-retry custom policy cannot force a
+// second attempt when maxAttempts clamps to 1.
+func TestRetryRoundTripper_maxAttempts_zero_with_custom_checkRetry(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, io.ErrUnexpectedEOF
+	})
+	rt := httpx.NewRetryRoundTripper(transport,
+		httpx.WithRTMaxAttempts(0),
+		httpx.WithCheckRetry(func(_ context.Context, _ *http.Response, _ error) (bool, error) {
+			return true, nil // always retry — but maxAttempts clamps to 1
+		}),
+	)
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/zero-custom", http.NoBody)
+	_, err := rt.RoundTrip(req) //nolint:bodyclose // error path, no response body
+	if err == nil {
+		t.Fatal("expected error from the single clamped attempt")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("WithRTMaxAttempts(0)+custom CheckRetry: calls=%d, want 1 (clamped to one attempt)", got)
+	}
+}
+
+// TestRetryRoundTripper_drains_every_discarded_response_body verifies each
+// discarded retry response is drained-and-closed: 3 intermediate + 1 final.
+func TestRetryRoundTripper_drains_every_discarded_response_body(t *testing.T) {
+	t.Parallel()
+	var closed atomic.Int32
+	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Body: &trackingCloser{
+				Reader:  strings.NewReader("response-body-data"),
+				onClose: func() { closed.Add(1) },
+			},
+			Header: http.Header{},
+		}, nil
+	})
+
+	rt := httpx.NewRetryRoundTripper(transport,
+		httpx.WithRTBaseDelay(time.Millisecond),
+		httpx.WithRTMaxAttempts(4),
+	)
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com", http.NoBody)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Body.Close()
+	if got := closed.Load(); got != 4 {
+		t.Errorf("closed count = %d, want 4 (3 intermediate + 1 final)", got)
 	}
 }

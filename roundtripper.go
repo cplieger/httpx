@@ -257,42 +257,67 @@ func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 			if abortErr := rt.sleepBeforeRetry(ctx, attempt, req, resp, err, backoff, bo, start); abortErr != nil {
 				return nil, abortErr
 			}
-			if bo == nil {
-				backoff = SafeDouble(backoff)
-			}
+			// Advancing the default backoff unconditionally is harmless when a
+			// custom Backoff is in use (its value is then unused by sleepBeforeRetry).
+			backoff = SafeDouble(backoff)
 		}
 
-		tryReq := req.Clone(ctx)
-		if attempt > 0 && req.GetBody != nil {
-			body, bodyErr := req.GetBody()
-			if bodyErr != nil {
-				return nil, fmt.Errorf("rewind request body: %w", bodyErr)
-			}
-			tryReq.Body = body
-		}
-		if attempt > 0 && rt.prepareRetry != nil {
-			if prepErr := rt.prepareRetry(tryReq); prepErr != nil {
-				return nil, fmt.Errorf("prepare retry: %w", prepErr)
-			}
+		tryReq, buildErr := rt.buildAttemptRequest(ctx, req, attempt)
+		if buildErr != nil {
+			return nil, buildErr
 		}
 
 		resp, err = rt.transport().RoundTrip(tryReq)
 
-		shouldRetry, checkErr := check(ctx, resp, err)
-		if checkErr != nil {
-			drainResp(resp)
-			return nil, checkErr
-		}
-		if !shouldRetry {
-			return resp, err
-		}
-		if ctx.Err() != nil {
-			drainResp(resp)
-			return nil, ctx.Err()
+		if done, finalResp, finalErr := rt.evaluateAttempt(ctx, check, resp, err); done {
+			return finalResp, finalErr
 		}
 	}
 
 	return resp, err
+}
+
+// buildAttemptRequest clones req for a single attempt. The caller's request is
+// never mutated (RoundTripper contract). On retries (attempt > 0) it rewinds the
+// body via GetBody and applies the PrepareRetry hook.
+func (rt *RetryRoundTripper) buildAttemptRequest(ctx context.Context, req *http.Request, attempt int) (*http.Request, error) {
+	tryReq := req.Clone(ctx)
+	if attempt == 0 {
+		return tryReq, nil
+	}
+	if req.GetBody != nil {
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return nil, fmt.Errorf("rewind request body: %w", bodyErr)
+		}
+		tryReq.Body = body
+	}
+	if rt.prepareRetry != nil {
+		if prepErr := rt.prepareRetry(tryReq); prepErr != nil {
+			return nil, fmt.Errorf("prepare retry: %w", prepErr)
+		}
+	}
+	return tryReq, nil
+}
+
+// evaluateAttempt applies the retry policy after an attempt. done==true means
+// RoundTrip stops and returns (finalResp, finalErr); done==false means retry.
+// A retryable response is drained only when stopping early on a policy or
+// context error; the success/no-retry path hands the body back to the caller.
+func (rt *RetryRoundTripper) evaluateAttempt(ctx context.Context, check CheckRetry, resp *http.Response, err error) (done bool, finalResp *http.Response, finalErr error) {
+	shouldRetry, checkErr := check(ctx, resp, err)
+	if checkErr != nil {
+		drainResp(resp)
+		return true, nil, checkErr
+	}
+	if !shouldRetry {
+		return true, resp, err
+	}
+	if ctx.Err() != nil {
+		drainResp(resp)
+		return true, nil, ctx.Err()
+	}
+	return false, nil, nil
 }
 
 // sleepBeforeRetry handles the pre-retry logic: hook, compute wait, honor
@@ -302,21 +327,13 @@ func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, 
 		rt.onRetry(attempt, req, resp, lastErr)
 	}
 
-	var wait time.Duration
-	if bo != nil {
-		// bo is a per-request instance (from rt.backoffFunc), so advancing it
-		// here needs no lock — no other goroutine shares it.
-		w := bo.NextBackOff()
-		if w == BackoffStop {
-			drainResp(resp)
-			if lastErr != nil {
-				return lastErr
-			}
-			return errors.New("backoff stopped")
+	wait, stop := nextWait(bo, backoff)
+	if stop {
+		drainResp(resp)
+		if lastErr != nil {
+			return lastErr
 		}
-		wait = w
-	} else {
-		wait = JitteredBackoff(backoff)
+		return errors.New("backoff stopped")
 	}
 
 	// Honor Retry-After on any retryable response (429, 502, 503, 504).
@@ -329,18 +346,9 @@ func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, 
 		}
 	}
 
-	// maxElapsedTime is a hard ceiling. Check it AFTER computing the final wait
-	// (including any honored Retry-After): if sleeping would push total retry
-	// time to or past the budget, abort now rather than overshoot it. An
-	// honored Retry-After can dwarf the remaining budget, so the pre-wait
-	// elapsed alone is not a sufficient guard. This subsumes the
-	// already-exceeded case (wait >= 0).
-	// Compare without adding so a near-MaxInt64 wait cannot overflow the sum
-	// (CWE-190): abort if the elapsed time already meets the budget, or if the
-	// remaining budget is <= wait. maxElapsedTime-elapsed is computed only when
-	// elapsed < maxElapsedTime, so it stays positive and cannot underflow.
-	if elapsed := time.Since(start); rt.maxElapsedTime > 0 &&
-		(elapsed >= rt.maxElapsedTime || wait >= rt.maxElapsedTime-elapsed) {
+	// maxElapsedTime is a hard ceiling. The check (computed AFTER any honored
+	// Retry-After) aborts now rather than overshoot the budget by sleeping.
+	if rt.elapsedBudgetExceeded(wait, start) {
 		drainResp(resp)
 		if lastErr != nil {
 			return fmt.Errorf("max elapsed time %s exceeded: %w", rt.maxElapsedTime, lastErr)
@@ -355,6 +363,33 @@ func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, 
 	}
 
 	return nil
+}
+
+// nextWait returns the base wait for this retry. With a custom Backoff it
+// advances that instance (per-request, so no lock is needed); stop==true
+// signals the Backoff is exhausted (BackoffStop). Without one it derives an
+// equal-jitter wait from the doubling default backoff.
+func nextWait(bo Backoff, backoff time.Duration) (wait time.Duration, stop bool) {
+	if bo == nil {
+		return JitteredBackoff(backoff), false
+	}
+	if w := bo.NextBackOff(); w != BackoffStop {
+		return w, false
+	}
+	return 0, true
+}
+
+// elapsedBudgetExceeded reports whether sleeping for wait now would meet or pass
+// the maxElapsedTime ceiling. The comparison tests the remaining budget rather
+// than summing elapsed+wait, so a near-MaxInt64 wait cannot overflow (CWE-190);
+// maxElapsedTime-elapsed is evaluated only when elapsed < maxElapsedTime, so it
+// stays positive. A non-positive maxElapsedTime means "no ceiling".
+func (rt *RetryRoundTripper) elapsedBudgetExceeded(wait time.Duration, start time.Time) bool {
+	if rt.maxElapsedTime <= 0 {
+		return false
+	}
+	elapsed := time.Since(start)
+	return elapsed >= rt.maxElapsedTime || wait >= rt.maxElapsedTime-elapsed
 }
 
 // drainResp drains and closes a response body if present.

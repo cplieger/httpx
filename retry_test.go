@@ -1,13 +1,14 @@
 package httpx_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,11 @@ import (
 
 	"github.com/cplieger/httpx/v2"
 )
+
+// bufLogger returns a debug-level text logger writing into buf.
+func bufLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
 
 func shortOpts() []httpx.Option {
 	return []httpx.Option{httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(10 << 20)}
@@ -231,7 +237,13 @@ func TestParseRetryAfter(t *testing.T) {
 		{"empty", "", 0},
 		{"delta seconds", "5", 5 * time.Second},
 		{"delta seconds with whitespace", "  10  ", 10 * time.Second},
+		{"delta seconds just under cap", "59", 59 * time.Second},
+		{"delta seconds exactly at cap", "60", 60 * time.Second},
+		{"delta seconds one over cap", "61", 60 * time.Second},
 		{"delta seconds capped at 60", "120", 60 * time.Second},
+		{"huge value capped not overflowed", "10000000000", 60 * time.Second},
+		{"max int64 seconds capped", "9223372036854775807", 60 * time.Second},
+		{"above int64 range treated as malformed", "99999999999999999999", 0},
 		{"zero", "0", 0},
 		{"negative", "-5", 0},
 		{"malformed", "soon", 0},
@@ -254,262 +266,12 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-func TestDockerGitHubRedirectPolicy(t *testing.T) {
-	makeReq := func(host string) *http.Request {
-		u, _ := url.Parse("https://" + host + "/some/path")
-		return &http.Request{URL: u}
-	}
-	makeVia := func(n int) []*http.Request {
-		via := make([]*http.Request, n)
-		for i := range n {
-			via[i] = &http.Request{}
-		}
-		return via
-	}
-
-	tests := []struct {
-		name    string
-		host    string
-		viaLen  int
-		wantErr bool
-	}{
-		{"hub.docker.com allowed", "hub.docker.com", 0, false},
-		{"subdomain of docker.com allowed", "auth.docker.com", 0, false},
-		{"github.com allowed", "github.com", 0, false},
-		{"subdomain of github.com allowed", "api.github.com", 0, false},
-		{"githubusercontent.com allowed", "raw.githubusercontent.com", 0, false},
-		{"evil.com refused", "evil.com", 0, true},
-		{"localhost refused", "localhost", 0, true},
-		{"127.0.0.1 refused", "127.0.0.1", 0, true},
-		{"too many redirects", "hub.docker.com", 5, true},
-		{"4 redirects still ok", "hub.docker.com", 4, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := httpx.DockerGitHubRedirectPolicy(makeReq(tt.host), makeVia(tt.viaLen))
-			if tt.wantErr && err == nil {
-				t.Errorf("DockerGitHubRedirectPolicy(%q, via=%d) = nil, want error", tt.host, tt.viaLen)
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("DockerGitHubRedirectPolicy(%q, via=%d) = %v, want nil", tt.host, tt.viaLen, err)
-			}
-		})
-	}
-}
-
-func TestRedirectPolicyFunc(t *testing.T) {
-	policy := httpx.RedirectPolicyFunc(
-		httpx.WithAllowedHosts("example.com"),
-		httpx.WithAllowedSuffixes(".example.org"),
-		httpx.WithMaxHops(3),
-	)
-
-	makeReq := func(host string) *http.Request {
-		u, _ := url.Parse("https://" + host + "/path")
-		return &http.Request{URL: u}
-	}
-	makeVia := func(n int) []*http.Request {
-		via := make([]*http.Request, n)
-		for i := range n {
-			via[i] = &http.Request{}
-		}
-		return via
-	}
-
-	tests := []struct {
-		name    string
-		host    string
-		viaLen  int
-		wantErr bool
-	}{
-		{"exact host allowed", "example.com", 0, false},
-		{"suffix allowed", "sub.example.org", 0, false},
-		{"unknown refused", "evil.com", 0, true},
-		{"too many hops", "example.com", 3, true},
-		{"2 hops ok", "example.com", 2, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := policy(makeReq(tt.host), makeVia(tt.viaLen))
-			if tt.wantErr && err == nil {
-				t.Errorf("want error for %s via=%d", tt.host, tt.viaLen)
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("unexpected error for %s via=%d: %v", tt.host, tt.viaLen, err)
-			}
-		})
-	}
-
-	// no options refuses all
-	nilPolicy := httpx.RedirectPolicyFunc()
-	if err := nilPolicy(makeReq("example.com"), nil); err == nil {
-		t.Error("no-options policy should refuse all redirects")
-	}
-}
-
-func TestNewClient_wires_timeout_and_redirect_policy(t *testing.T) {
-	c := httpx.NewClient(42 * time.Second)
-	if c.Timeout != 42*time.Second {
-		t.Errorf("Timeout = %v, want 42s", c.Timeout)
-	}
-	if c.CheckRedirect == nil {
-		t.Fatal("CheckRedirect is nil")
-	}
-	// DefaultRedirectPolicy denies cross-host redirects.
-	origURL, _ := url.Parse("https://example.com/start")
-	redirURL, _ := url.Parse("https://evil.com/x")
-	via := []*http.Request{{URL: origURL}}
-	if err := c.CheckRedirect(&http.Request{URL: redirURL}, via); err == nil {
-		t.Error("CheckRedirect(evil.com) = nil, want error")
-	}
-	// Same-host redirect is allowed.
-	sameURL, _ := url.Parse("https://example.com/other")
-	if err := c.CheckRedirect(&http.Request{URL: sameURL}, via); err != nil {
-		t.Errorf("CheckRedirect(same host) = %v, want nil", err)
-	}
-}
-
 func TestDrain_small_body(t *testing.T) {
 	httpx.Drain(io.NopCloser(strings.NewReader("small")))
 }
 
 func TestDrain_truncated_at_limit(t *testing.T) {
 	httpx.Drain(io.NopCloser(strings.NewReader(strings.Repeat("y", 128<<10))))
-}
-
-func TestCheckHTTPStatus(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name       string
-		statusCode int
-		wantNil    bool
-		wantAuth   bool
-		wantRate   bool
-		wantStatus bool
-	}{
-		{"200 OK", 200, true, false, false, false},
-		{"201 Created", 201, true, false, false, false},
-		{"400 Bad Request", 400, false, false, false, true},
-		{"401 Unauthorized", 401, false, true, false, false},
-		{"403 Forbidden", 403, false, true, false, false},
-		{"429 Too Many Requests", 429, false, false, true, false},
-		{"500 Internal Server Error", 500, false, false, false, true},
-		{"502 Bad Gateway", 502, false, false, false, true},
-		{"503 Service Unavailable", 503, false, false, false, true},
-		{"504 Gateway Timeout", 504, false, false, false, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			resp := &http.Response{StatusCode: tt.statusCode, Header: http.Header{}}
-			err := httpx.CheckHTTPStatus(resp)
-			if tt.wantNil {
-				if err != nil {
-					t.Errorf("CheckHTTPStatus(%d) = %v, want nil", tt.statusCode, err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("CheckHTTPStatus(%d) = nil, want error", tt.statusCode)
-			}
-			var authErr *httpx.AuthError
-			var rateErr *httpx.RateLimitError
-			var statusErr *httpx.HTTPStatusError
-			if tt.wantAuth && !errors.As(err, &authErr) {
-				t.Errorf("CheckHTTPStatus(%d) = %T, want *AuthError", tt.statusCode, err)
-			}
-			if tt.wantRate && !errors.As(err, &rateErr) {
-				t.Errorf("CheckHTTPStatus(%d) = %T, want *RateLimitError", tt.statusCode, err)
-			}
-			if tt.wantStatus && !errors.As(err, &statusErr) {
-				t.Errorf("CheckHTTPStatus(%d) = %T, want *HTTPStatusError", tt.statusCode, err)
-			}
-		})
-	}
-}
-
-func TestCheckHTTPStatus_429_parses_retry_after(t *testing.T) {
-	t.Parallel()
-	h := http.Header{}
-	h.Set("Retry-After", "30")
-	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: h}
-	err := httpx.CheckHTTPStatus(resp)
-	var rl *httpx.RateLimitError
-	if !errors.As(err, &rl) {
-		t.Fatalf("expected *RateLimitError, got %T", err)
-	}
-	if rl.RetryAfter != 30*time.Second {
-		t.Errorf("RetryAfter = %v, want 30s", rl.RetryAfter)
-	}
-}
-
-func TestCheckHTTPStatus_429_parses_http_date(t *testing.T) {
-	t.Parallel()
-	future := time.Now().Add(45 * time.Second).UTC().Format(http.TimeFormat)
-	h := http.Header{}
-	h.Set("Retry-After", future)
-	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: h}
-	err := httpx.CheckHTTPStatus(resp)
-	var rl *httpx.RateLimitError
-	if !errors.As(err, &rl) {
-		t.Fatalf("expected *RateLimitError, got %T", err)
-	}
-	if rl.RetryAfter < 30*time.Second || rl.RetryAfter > 60*time.Second {
-		t.Errorf("RetryAfter = %v, want ~45s", rl.RetryAfter)
-	}
-}
-
-// --- StatusError tests ---
-
-func TestStatusError_Error(t *testing.T) {
-	err := &httpx.StatusError{Code: 503, URL: "http://example.com/x"}
-	want := "HTTP 503 from http://example.com/x"
-	if got := err.Error(); got != want {
-		t.Errorf("Error() = %q, want %q", got, want)
-	}
-}
-
-func TestStatusError_IsRateLimited(t *testing.T) {
-	tests := []struct {
-		code int
-		want bool
-	}{
-		{429, true},
-		{500, false},
-		{503, false},
-		{400, false},
-	}
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%d", tt.code), func(t *testing.T) {
-			err := &httpx.StatusError{Code: tt.code}
-			if got := errors.Is(err, httpx.ErrRateLimited); got != tt.want {
-				t.Errorf("errors.Is(%d, ErrRateLimited) = %v, want %v", tt.code, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestStatusError_IsServerError(t *testing.T) {
-	tests := []struct {
-		code int
-		want bool
-	}{
-		{500, true},
-		{502, true},
-		{503, true},
-		{599, true},
-		{429, false},
-		{400, false},
-		{600, false},
-	}
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%d", tt.code), func(t *testing.T) {
-			err := &httpx.StatusError{Code: tt.code}
-			if got := errors.Is(err, httpx.ErrServerError); got != tt.want {
-				t.Errorf("errors.Is(%d, ErrServerError) = %v, want %v", tt.code, got, tt.want)
-			}
-		})
-	}
 }
 
 func TestRetry_returns_typed_StatusError_on_exhaustion(t *testing.T) {
@@ -568,43 +330,6 @@ func TestRetry_4xx_returns_typed_StatusError(t *testing.T) {
 	}
 	if target.Code != 404 {
 		t.Errorf("Code = %d, want 404", target.Code)
-	}
-}
-
-func TestDefaultRedirectPolicy_same_host_allowed(t *testing.T) {
-	origURL, _ := url.Parse("https://example.com/start")
-	redirURL, _ := url.Parse("https://example.com/other")
-	via := []*http.Request{{URL: origURL}}
-	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, via); err != nil {
-		t.Errorf("same-host redirect should be allowed, got %v", err)
-	}
-}
-
-func TestDefaultRedirectPolicy_cross_host_refused(t *testing.T) {
-	origURL, _ := url.Parse("https://example.com/start")
-	redirURL, _ := url.Parse("https://evil.com/x")
-	via := []*http.Request{{URL: origURL}}
-	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, via); err == nil {
-		t.Error("cross-host redirect should be refused")
-	}
-}
-
-func TestDefaultRedirectPolicy_first_redirect_no_via(t *testing.T) {
-	redirURL, _ := url.Parse("https://anywhere.com/x")
-	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, nil); err != nil {
-		t.Errorf("first redirect (no via) should be allowed, got %v", err)
-	}
-}
-
-func TestDefaultRedirectPolicy_too_many_hops(t *testing.T) {
-	origURL, _ := url.Parse("https://example.com/start")
-	redirURL, _ := url.Parse("https://example.com/x")
-	via := make([]*http.Request, 5)
-	for i := range via {
-		via[i] = &http.Request{URL: origURL}
-	}
-	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, via); err == nil {
-		t.Error("should refuse after 5 hops")
 	}
 }
 
@@ -777,22 +502,224 @@ func TestRetry_read_response_body_error(t *testing.T) {
 	}
 }
 
-func TestStatusError_Is_unrelated_target_returns_false(t *testing.T) {
-	se := &httpx.StatusError{Code: http.StatusTooManyRequests, URL: "http://example.com"}
-	if errors.Is(se, io.EOF) {
-		t.Error("errors.Is(StatusError{429}, io.EOF) = true, want false")
+// errReadCloser fails every Read and records whether Close was called.
+type errReadCloser struct {
+	err    error
+	closed bool
+}
+
+func (e *errReadCloser) Read(_ []byte) (int, error) { return 0, e.err }
+func (e *errReadCloser) Close() error               { e.closed = true; return nil }
+
+// errDrainBody fails every Read and is a no-op on Close (for Drain logging).
+type errDrainBody struct{}
+
+func (errDrainBody) Read([]byte) (int, error) { return 0, errors.New("read boom") }
+func (errDrainBody) Close() error             { return nil }
+
+//nolint:bodyclose // synthetic responses passed to the pure header parser; bodies never read
+func TestParseRetryAfterResponse(t *testing.T) {
+	t.Parallel()
+	resp := func(retryAfter string) *http.Response {
+		h := http.Header{}
+		if retryAfter != "" {
+			h.Set("Retry-After", retryAfter)
+		}
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h}
 	}
-	if errors.Is(se, context.Canceled) {
-		t.Error("errors.Is(StatusError{429}, context.Canceled) = true, want false")
+
+	if d := httpx.ParseRetryAfterResponse(resp("")); d != 0 {
+		t.Errorf("ParseRetryAfterResponse(no header) = %v, want 0", d)
+	}
+	if d := httpx.ParseRetryAfterResponse(resp("0")); d != 0 {
+		t.Errorf("ParseRetryAfterResponse(\"0\") = %v, want 0", d)
+	}
+	if d := httpx.ParseRetryAfterResponse(resp("-1")); d != 0 {
+		t.Errorf("ParseRetryAfterResponse(\"-1\") = %v, want 0", d)
+	}
+	if d := httpx.ParseRetryAfterResponse(resp("9")); d != 9*time.Second {
+		t.Errorf("ParseRetryAfterResponse(\"9\") = %v, want 9s", d)
+	}
+	// Shared parseRetryAfterValue trims whitespace (delegation, not a per-copy Atoi).
+	if d := httpx.ParseRetryAfterResponse(resp("  30  ")); d != 30*time.Second {
+		t.Errorf("ParseRetryAfterResponse(\"  30  \") = %v, want 30s", d)
+	}
+	// Uncapped (unlike ParseRetryAfter): an above-max value caps only at the
+	// int64-seconds overflow boundary, computed as maxSecs*time.Second.
+	const maxSecs = 9223372036
+	if d := httpx.ParseRetryAfterResponse(resp("9999999999")); d != time.Duration(maxSecs)*time.Second {
+		t.Errorf("ParseRetryAfterResponse(overflow) = %v, want %v", d, time.Duration(maxSecs)*time.Second)
+	}
+	future := time.Now().Add(45 * time.Second).UTC().Format(http.TimeFormat)
+	if d := httpx.ParseRetryAfterResponse(resp(future)); d <= 0 {
+		t.Errorf("ParseRetryAfterResponse(future date) = %v, want > 0", d)
+	}
+	past := time.Now().Add(-45 * time.Second).UTC().Format(http.TimeFormat)
+	if d := httpx.ParseRetryAfterResponse(resp(past)); d != 0 {
+		t.Errorf("ParseRetryAfterResponse(past date) = %v, want 0", d)
 	}
 }
 
-func TestCheckHTTPStatus_informational_1xx_returns_nil(t *testing.T) {
+func TestRetry_zero_base_delay_defaults_to_base(t *testing.T) {
 	t.Parallel()
-	if err := httpx.CheckHTTPStatus(&http.Response{StatusCode: http.StatusContinue, Header: http.Header{}}); err != nil {
-		t.Errorf("CheckHTTPStatus(100) = %v, want nil (sub-200 is not an error)", err)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// A zero base delay must be coerced to DefaultBaseDelay (1s), so the pre-retry
+	// sleep blows the 100ms deadline and surfaces the context error.
+	_, err := httpx.Retry(ctx, srv.Client(), srv.URL, httpx.WithMaxAttempts(2), httpx.WithBaseDelay(0))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Retry(baseDelay=0) = %v, want context.DeadlineExceeded (delay defaulted)", err)
 	}
-	if err := httpx.CheckHTTPStatus(&http.Response{StatusCode: 199, Header: http.Header{}}); err != nil {
-		t.Errorf("CheckHTTPStatus(199) = %v, want nil (sub-200 is not an error)", err)
+}
+
+func TestRetry_zero_max_body_bytes_defaults_to_full_body(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("hello world"))
+	}))
+	defer srv.Close()
+
+	// Zero must be coerced to DefaultMaxBodyBytes, returning the whole body.
+	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
+		httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(0))
+	if err != nil {
+		t.Fatalf("Retry = %v, want nil", err)
+	}
+	if string(body) != "hello world" {
+		t.Errorf("Retry(maxBodyBytes=0) body = %q, want %q", body, "hello world")
+	}
+}
+
+func TestRetry_does_not_sleep_before_first_attempt(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// The first attempt must NOT sleep, so a fast response returns before the
+	// deadline despite a huge base delay.
+	body, err := httpx.Retry(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(10*time.Second))
+	if err != nil {
+		t.Fatalf("Retry(first attempt) = %v, want nil (no pre-first-attempt sleep)", err)
+	}
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want %q", body, "ok")
+	}
+}
+
+func TestRetry_fast_response_does_not_log_slow_upstream(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
+		httpx.WithBaseDelay(time.Millisecond), httpx.WithLogger(bufLogger(&buf)))
+	if err != nil {
+		t.Fatalf("Retry = %v, want nil", err)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("body = %q, want %q", body, "ok")
+	}
+	// A sub-second response must NOT trigger the >10s "slow upstream" warning.
+	if strings.Contains(buf.String(), "slow upstream response") {
+		t.Errorf("fast response logged slow-upstream warning:\n%s", buf.String())
+	}
+}
+
+func TestRetry_retry_debug_log_reports_one_indexed_attempt(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	if _, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
+		httpx.WithBaseDelay(time.Millisecond), httpx.WithLogger(bufLogger(&buf))); err != nil {
+		t.Fatalf("Retry = %v, want nil", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "http request failed, will retry") {
+		t.Fatalf("expected retry debug log, got:\n%s", logged)
+	}
+	// The first failure logs the human (1-indexed) attempt number, attempt+1 == 1.
+	if !strings.Contains(logged, "attempt=1") {
+		t.Errorf("retry debug log = %q, want attribute attempt=1", logged)
+	}
+}
+
+// TestDrain_clean_drain_does_not_log_failure swaps slog.Default; not parallel.
+func TestDrain_clean_drain_does_not_log_failure(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
+
+	// A body larger than the 64KB drain limit: CopyN returns nil (no EOF).
+	httpx.Drain(io.NopCloser(strings.NewReader(strings.Repeat("y", 128<<10))))
+	if strings.Contains(buf.String(), "failed to drain") {
+		t.Errorf("clean drain logged a failure:\n%s", buf.String())
+	}
+}
+
+// TestDrain_logs_on_non_eof_read_error swaps slog.Default; not parallel.
+func TestDrain_logs_on_non_eof_read_error(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
+
+	httpx.Drain(errDrainBody{})
+	if !strings.Contains(buf.String(), "failed to drain response body") {
+		t.Errorf("Drain(erroring body) logged %q, want drain-failure debug line", buf.String())
+	}
+}
+
+func TestDrainClose_closes_body_on_read_error(t *testing.T) {
+	errReader := &errReadCloser{err: errors.New("read fail")}
+	httpx.DrainClose(errReader)
+	if !errReader.closed {
+		t.Error("DrainClose did not close body on read error")
+	}
+}
+
+// TestRetry_maxAttempts_nonpositive_clamps_to_one verifies a degenerate attempt
+// count runs fn exactly once (try once), never the old coerce-to-default-3 and
+// never a silent zero-attempt no-op.
+func TestRetry_maxAttempts_nonpositive_clamps_to_one(t *testing.T) {
+	t.Parallel()
+	for _, maxAttempts := range []int{0, -1, -100} {
+		var calls atomic.Int32
+		client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     http.Header{},
+			}, nil
+		})}
+		_, _ = httpx.Retry(t.Context(), client, "http://example.com/retry-edge",
+			httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxAttempts(maxAttempts))
+		if got := calls.Load(); got != 1 {
+			t.Errorf("WithMaxAttempts(%d): calls = %d, want 1 (clamped to a single attempt)", maxAttempts, got)
+		}
 	}
 }

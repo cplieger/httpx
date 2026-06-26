@@ -1,14 +1,24 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// bufLogger returns a debug-level text logger writing into buf.
+func bufLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
 
 func TestIsTransient(t *testing.T) {
 	t.Parallel()
@@ -35,6 +45,12 @@ func TestIsTransient(t *testing.T) {
 		{name: "HTTPStatusError 400 is not transient", err: &HTTPStatusError{Code: 400}, want: false},
 		{name: "HTTPStatusError 404 is not transient", err: &HTTPStatusError{Code: 404}, want: false},
 		{name: "generic error is not transient", err: errors.New("something failed"), want: false},
+		{name: "PermanentError is not transient", err: Permanent(errors.New("x")), want: false},
+		{name: "wrapped PermanentError is not transient", err: fmt.Errorf("wrap: %w", Permanent(errors.New("x"))), want: false},
+		{name: "wrapped AuthError is not transient", err: fmt.Errorf("wrap: %w", &AuthError{Msg: "x"}), want: false},
+		{name: "wrapped RateLimitError is not transient", err: fmt.Errorf("wrap: %w", &RateLimitError{Msg: "x"}), want: false},
+		{name: "wrapped context.Canceled is not transient", err: fmt.Errorf("wrap: %w", context.Canceled), want: false},
+		{name: "wrapped HTTPStatusError 502 is transient", err: fmt.Errorf("wrap: %w", &HTTPStatusError{Code: 502}), want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -393,5 +409,282 @@ func TestRetryWithBackoff_context_deadline_during_backoff_sleep(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("fn calls = %d, want 1 (deadline during first backoff sleep)", calls)
+	}
+}
+
+// --- HTTPStatusError classification ---
+
+func TestHTTPStatusError_classification(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		code      int
+		transient bool
+		serverErr bool
+		clientErr bool
+	}{
+		{400, false, false, true},
+		{404, false, false, true},
+		{499, false, false, true},
+		{500, false, true, false},
+		{501, false, true, false},
+		{502, true, true, false},
+		{503, true, true, false},
+		{504, true, true, false},
+	}
+	for _, tt := range tests {
+		e := &HTTPStatusError{Code: tt.code}
+		if e.IsTransient() != tt.transient {
+			t.Errorf("HTTPStatusError{%d}.IsTransient() = %v, want %v", tt.code, e.IsTransient(), tt.transient)
+		}
+		if e.IsServerError() != tt.serverErr {
+			t.Errorf("HTTPStatusError{%d}.IsServerError() = %v, want %v", tt.code, e.IsServerError(), tt.serverErr)
+		}
+		if e.IsClientError() != tt.clientErr {
+			t.Errorf("HTTPStatusError{%d}.IsClientError() = %v, want %v", tt.code, e.IsClientError(), tt.clientErr)
+		}
+	}
+}
+
+// --- Backoff primitives: concrete edge cases (property coverage in prop_test.go) ---
+
+func TestSafeDouble_concrete(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"zero", 0, 0},
+		{"negative passthrough", -3 * time.Second, -3 * time.Second},
+		{"doubles", 2 * time.Second, 4 * time.Second},
+		{"no overflow near top", 1 << 61, 1 << 62},
+		{"overflow caps at max", time.Duration(1<<63 - 1), time.Duration(1<<63 - 1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := SafeDouble(tt.in); got != tt.want {
+				t.Errorf("SafeDouble(%v) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestJitteredBackoff_zero_and_negative_passthrough(t *testing.T) {
+	t.Parallel()
+	if d := JitteredBackoff(0); d != 0 {
+		t.Errorf("JitteredBackoff(0) = %v, want 0", d)
+	}
+	if d := JitteredBackoff(-time.Second); d != -time.Second {
+		t.Errorf("JitteredBackoff(-1s) = %v, want -1s", d)
+	}
+}
+
+// TestSleepCtx_nonpositive_returns_nil_without_consulting_context pins that a
+// non-positive duration short-circuits to nil immediately, never consulting the
+// context: the assertion holds even with an already-cancelled context.
+func TestSleepCtx_nonpositive_returns_nil_without_consulting_context(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 200 {
+		if got := SleepCtx(ctx, 0); got != nil {
+			t.Fatalf("SleepCtx(cancelled ctx, 0) = %v, want nil", got)
+		}
+	}
+	if got := SleepCtx(ctx, -time.Second); got != nil {
+		t.Fatalf("SleepCtx(cancelled ctx, -1s) = %v, want nil", got)
+	}
+}
+
+func TestSleepCtx_negative_returns_immediately(t *testing.T) {
+	t.Parallel()
+	start := time.Now()
+	if err := SleepCtx(context.Background(), -time.Second); err != nil {
+		t.Errorf("SleepCtx(-1s) = %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Errorf("SleepCtx(-1s) took %v, want immediate return", elapsed)
+	}
+}
+
+func TestSleepCtx_cancelled_context_no_goroutine_leak(t *testing.T) {
+	before := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 100 {
+		_ = SleepCtx(ctx, time.Hour)
+	}
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	if after := runtime.NumGoroutine(); after-before > 5 {
+		t.Errorf("goroutine leak: before=%d, after=%d", before, after)
+	}
+}
+
+// --- ExponentialBackoff: zero initial interval coerces to DefaultBaseDelay ---
+
+func TestExponentialBackoff_zero_initial_interval_defaults_to_base(t *testing.T) {
+	t.Parallel()
+	b := NewExponentialBackoff(WithInitialInterval(0))
+	got := b.NextBackOff()
+	// Reset must coerce the zero interval up to DefaultBaseDelay, so the first
+	// jittered delay lies in [DefaultBaseDelay/2, DefaultBaseDelay].
+	if got < DefaultBaseDelay/2 || got > DefaultBaseDelay {
+		t.Errorf("NextBackOff() with zero initial interval = %v, want within [%v, %v]",
+			got, DefaultBaseDelay/2, DefaultBaseDelay)
+	}
+}
+
+// --- RetryOnRateLimit: attempt clamp and Retry-After vs maxWait boundary ---
+
+func TestRetryOnRateLimit_zero_attempts_clamps_to_one(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	sentinel := &RateLimitError{Msg: "rl"}
+	err := RetryOnRateLimit(context.Background(), 0, time.Second, func(_ context.Context) error {
+		calls++
+		return sentinel
+	})
+	// maxAttempts<1 clamps to 1: fn runs exactly once and its error is returned.
+	var rlErr *RateLimitError
+	if !errors.As(err, &rlErr) {
+		t.Errorf("RetryOnRateLimit(maxAttempts=0) = %v, want the single attempt's *RateLimitError", err)
+	}
+	if calls != 1 {
+		t.Errorf("fn calls = %d, want 1 (maxAttempts<1 clamps to 1)", calls)
+	}
+}
+
+func TestRetryOnRateLimit_no_sleep_after_final_attempt(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// With one attempt the loop must break before sleeping; a mutated break guard
+	// would fall through to SleepCtx and return the cancelled-context error.
+	err := RetryOnRateLimit(ctx, 1, time.Minute, func(_ context.Context) error {
+		return &RateLimitError{Msg: "slow"}
+	})
+	var rlErr *RateLimitError
+	if !errors.As(err, &rlErr) {
+		t.Errorf("RetryOnRateLimit(maxAttempts=1) = %v, want *RateLimitError (no trailing sleep)", err)
+	}
+}
+
+func TestRetryOnRateLimit_zero_retry_after_uses_max_wait(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// RetryAfter==0 must NOT override the (large) max wait, so SleepCtx waits an
+	// hour against the cancelled context and returns its error.
+	err := RetryOnRateLimit(ctx, 2, time.Hour, func(_ context.Context) error {
+		return &RateLimitError{Msg: "slow", RetryAfter: 0}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("RetryOnRateLimit(RetryAfter=0) = %v, want context.Canceled (max wait honored)", err)
+	}
+}
+
+func TestRetryOnRateLimit_positive_retry_after_caps_below_max_wait(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	// A positive RetryAfter must shrink the wait to 10ms so the retry completes
+	// well within the 150ms deadline and returns the rate-limit error.
+	err := RetryOnRateLimit(ctx, 2, 10*time.Second, func(_ context.Context) error {
+		return &RateLimitError{Msg: "slow", RetryAfter: 10 * time.Millisecond}
+	})
+	var rlErr *RateLimitError
+	if !errors.As(err, &rlErr) {
+		t.Errorf("RetryOnRateLimit(RetryAfter=10ms) = %v, want *RateLimitError (RetryAfter honored)", err)
+	}
+}
+
+// --- RetryWithBackoff: zero base delay coercion and structured-log content ---
+
+func TestRetryWithBackoff_zero_base_delay_defaults_to_base(t *testing.T) {
+	t.Parallel()
+	// A zero base delay must be coerced to DefaultBaseDelay (1s), so the pre-retry
+	// sleep blows the 100ms deadline and surfaces the context error.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := RetryWithBackoff(ctx, 2, 0, "test", func(_ context.Context) (string, error) {
+		return "", &HTTPStatusError{Code: 503}
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("RetryWithBackoff(baseDelay=0) = %v, want context.DeadlineExceeded (delay defaulted)", err)
+	}
+}
+
+// These three swap slog.Default, so they must NOT run in parallel.
+
+func TestRetryWithBackoff_first_try_success_omits_succeeded_log(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
+
+	_, err := RetryWithBackoff(context.Background(), 3, time.Microsecond, "lbl",
+		func(_ context.Context) (string, error) { return "ok", nil })
+	if err != nil {
+		t.Fatalf("RetryWithBackoff = %v, want nil", err)
+	}
+	if strings.Contains(buf.String(), "succeeded after retry") {
+		t.Errorf("first-try success logged a retry-success line:\n%s", buf.String())
+	}
+}
+
+func TestRetryWithBackoff_success_after_one_retry_logs_attempt_counts(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
+
+	calls := 0
+	_, err := RetryWithBackoff(context.Background(), 3, time.Microsecond, "lbl",
+		func(_ context.Context) (int, error) {
+			calls++
+			if calls == 1 {
+				return 0, &HTTPStatusError{Code: 503}
+			}
+			return 42, nil
+		})
+	if err != nil {
+		t.Fatalf("RetryWithBackoff = %v, want nil", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "attempt=1") {
+		t.Errorf("retry debug log = %q, want attribute attempt=1", logged)
+	}
+	if !strings.Contains(logged, "succeeded after retry") {
+		t.Errorf("success-after-retry not logged:\n%s", logged)
+	}
+	if !strings.Contains(logged, "attempts=2") {
+		t.Errorf("success log = %q, want attribute attempts=2", logged)
+	}
+}
+
+func TestRetryWithBackoff_no_retry_log_after_final_attempt(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
+
+	calls := 0
+	_, err := RetryWithBackoff(context.Background(), 2, time.Microsecond, "lbl",
+		func(_ context.Context) (string, error) {
+			calls++
+			return "", &HTTPStatusError{Code: 503}
+		})
+	if err == nil {
+		t.Fatal("RetryWithBackoff = nil, want error after exhaustion")
+	}
+	if calls != 2 {
+		t.Fatalf("fn calls = %d, want 2", calls)
+	}
+	// Exactly one "failed, retrying" line: the break before the final attempt
+	// suppresses the second.
+	if got := strings.Count(buf.String(), "failed, retrying"); got != 1 {
+		t.Errorf("retry-log count = %d, want 1\n%s", got, buf.String())
 	}
 }

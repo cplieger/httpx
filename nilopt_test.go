@@ -12,11 +12,10 @@ import (
 	"github.com/cplieger/httpx/v2"
 )
 
-// === ROUND 5: Nil-option panic regression + edge-case option values ===
+// Nil-option guards (a nil functional option must be skipped, not panic) and the
+// negative-attempt clamp edge case.
 
-// --- Nil option guards (P0 regression) ---
-
-func TestR5_NilOption_Retry(t *testing.T) {
+func TestRetry_nil_option_is_skipped(t *testing.T) {
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -26,13 +25,12 @@ func TestR5_NilOption_Retry(t *testing.T) {
 	})
 	client := &http.Client{Transport: transport}
 	var nilOpt httpx.Option
-	_, err := httpx.Retry(context.Background(), client, "http://example.com/nilopt", nilOpt)
-	if err != nil {
+	if _, err := httpx.Retry(context.Background(), client, "http://example.com/nilopt", nilOpt); err != nil {
 		t.Fatalf("nil Option caused error: %v", err)
 	}
 }
 
-func TestR5_NilOption_RTOption(t *testing.T) {
+func TestRetryRoundTripper_nil_option_is_skipped(t *testing.T) {
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -50,28 +48,27 @@ func TestR5_NilOption_RTOption(t *testing.T) {
 	resp.Body.Close()
 }
 
-func TestR5_NilOption_ExpBackoffOption(t *testing.T) {
+func TestExponentialBackoff_nil_option_is_skipped(t *testing.T) {
 	var nilOpt httpx.ExpBackoffOption
 	bo := httpx.NewExponentialBackoff(nilOpt)
-	d := bo.NextBackOff()
-	if d < 0 {
+	if d := bo.NextBackOff(); d < 0 {
 		t.Fatalf("negative backoff: %v", d)
 	}
 }
 
-func TestR5_NilOption_RedirectOption(t *testing.T) {
+func TestRedirectPolicyFunc_nil_option_still_refuses(t *testing.T) {
 	var nilOpt httpx.RedirectOption
 	policy := httpx.RedirectPolicyFunc(nilOpt)
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/nilredir", http.NoBody)
-	err := policy(req, nil)
-	if err == nil {
+	if err := policy(req, nil); err == nil {
 		t.Fatal("nil RedirectOption should still refuse (no hosts configured)")
 	}
 }
 
-// --- WithRTMaxAttempts(negative) handling ---
-
-func TestR5_WithRTMaxAttempts_Negative(t *testing.T) {
+// TestRetryRoundTripper_negative_max_attempts_clamps_to_one covers the negative
+// edge (the {0,1,2,3} exact-count table lives in v2_test.go): -1 clamps to a
+// single attempt, never a silent no-op and never the old coerce-to-default-3.
+func TestRetryRoundTripper_negative_max_attempts_clamps_to_one(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		calls.Add(1)
@@ -90,93 +87,7 @@ func TestR5_WithRTMaxAttempts_Negative(t *testing.T) {
 	if resp != nil {
 		resp.Body.Close()
 	}
-	// Negative clamps to 1: a single attempt, never a silent no-op and never
-	// the old coerce-to-default-3.
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("WithRTMaxAttempts(-1): calls=%d, want 1 (clamped to a single attempt)", got)
-	}
-}
-
-// --- WithBaseDelay(0) and WithRTBaseDelay(0) fallback to default ---
-
-func TestR5_WithBaseDelay_Zero(t *testing.T) {
-	var calls atomic.Int32
-	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		calls.Add(1)
-		if calls.Load() < 2 {
-			return &http.Response{
-				StatusCode: http.StatusServiceUnavailable,
-				Body:       io.NopCloser(strings.NewReader("")),
-				Header:     http.Header{},
-			}, nil
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader("ok")),
-			Header:     http.Header{},
-		}, nil
-	})
-	client := &http.Client{Transport: transport}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	// WithBaseDelay(0) should not hang (falls back to default)
-	_, err := httpx.Retry(ctx, client, "http://example.com/zerodelay",
-		httpx.WithBaseDelay(0), httpx.WithMaxAttempts(2))
-	if err != nil {
-		t.Fatalf("WithBaseDelay(0): %v", err)
-	}
-}
-
-func TestR5_WithRTBaseDelay_Zero(t *testing.T) {
-	var calls atomic.Int32
-	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		calls.Add(1)
-		if calls.Load() < 2 {
-			return &http.Response{
-				StatusCode: http.StatusServiceUnavailable,
-				Body:       io.NopCloser(strings.NewReader("")),
-				Header:     http.Header{},
-			}, nil
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader("ok")),
-			Header:     http.Header{},
-		}, nil
-	})
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(0),
-		httpx.WithRTMaxAttempts(3),
-	)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/zerortdelay", http.NoBody)
-	resp, err := rt.RoundTrip(req)
-	if err != nil {
-		t.Fatalf("WithRTBaseDelay(0): %v", err)
-	}
-	resp.Body.Close()
-}
-
-// --- WithRTMaxAttempts(0) clamp verification ---
-
-func TestR5_WithRTMaxAttempts_Zero_Verify(t *testing.T) {
-	var calls atomic.Int32
-	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		calls.Add(1)
-		return &http.Response{
-			StatusCode: http.StatusServiceUnavailable,
-			Body:       io.NopCloser(strings.NewReader("")),
-			Header:     http.Header{},
-		}, nil
-	})
-	rt := httpx.NewRetryRoundTripper(transport, httpx.WithRTMaxAttempts(0))
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com/zeroretry", http.NoBody)
-	resp, _ := rt.RoundTrip(req)
-	if resp != nil {
-		resp.Body.Close()
-	}
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("WithRTMaxAttempts(0): calls=%d, want 1 (clamped to a single attempt)", got)
 	}
 }
