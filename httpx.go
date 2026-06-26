@@ -412,6 +412,14 @@ func IsTransient(err error) bool {
 
 // --- Generic retry ---
 
+// logRetrySuccess emits the debug line when fn recovered after at least one
+// retry (attempt is 0-indexed, so attempt > 0 means a prior failure recovered).
+func logRetrySuccess(label string, attempt int) {
+	if attempt > 0 {
+		slog.Debug(label+" succeeded after retry", "attempts", attempt+1)
+	}
+}
+
 // RetryWithBackoff calls fn up to maxAttempts times (total, including the first
 // call) with jittered exponential backoff, returning the first success.
 // Non-transient errors are returned immediately. maxAttempts is the TOTAL
@@ -434,9 +442,7 @@ func RetryWithBackoff[T any](ctx context.Context, maxAttempts int, baseDelay tim
 	for attempt := range maxAttempts {
 		result, err := fn(ctx)
 		if err == nil {
-			if attempt > 0 {
-				slog.Debug(label+" succeeded after retry", "attempts", attempt+1)
-			}
+			logRetrySuccess(label, attempt)
 			return result, nil
 		}
 		lastErr = err
@@ -571,6 +577,45 @@ func WithLogger(l *slog.Logger) Option {
 // Routing Retry through RoundTrip would silently change one or more of these,
 // so the loop is intentionally not merged.
 func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Option) ([]byte, error) {
+	cfg := newRetryCfg(opts)
+	log := cfg.logger
+
+	start := time.Now()
+	var lastErr error
+	var overrideWait time.Duration
+	backoff := cfg.baseDelay
+	for attempt := range cfg.maxAttempts {
+		if attempt > 0 {
+			newBackoff, sleepErr := retrySleep(ctx, overrideWait, backoff)
+			if sleepErr != nil {
+				return nil, sleepErr
+			}
+			backoff = newBackoff
+		}
+		attemptStart := time.Now()
+		body, retryAfter, err := retryAttempt(ctx, client, reqURL, &cfg)
+		if body != nil {
+			logSlowUpstream(log, reqURL, attemptStart)
+			return body, nil
+		}
+		if err != nil && !isRetryStatus(err) {
+			return nil, logSafeError(err)
+		}
+		lastErr = err
+		overrideWait = retryAfter
+		log.Debug("http request failed, will retry",
+			"url", redactURL(reqURL), "attempt", attempt+1, "max", cfg.maxAttempts, "error", logSafeError(err))
+	}
+	elapsed := time.Since(start)
+	log.Warn("http retries exhausted",
+		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", logSafeError(lastErr))
+	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), logSafeError(lastErr))
+}
+
+// newRetryCfg builds a retryCfg from opts (nil options are skipped) and applies
+// defaults: maxAttempts clamps to >= 1, a non-positive baseDelay/maxBodyBytes
+// falls back to its default, and a nil logger resolves to slog.Default().
+func newRetryCfg(opts []Option) retryCfg {
 	cfg := retryCfg{
 		maxAttempts:  DefaultMaxAttempts,
 		baseDelay:    DefaultBaseDelay,
@@ -590,46 +635,33 @@ func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Opti
 	if cfg.maxBodyBytes <= 0 {
 		cfg.maxBodyBytes = DefaultMaxBodyBytes
 	}
-	log := cfg.logger
-	if log == nil {
-		log = slog.Default()
+	if cfg.logger == nil {
+		cfg.logger = slog.Default()
 	}
+	return cfg
+}
 
-	start := time.Now()
-	var lastErr error
-	var overrideWait time.Duration
-	backoff := cfg.baseDelay
-	for attempt := range cfg.maxAttempts {
-		if attempt > 0 {
-			delay := overrideWait
-			if delay <= 0 {
-				delay = JitteredBackoff(backoff)
-			}
-			if err := SleepCtx(ctx, delay); err != nil {
-				return nil, err
-			}
-			backoff = SafeDouble(backoff)
-		}
-		attemptStart := time.Now()
-		body, retryAfter, err := retryAttempt(ctx, client, reqURL, &cfg)
-		if body != nil {
-			if elapsed := time.Since(attemptStart); elapsed > 10*time.Second {
-				log.Warn("slow upstream response", "url", redactURL(reqURL), "duration", elapsed.Round(time.Millisecond))
-			}
-			return body, nil
-		}
-		if err != nil && !isRetryStatus(err) {
-			return nil, logSafeError(err)
-		}
-		lastErr = err
-		overrideWait = retryAfter
-		log.Debug("http request failed, will retry",
-			"url", redactURL(reqURL), "attempt", attempt+1, "max", cfg.maxAttempts, "error", logSafeError(err))
+// retrySleep waits before a retry attempt: it honors a positive overrideWait (a
+// capped Retry-After) else an equal-jitter delay derived from backoff, then
+// returns the doubled backoff for the next attempt.
+func retrySleep(ctx context.Context, overrideWait, backoff time.Duration) (time.Duration, error) {
+	delay := overrideWait
+	if delay <= 0 {
+		delay = JitteredBackoff(backoff)
 	}
-	elapsed := time.Since(start)
-	log.Warn("http retries exhausted",
-		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", logSafeError(lastErr))
-	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), logSafeError(lastErr))
+	if err := SleepCtx(ctx, delay); err != nil {
+		return backoff, err
+	}
+	return SafeDouble(backoff), nil
+}
+
+// logSlowUpstream warns when a successful attempt took longer than 10s. Timed
+// per-attempt so the library's own backoff sleeps are not mislabeled as
+// upstream latency.
+func logSlowUpstream(log *slog.Logger, reqURL string, attemptStart time.Time) {
+	if elapsed := time.Since(attemptStart); elapsed > 10*time.Second {
+		log.Warn("slow upstream response", "url", redactURL(reqURL), "duration", elapsed.Round(time.Millisecond))
+	}
 }
 
 // retryAttempt performs a single HTTP GET attempt. Returns (body, 0, nil) on
@@ -778,35 +810,56 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 	if maxHops <= 0 {
 		maxHops = redirectCap
 	}
-	// Normalize suffixes to start with "." to prevent substring bypass.
-	// Hostnames are case-insensitive (RFC 3986 §6.2.2.1), so lowercase the
-	// suffixes, the allowed hosts, and the candidate host before comparison.
-	normalized := make([]string, len(cfg.allowedSuffixes))
-	for i, s := range cfg.allowedSuffixes {
-		if !strings.HasPrefix(s, ".") {
-			s = "." + s
-		}
-		normalized[i] = strings.ToLower(s)
-	}
-	allowedHosts := make([]string, len(cfg.allowedHosts))
-	for i, h := range cfg.allowedHosts {
-		allowedHosts[i] = strings.ToLower(h)
-	}
+	// Hostnames are case-insensitive (RFC 3986 §6.2.2.1) and suffixes are
+	// dot-anchored to prevent substring bypass; normalize once up front.
+	normalized := normalizeSuffixes(cfg.allowedSuffixes)
+	allowedHosts := lowercaseAll(cfg.allowedHosts)
 	return func(req *http.Request, via []*http.Request) error {
 		if len(via) >= maxHops {
 			return errors.New("too many redirects")
 		}
 		host := strings.ToLower(req.URL.Hostname())
-		if slices.Contains(allowedHosts, host) {
+		if redirectAllowed(host, allowedHosts, normalized) {
 			return nil
-		}
-		for _, s := range normalized {
-			if hostMatchesSuffix(host, s) {
-				return nil
-			}
 		}
 		return fmt.Errorf("refusing redirect to %s", host)
 	}
+}
+
+// normalizeSuffixes dot-anchors and lowercases each allowed redirect suffix so a
+// bare "docker.com" cannot be bypassed by a substring match like "evildocker.com".
+func normalizeSuffixes(suffixes []string) []string {
+	out := make([]string, len(suffixes))
+	for i, s := range suffixes {
+		if !strings.HasPrefix(s, ".") {
+			s = "." + s
+		}
+		out[i] = strings.ToLower(s)
+	}
+	return out
+}
+
+// lowercaseAll returns a lowercased copy of in (RFC 3986 host comparison).
+func lowercaseAll(in []string) []string {
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = strings.ToLower(s)
+	}
+	return out
+}
+
+// redirectAllowed reports whether host matches an exact allowed host or an
+// allowed (dot-anchored, lowercased) suffix.
+func redirectAllowed(host string, allowedHosts, normalizedSuffixes []string) bool {
+	if slices.Contains(allowedHosts, host) {
+		return true
+	}
+	for _, s := range normalizedSuffixes {
+		if hostMatchesSuffix(host, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // DefaultRedirectPolicy is the default redirect policy: it denies cross-host
