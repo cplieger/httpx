@@ -358,3 +358,46 @@ func TestRetryRoundTripper_sleep_error_aborts_with_bare_context_error(t *testing
 		t.Errorf("RoundTrip err = %v, want context.DeadlineExceeded", err)
 	}
 }
+
+// TestRetryRoundTripper_aborts_when_wait_consumes_remaining_budget pins the
+// remaining-budget arithmetic (maxElapsedTime - elapsed). The custom backoff
+// returns a wait exactly equal to maxElapsedTime, so the remaining budget
+// (maxElapsedTime minus the tiny real elapsed) is strictly less than the wait
+// and the hard ceiling trips on the first retry: RoundTrip aborts after a single
+// transport call without sleeping. A budget computed as maxElapsedTime + elapsed
+// would instead exceed the wait, letting the round-tripper sleep and make a
+// second attempt.
+func TestRetryRoundTripper_aborts_when_wait_consumes_remaining_budget(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     http.Header{},
+		}, nil
+	})
+	const budget = 50 * time.Millisecond
+	rt := httpx.NewRetryRoundTripper(transport,
+		httpx.WithRTMaxAttempts(3),
+		httpx.WithRTMaxElapsedTime(budget),
+		httpx.WithBackoffFunc(func() httpx.Backoff {
+			return &testBackoff{delays: []time.Duration{budget, budget}}
+		}),
+	)
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/budget", http.NoBody)
+	resp, err := rt.RoundTrip(req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("RoundTrip = nil, want max-elapsed-time abort (next wait equals the remaining budget)")
+	}
+	if !strings.Contains(err.Error(), "max elapsed time") {
+		t.Errorf("error = %v, want containing 'max elapsed time'", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("transport calls = %d, want 1 (abort before the second attempt)", got)
+	}
+}

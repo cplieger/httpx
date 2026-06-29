@@ -723,3 +723,39 @@ func TestRetry_maxAttempts_nonpositive_clamps_to_one(t *testing.T) {
 		}
 	}
 }
+
+// TestRetry_cancel_during_backoff_aborts_before_next_attempt verifies that a
+// context cancelled while Retry is sleeping between attempts aborts the loop
+// immediately: the interrupted-sleep error propagates and no further attempt is
+// made. The transport cancels the context on the first call so the subsequent
+// backoff sleep observes a dead context; the WithHeaders hook counts attempts
+// independently of the http.Client's transport-invocation details.
+func TestRetry_cancel_during_backoff_aborts_before_next_attempt(t *testing.T) {
+	var attempts atomic.Int32
+	ctx, cancel := context.WithCancel(t.Context())
+	client := &http.Client{
+		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			cancel() // cancel during the post-response backoff window
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     http.Header{},
+			}, nil
+		}),
+	}
+
+	// A one-hour base delay would dominate the run if the sleep were not
+	// interrupted; because the context is already cancelled, SleepCtx returns at
+	// once and the test stays fast.
+	_, err := httpx.Retry(ctx, client, "http://example.com/cancel-during-backoff",
+		httpx.WithBaseDelay(time.Hour),
+		httpx.WithMaxAttempts(3),
+		httpx.WithHeaders(func(*http.Request) { attempts.Add(1) }),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Retry = %v, want context.Canceled (a cancelled backoff sleep must abort)", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1 (cancellation during backoff must abort before a second attempt)", got)
+	}
+}
