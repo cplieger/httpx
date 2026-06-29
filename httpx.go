@@ -785,6 +785,30 @@ func WithMaxHops(n int) RedirectOption {
 	return func(c *redirectCfg) { c.maxHops = n }
 }
 
+// asciiLower lowercases only ASCII letters A-Z, leaving every other byte
+// unchanged. Host comparison in RFC 3986 §6.2.2.1 is ASCII case-insensitive;
+// strings.ToLower must NOT be used here because it folds each invalid UTF-8
+// byte to U+FFFD, collapsing distinct hosts (e.g. "\xfe" and "\xae") into one
+// allowlist-matching equivalence class — a redirect-allowlist bypass. It also
+// allocates only when an uppercase letter is present (hostnames are normally
+// already lowercase), so the common path is zero-allocation.
+func asciiLower(s string) string {
+	var b []byte
+	for i := range len(s) {
+		c := s[i]
+		if 'A' <= c && c <= 'Z' {
+			if b == nil {
+				b = []byte(s)
+			}
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	if b == nil {
+		return s
+	}
+	return string(b)
+}
+
 // hostMatchesSuffix reports whether host matches the given dot-prefixed suffix.
 // The suffix must start with ".". It matches if host equals the suffix without
 // the leading dot, or if host ends with the suffix.
@@ -818,7 +842,7 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 		if len(via) >= maxHops {
 			return errors.New("too many redirects")
 		}
-		host := strings.ToLower(req.URL.Hostname())
+		host := asciiLower(req.URL.Hostname())
 		if redirectAllowed(host, allowedHosts, normalized) {
 			return nil
 		}
@@ -834,16 +858,16 @@ func normalizeSuffixes(suffixes []string) []string {
 		if !strings.HasPrefix(s, ".") {
 			s = "." + s
 		}
-		out[i] = strings.ToLower(s)
+		out[i] = asciiLower(s)
 	}
 	return out
 }
 
-// lowercaseAll returns a lowercased copy of in (RFC 3986 host comparison).
+// lowercaseAll returns an ASCII-lowercased copy of in (RFC 3986 host comparison).
 func lowercaseAll(in []string) []string {
 	out := make([]string, len(in))
 	for i, s := range in {
-		out[i] = strings.ToLower(s)
+		out[i] = asciiLower(s)
 	}
 	return out
 }
@@ -872,8 +896,8 @@ func DefaultRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
 	}
-	origHost := strings.ToLower(via[0].URL.Hostname())
-	if strings.ToLower(req.URL.Hostname()) == origHost {
+	origHost := asciiLower(via[0].URL.Hostname())
+	if asciiLower(req.URL.Hostname()) == origHost {
 		return nil
 	}
 	return fmt.Errorf("refusing redirect to %s", req.URL.Hostname())
@@ -886,7 +910,7 @@ func DockerGitHubRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) >= redirectCap {
 		return errors.New("too many redirects")
 	}
-	host := strings.ToLower(req.URL.Hostname())
+	host := asciiLower(req.URL.Hostname())
 	switch {
 	case host == "hub.docker.com",
 		strings.HasSuffix(host, ".docker.com"),
