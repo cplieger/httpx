@@ -128,3 +128,17 @@ func TestRedactSecret_replaces_secret_occurrences(t *testing.T) {
 		t.Errorf("RedactSecret = %q, want REDACTED in place of secret", msg)
 	}
 }
+
+// TestRedactTransportError_prefix_controls_wrapping pins the prefix branch: an
+// empty prefix returns the cause verbatim, while a non-empty prefix renders
+// "prefix: cause". No *url.Error and no secret are involved, isolating the
+// prefix decision from the unwrap and redact steps.
+func TestRedactTransportError_prefix_controls_wrapping(t *testing.T) {
+	base := errors.New("connection refused")
+	if got := RedactTransportError(base, "", ""); got.Error() != "connection refused" {
+		t.Errorf(`RedactTransportError(err, "", "") = %q, want %q`, got.Error(), "connection refused")
+	}
+	if got := RedactTransportError(base, "fetch", ""); got.Error() != "fetch: connection refused" {
+		t.Errorf(`RedactTransportError(err, "fetch", "") = %q, want %q`, got.Error(), "fetch: connection refused")
+	}
+}

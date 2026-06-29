@@ -688,3 +688,35 @@ func TestRetryWithBackoff_no_retry_log_after_final_attempt(t *testing.T) {
 		t.Errorf("retry-log count = %d, want 1\n%s", got, buf.String())
 	}
 }
+
+// TestRetryOnRateLimit_retry_debug_log_reports_one_indexed_attempt pins the
+// per-attempt "rate limited, backing off" Debug line's attempt field to the
+// human (1-indexed) value: the first retry logs attempt=1, not the 0-indexed
+// loop counter. Mirrors the RetryWithBackoff debug-attempt assertion. Swaps
+// slog.Default, so it must not run in parallel.
+func TestRetryOnRateLimit_retry_debug_log_reports_one_indexed_attempt(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
+
+	calls := 0
+	err := RetryOnRateLimit(context.Background(), 3, time.Millisecond, func(_ context.Context) error {
+		calls++
+		if calls == 1 {
+			return &RateLimitError{Msg: "429"}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RetryOnRateLimit = %v, want nil", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "rate limited, backing off") {
+		t.Fatalf("expected per-attempt debug log, got:\n%s", logged)
+	}
+	// The first retry logs the human (1-indexed) attempt number, attempt+1 == 1.
+	if !strings.Contains(logged, "attempt=1") {
+		t.Errorf("retry debug log = %q, want attribute attempt=1", logged)
+	}
+}
