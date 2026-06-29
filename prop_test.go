@@ -195,16 +195,21 @@ func FuzzRedirectPolicyFunc(f *testing.F) {
 		err = policy(req, via)
 
 		if err == nil {
-			// Policy accepted — verify invariant.
-			if host == allowedHost {
-				return // exact match is fine
+			// Policy accepted — verify the invariant using the SAME ASCII
+			// case-normalization the policy applies (RFC 3986 §6.2.2.1). url.Parse
+			// preserves host case and the policy matches case-insensitively, so the
+			// oracle must lowercase host, allowed host, and suffix identically.
+			lhost := asciiLower(host)
+			if lhost == asciiLower(allowedHost) {
+				return // exact allowed-host match
 			}
-			// Must match the normalized suffix.
+			// Must match the normalized (dot-anchored, ASCII-lowercased) suffix.
 			norm := suffix
 			if !strings.HasPrefix(norm, ".") {
 				norm = "." + norm
 			}
-			if !hostMatchesSuffix(host, norm) {
+			norm = asciiLower(norm)
+			if !hostMatchesSuffix(lhost, norm) {
 				t.Fatalf("policy accepted host %q but it doesn't match suffix %q or allowedHost %q", host, suffix, allowedHost)
 			}
 		}
