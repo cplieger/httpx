@@ -17,18 +17,11 @@ files: `httpx.go` (errors, backoff, retry, parsing, redirect, redaction) and
 
 ## The SKIP list is a contract, not a backlog
 
-`README.md` has an "Unsupported by Design (SKIP List)" table. Those entries are
-deliberate non-goals with documented rationale — **do not implement them**:
-
-- Circuit breaker (compose `sony/gobreaker` externally)
-- Retry budget / token bucket
-- Multiple jitter strategies (full, decorrelated) — equal jitter is the only one
-- `ErrorHandler` for exhaustion
-- Response body on error
-- Idempotency-key injection
-
-If you believe one belongs in scope, open an issue to change the contract first;
-don't send a PR that quietly adds it.
+`README.md` has an
+"[Unsupported by Design (SKIP List)](README.md#unsupported-by-design-skip-list)"
+table of deliberate non-goals with documented rationale; **do not implement
+them**. If you believe one belongs in scope, open an issue to change the
+contract first; don't send a PR that quietly adds it.
 
 ## Design invariants to preserve
 
