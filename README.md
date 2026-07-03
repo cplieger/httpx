@@ -2,7 +2,6 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx/v2.svg)](https://pkg.go.dev/github.com/cplieger/httpx/v2)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/httpx)](https://github.com/cplieger/httpx/blob/main/go.mod)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/httpx)](https://goreportcard.com/report/github.com/cplieger/httpx)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/coverage.json)](https://github.com/cplieger/httpx/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/mutation.json)](https://github.com/cplieger/httpx/issues?q=label%3Agremlins-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13213/badge)](https://www.bestpractices.dev/projects/13213)
@@ -107,7 +106,7 @@ defer rc.Close()
 ### Backoff Strategy
 
 - `Backoff` — pluggable backoff interface: `NextBackOff() time.Duration` + `Reset()` (mirrors cenkalti/backoff)
-- `WithBackoffFunc(func() Backoff)` — supply a factory that is called per-request to produce a fresh `Backoff` instance (renamed from `WithBackoff(Backoff)` to fix a shared-state concurrency bug where multiple goroutines sharing a `StandardClient()` corrupted each other's backoff progression; the mutex is gone — the fix is inherent in per-request instantiation)
+- `WithBackoffFunc(func() Backoff)` — supply a factory that is called per-request to produce a fresh `Backoff` instance (each request gets an independent backoff progression)
 - `NewExponentialBackoff` — create jittered exponential backoff (functional options: `WithInitialInterval`, `WithMaxElapsedTime`)
 - `BackoffStop` — sentinel value to signal "stop retrying"
 
@@ -190,6 +189,12 @@ The following features are intentionally not provided:
 | Response body on error                                               | Adds API complexity (ownership of body close). Use `RetryWithBackoff[T]` with custom logic.                                                             |
 | Idempotency key injection                                            | Application-level concern, not a retry library's responsibility.                                                                                        |
 | Configurable Retry-After cap / per-call `WithLogger` on the generics | A raisable cap would regress the fixed-60s DoS ceiling; a per-call logger on the positional generics forces an options refactor for no consumer demand. |
+
+## Disclaimer
+
+This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
+
+This project was built with AI-assisted tooling using [Claude Opus](https://www.anthropic.com/claude) and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
 
 ## License
 
