@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +77,15 @@ func TestCACertPool(t *testing.T) {
 			t.Errorf("CACertPool(good, WithSystemRoots) = (%v, %v), want (pool, nil)", pool, err)
 		}
 	})
+
+	t.Run("valid cert alongside a junk block still builds", func(t *testing.T) {
+		// AppendCertsFromPEM returns true if it parsed at least one cert, so a
+		// valid cert followed by an unparseable block yields a usable pool.
+		mixed := append(testCAPEM(t), "\n-----BEGIN CERTIFICATE-----\nnotvalidbase64\n-----END CERTIFICATE-----\n"...)
+		if pool, err := httpx.CACertPool(mixed); err != nil || pool == nil {
+			t.Errorf("CACertPool(valid+junk) = (%v, %v), want (pool, nil)", pool, err)
+		}
+	})
 }
 
 func TestCATransport(t *testing.T) {
@@ -138,21 +148,39 @@ func TestCATransport_verification(t *testing.T) {
 		t.Errorf("status = %d, want 204", resp.StatusCode)
 	}
 
-	// A transport pinning an unrelated CA must reject the server.
+	// WithSystemRoots must still honor the pinned CA (it trusts the pin
+	// ALONGSIDE the system roots), so the same handshake still succeeds.
+	plusSystem, err := httpx.CATransport(serverCAPEM, httpx.WithSystemRoots())
+	if err != nil {
+		t.Fatalf("CATransport(serverCA, WithSystemRoots): %v", err)
+	}
+	resp, err = (&http.Client{Transport: plusSystem, Timeout: 5 * time.Second}).Get(srv.URL)
+	if err != nil {
+		t.Fatalf("request with pinned CA + system roots failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// A transport pinning an unrelated CA must reject the server with a
+	// certificate/authority error — proving the pin is enforced, not bypassed.
 	wrong, err := httpx.CATransport(testCAPEM(t))
 	if err != nil {
 		t.Fatalf("CATransport(wrongCA): %v", err)
 	}
-	if resp, err := (&http.Client{Transport: wrong, Timeout: 5 * time.Second}).Get(srv.URL); err == nil {
-		resp.Body.Close()
-		t.Error("request with an unpinned CA succeeded; TLS verification was not enforced")
+	badResp, err := (&http.Client{Transport: wrong, Timeout: 5 * time.Second}).Get(srv.URL)
+	if err == nil {
+		badResp.Body.Close()
+		t.Fatal("request with an unpinned CA succeeded; TLS verification was not enforced")
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	if !errors.As(err, &unknownAuthority) && !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("expected a certificate verification error, got: %v", err)
 	}
 }
 
 func FuzzCACertPool(f *testing.F) {
 	f.Add([]byte(""))
 	f.Add([]byte("garbage"))
-	f.Add(testCAPEM(&testing.T{}))
+	f.Add([]byte("-----BEGIN CERTIFICATE-----\nnotbase64\n-----END CERTIFICATE-----\n"))
 	f.Fuzz(func(t *testing.T, pemBytes []byte) {
 		pool, err := httpx.CACertPool(pemBytes)
 		// Contract: exactly one of (pool, err) is set — never a nil pool with a
