@@ -65,10 +65,14 @@ func CACertPool(pem []byte, opts ...CAOption) (*x509.CertPool, error) {
 
 // CATransport builds an *http.Transport that trusts the CA certificate(s) in
 // pem for TLS verification. It is cloned from http.DefaultTransport, so it
-// keeps the standard connection pooling, dial/keepalive timeouts, and proxy
-// support (ProxyFromEnvironment); only the TLS trust configuration is set.
-// Verification stays ENABLED — InsecureSkipVerify is never set — with a
-// TLS 1.2 minimum (an existing stricter minimum, e.g. TLS 1.3, is preserved).
+// keeps the standard connection pooling, dial/keepalive timeouts, HTTP/2
+// negotiation, and proxy support (ProxyFromEnvironment). A FRESH TLS config is
+// then installed — RootCAs from pem, a TLS 1.2 minimum, and verification always
+// ENABLED (InsecureSkipVerify is not set). Any TLS settings already on
+// http.DefaultTransport are intentionally NOT carried over, so the returned
+// transport's trust posture cannot be weakened by a program that globally
+// mutated the default transport's *tls.Config (e.g. set InsecureSkipVerify or
+// an accept-all VerifyPeerCertificate hook).
 //
 // By default the supplied CA(s) are the SOLE trust anchors: the transport
 // rejects any host not chaining to them, including public-CA hosts. This is
@@ -86,6 +90,11 @@ func CACertPool(pem []byte, opts ...CAOption) (*x509.CertPool, error) {
 // It returns ErrNoCertsInPEM when pem yields no certificates. The caller owns
 // reading the PEM bytes (from a file, a secret, an env var), which keeps this
 // function I/O-free and lets the caller bound the read as it sees fit.
+//
+// CATransport requires http.DefaultTransport to be the standard library's
+// *http.Transport (the default). If your program has replaced it with a
+// wrapping RoundTripper (for example request instrumentation), build your own
+// transport and set its TLSClientConfig.RootCAs from CACertPool instead.
 func CATransport(pem []byte, opts ...CAOption) (*http.Transport, error) {
 	pool, err := CACertPool(pem, opts...)
 	if err != nil {
@@ -93,23 +102,19 @@ func CATransport(pem []byte, opts ...CAOption) (*http.Transport, error) {
 	}
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
-		// http.DefaultTransport is always *http.Transport in the standard
-		// library; this guard is defensive against a program that replaced it
-		// with a different RoundTripper before calling CATransport.
-		return nil, errors.New("httpx: http.DefaultTransport is not *http.Transport")
+		return nil, errors.New("httpx: http.DefaultTransport is not *http.Transport; " +
+			"build your own transport and set TLSClientConfig.RootCAs from CACertPool")
 	}
 	tr := base.Clone()
-	// Preserve any TLS settings already on the cloned transport (NextProtos,
-	// cipher preferences) and layer the pinned roots + TLS 1.2 floor on top,
-	// rather than discarding them with a fresh *tls.Config. Clone is nil-safe.
-	tlsCfg := tr.TLSClientConfig.Clone()
-	if tlsCfg == nil {
-		tlsCfg = &tls.Config{}
+	// Install a FRESH TLS config rather than inheriting the cloned base's. This
+	// guarantees the documented trust posture — verification on, no inherited
+	// InsecureSkipVerify or accept-all VerifyPeerCertificate/VerifyConnection
+	// hook — regardless of any global mutation of http.DefaultTransport's TLS
+	// config. ForceAttemptHTTP2 (preserved by the clone) keeps HTTP/2 working
+	// without needing to carry NextProtos across.
+	tr.TLSClientConfig = &tls.Config{
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
 	}
-	tlsCfg.RootCAs = pool
-	if tlsCfg.MinVersion < tls.VersionTLS12 {
-		tlsCfg.MinVersion = tls.VersionTLS12
-	}
-	tr.TLSClientConfig = tlsCfg
 	return tr, nil
 }
