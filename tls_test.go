@@ -1,4 +1,4 @@
-package httpx_test
+package httpx
 
 import (
 	"crypto/ecdsa"
@@ -15,8 +15,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/cplieger/httpx/v2"
 )
 
 // testCAPEM generates a throwaway self-signed CA certificate and returns it
@@ -43,11 +41,13 @@ func testCAPEM(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
+// TestCACertPool exercises the internal caCertPool primitive directly (this is
+// an in-package test so it can reach the unexported builder).
 func TestCACertPool(t *testing.T) {
 	t.Run("valid PEM builds a pool", func(t *testing.T) {
-		pool, err := httpx.CACertPool(testCAPEM(t))
+		pool, err := caCertPool(testCAPEM(t))
 		if err != nil {
-			t.Fatalf("CACertPool: %v", err)
+			t.Fatalf("caCertPool: %v", err)
 		}
 		if pool == nil {
 			t.Fatal("pool is nil")
@@ -56,25 +56,13 @@ func TestCACertPool(t *testing.T) {
 
 	t.Run("no certs is a loud error", func(t *testing.T) {
 		for _, bad := range [][]byte{nil, {}, []byte("not a pem"), []byte("-----BEGIN CERTIFICATE-----\nnonsense\n-----END CERTIFICATE-----\n")} {
-			pool, err := httpx.CACertPool(bad)
-			if !errors.Is(err, httpx.ErrNoCertsInPEM) {
-				t.Errorf("CACertPool(%q) err = %v, want ErrNoCertsInPEM", bad, err)
+			pool, err := caCertPool(bad)
+			if !errors.Is(err, ErrNoCertsInPEM) {
+				t.Errorf("caCertPool(%q) err = %v, want ErrNoCertsInPEM", bad, err)
 			}
 			if pool != nil {
-				t.Errorf("CACertPool(%q) pool = non-nil, want nil on error", bad)
+				t.Errorf("caCertPool(%q) pool = non-nil, want nil on error", bad)
 			}
-		}
-	})
-
-	t.Run("WithSystemRoots still requires certs in pem", func(t *testing.T) {
-		// A bad PEM is an error even with system roots requested: the caller
-		// asked to add certs and supplied none.
-		if _, err := httpx.CACertPool([]byte("garbage"), httpx.WithSystemRoots()); !errors.Is(err, httpx.ErrNoCertsInPEM) {
-			t.Errorf("err = %v, want ErrNoCertsInPEM", err)
-		}
-		// A good PEM with system roots yields a usable pool.
-		if pool, err := httpx.CACertPool(testCAPEM(t), httpx.WithSystemRoots()); err != nil || pool == nil {
-			t.Errorf("CACertPool(good, WithSystemRoots) = (%v, %v), want (pool, nil)", pool, err)
 		}
 	})
 
@@ -82,15 +70,15 @@ func TestCACertPool(t *testing.T) {
 		// AppendCertsFromPEM returns true if it parsed at least one cert, so a
 		// valid cert followed by an unparseable block yields a usable pool.
 		mixed := append(testCAPEM(t), "\n-----BEGIN CERTIFICATE-----\nnotvalidbase64\n-----END CERTIFICATE-----\n"...)
-		if pool, err := httpx.CACertPool(mixed); err != nil || pool == nil {
-			t.Errorf("CACertPool(valid+junk) = (%v, %v), want (pool, nil)", pool, err)
+		if pool, err := caCertPool(mixed); err != nil || pool == nil {
+			t.Errorf("caCertPool(valid+junk) = (%v, %v), want (pool, nil)", pool, err)
 		}
 	})
 }
 
 func TestCATransport(t *testing.T) {
 	t.Run("pins CA with verification on and TLS 1.2 floor", func(t *testing.T) {
-		tr, err := httpx.CATransport(testCAPEM(t))
+		tr, err := CATransport(testCAPEM(t))
 		if err != nil {
 			t.Fatalf("CATransport: %v", err)
 		}
@@ -114,8 +102,8 @@ func TestCATransport(t *testing.T) {
 	})
 
 	t.Run("no certs is a loud error", func(t *testing.T) {
-		tr, err := httpx.CATransport([]byte("garbage"))
-		if !errors.Is(err, httpx.ErrNoCertsInPEM) {
+		tr, err := CATransport([]byte("garbage"))
+		if !errors.Is(err, ErrNoCertsInPEM) {
 			t.Errorf("err = %v, want ErrNoCertsInPEM", err)
 		}
 		if tr != nil {
@@ -135,7 +123,7 @@ func TestCATransport_verification(t *testing.T) {
 
 	serverCAPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
 
-	trusting, err := httpx.CATransport(serverCAPEM)
+	trusting, err := CATransport(serverCAPEM)
 	if err != nil {
 		t.Fatalf("CATransport(serverCA): %v", err)
 	}
@@ -148,21 +136,9 @@ func TestCATransport_verification(t *testing.T) {
 		t.Errorf("status = %d, want 204", resp.StatusCode)
 	}
 
-	// WithSystemRoots must still honor the pinned CA (it trusts the pin
-	// ALONGSIDE the system roots), so the same handshake still succeeds.
-	plusSystem, err := httpx.CATransport(serverCAPEM, httpx.WithSystemRoots())
-	if err != nil {
-		t.Fatalf("CATransport(serverCA, WithSystemRoots): %v", err)
-	}
-	resp, err = (&http.Client{Transport: plusSystem, Timeout: 5 * time.Second}).Get(srv.URL)
-	if err != nil {
-		t.Fatalf("request with pinned CA + system roots failed: %v", err)
-	}
-	resp.Body.Close()
-
 	// A transport pinning an unrelated CA must reject the server with a
 	// certificate/authority error — proving the pin is enforced, not bypassed.
-	wrong, err := httpx.CATransport(testCAPEM(t))
+	wrong, err := CATransport(testCAPEM(t))
 	if err != nil {
 		t.Fatalf("CATransport(wrongCA): %v", err)
 	}
@@ -182,13 +158,13 @@ func FuzzCACertPool(f *testing.F) {
 	f.Add([]byte("garbage"))
 	f.Add([]byte("-----BEGIN CERTIFICATE-----\nnotbase64\n-----END CERTIFICATE-----\n"))
 	f.Fuzz(func(t *testing.T, pemBytes []byte) {
-		pool, err := httpx.CACertPool(pemBytes)
+		pool, err := caCertPool(pemBytes)
 		// Contract: exactly one of (pool, err) is set — never a nil pool with a
 		// nil error, and never a pool alongside an error.
 		if (err == nil) == (pool == nil) {
-			t.Errorf("CACertPool invariant violated: pool=%v err=%v", pool, err)
+			t.Errorf("caCertPool invariant violated: pool=%v err=%v", pool, err)
 		}
-		if err != nil && !errors.Is(err, httpx.ErrNoCertsInPEM) {
+		if err != nil && !errors.Is(err, ErrNoCertsInPEM) {
 			t.Errorf("unexpected error type: %v", err)
 		}
 	})
