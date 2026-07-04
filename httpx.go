@@ -1,7 +1,7 @@
 // Package httpx provides a resilient outbound-HTTP toolkit: transient-error
 // classification, generic retry with jittered exponential backoff, Retry-After
-// parsing, HTTP status mapping, secret redaction, body draining, and a
-// configurable redirect allowlist.
+// parsing, HTTP status mapping, secret redaction, body draining, custom-CA TLS
+// transports, and a configurable redirect allowlist.
 package httpx
 
 import (

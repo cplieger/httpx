@@ -79,6 +79,14 @@ policy := httpx.RedirectPolicyFunc(
     httpx.WithMaxHops(3),
 )
 
+// Pin a private / self-signed CA (verification stays ON, TLS 1.2 minimum).
+// The caller reads the PEM bytes (file, secret, env), keeping the helper I/O-free.
+tr, err := httpx.CATransport(pemBytes)              // pin: trust ONLY this CA
+client := &http.Client{Transport: tr}
+// ...or trust it alongside the system roots, and/or compose with retry:
+tr, _ = httpx.CATransport(pemBytes, httpx.WithSystemRoots())
+client = httpx.NewRetryRoundTripper(tr, httpx.WithRTMaxAttempts(3)).StandardClient()
+
 // Transient error classification
 if httpx.IsTransient(err) { /* safe to retry */ }
 
@@ -96,6 +104,13 @@ defer rc.Close()
 - `RetryOnRateLimit` — retry on `*RateLimitError` only (passes ctx to fn)
 - `NewRetryRoundTripper` — create a retrying `http.RoundTripper` (functional options: `WithRTMaxAttempts`, `WithRTBaseDelay`, `WithRTMaxElapsedTime`, `WithBackoffFunc`, `WithCheckRetry`, `WithOnRetry`, `WithPrepareRetry`, `WithRetryNonIdempotent`)
 - `StandardClient()` — returns `*http.Client` using the `RetryRoundTripper`
+
+### TLS transports
+
+- `CATransport(pem, opts...)` — build an `*http.Transport` (cloned from `http.DefaultTransport`, so pooling/timeouts/proxy are preserved) that trusts the CA certificate(s) in `pem`. Verification stays **on** (`InsecureSkipVerify` is never set) with a TLS 1.2 minimum. Returns the concrete, mutable transport so it composes with `NewRetryRoundTripper`.
+- `CACertPool(pem, opts...)` — the lower-level primitive: build an `*x509.CertPool` from `pem` for your own `*tls.Config` / gRPC credentials.
+- `WithSystemRoots()` — trust the supplied CA(s) **in addition** to the system trust store (mixed trust) instead of the default pin-only behaviour.
+- `ErrNoCertsInPEM` — returned by both when `pem` yields no certificates (a loud error instead of a silently-empty pool). The caller reads the PEM bytes, keeping these helpers I/O-free.
 
 ### Hooks & Policies
 
