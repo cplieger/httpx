@@ -11,9 +11,10 @@ A single-package, zero-runtime-dependency Go toolkit for resilient outbound
 HTTP: jittered exponential backoff, transient-error classification, Retry-After
 parsing, HTTP status→typed-error mapping, secret redaction, body draining, a
 transparent retrying `http.RoundTripper` with body replay, and a configurable
-redirect allowlist. Everything lives in the root package `httpx` across two
-files: `httpx.go` (errors, backoff, retry, parsing, redirect, redaction) and
-`roundtripper.go` (the `RetryRoundTripper`).
+redirect allowlist, and a custom-CA TLS transport. Everything lives in the root
+package `httpx` across three files: `httpx.go` (errors, backoff, retry, parsing,
+redirect, redaction), `roundtripper.go` (the `RetryRoundTripper`), and `tls.go`
+(the custom-CA TLS transport and `ErrNoCertsInPEM`).
 
 ## The SKIP list is a contract, not a backlog
 

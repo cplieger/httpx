@@ -74,7 +74,7 @@ func WithBackoffFunc(f func() Backoff) RTOption {
 }
 
 // WithCheckRetry sets a custom retry policy. If nil, the default policy
-// retries on transient transport errors and 429/5xx responses.
+// retries on transient transport errors and 429/502/503/504 responses.
 func WithCheckRetry(cr CheckRetry) RTOption {
 	return func(c *rtCfg) { c.checkRetry = cr }
 }
@@ -409,6 +409,17 @@ func drainResp(resp *http.Response) {
 // the RoundTripper logs nothing itself the stall is silent. A Client.Timeout is
 // intentionally NOT set here because it would cap total time across all retries,
 // conflicting with WithRTMaxElapsedTime.
+//
+// The returned client sets no CheckRedirect: redirects follow the
+// net/http default policy (up to 10 hops to any host; Authorization
+// is stripped on cross-host redirects). This RoundTripper is a
+// Transport and cannot restrict redirect targets from RoundTrip.
+// Callers that need a redirect allowlist must set CheckRedirect on
+// the returned client explicitly, e.g.:
+//
+//	c := rt.StandardClient()
+//	c.CheckRedirect = httpx.DefaultRedirectPolicy // same-host only
+//	// or httpx.RedirectPolicyFunc(httpx.WithAllowedSuffixes(".example.com"))
 func (rt *RetryRoundTripper) StandardClient() *http.Client {
 	return &http.Client{Transport: rt}
 }
