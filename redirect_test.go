@@ -180,3 +180,67 @@ func TestNewClient_wires_timeout_and_redirect_policy(t *testing.T) {
 		t.Errorf("CheckRedirect(same host) = %v, want nil", err)
 	}
 }
+
+func TestRedirect_case_insensitive_host_matching(t *testing.T) {
+	// RFC 3986 6.2.2.1 host comparison is case-insensitive; url.Parse preserves
+	// host case, so these uppercase/mixed-case targets drive the asciiLower fold
+	// the (all-lowercase) other redirect tests never reach.
+	for _, host := range []string{"HUB.DOCKER.COM", "API.GITHUB.COM", "Raw.GitHubUserContent.com"} {
+		if err := httpx.DockerGitHubRedirectPolicy(redirectReq(host), redirectVia(0)); err != nil {
+			t.Errorf("DockerGitHubRedirectPolicy(%q) = %v, want nil (case-insensitive match)", host, err)
+		}
+	}
+	policy := httpx.RedirectPolicyFunc(
+		httpx.WithAllowedHosts("example.com"),
+		httpx.WithAllowedSuffixes(".example.org"),
+	)
+	if err := policy(redirectReq("EXAMPLE.COM"), nil); err != nil {
+		t.Errorf("RedirectPolicyFunc allowed-host uppercase EXAMPLE.COM = %v, want nil", err)
+	}
+	if err := policy(redirectReq("Sub.Example.ORG"), nil); err != nil {
+		t.Errorf("RedirectPolicyFunc suffix mixed-case Sub.Example.ORG = %v, want nil", err)
+	}
+}
+
+// TestDockerGitHubRedirectPolicy_substring_and_bare_domain_refused pins the
+// dot-anchoring of the allowlist suffixes: a host that only CONTAINS an allowed
+// domain as a substring, a bare allowed domain, or an allowed domain used as a
+// left label must all be refused. DockerGitHubRedirectPolicy inlines its own
+// strings.HasSuffix checks (it shares no code with the fuzzed RedirectPolicyFunc),
+// so without these a regression dropping a leading dot (".docker.com" ->
+// "docker.com") would let maliciousdocker.com through and no other
+// DockerGitHubRedirectPolicy case would fail.
+func TestDockerGitHubRedirectPolicy_substring_and_bare_domain_refused(t *testing.T) {
+	for _, host := range []string{
+		"maliciousdocker.com",
+		"notgithub.com",
+		"evilgithubusercontent.com",
+		"docker.com",
+		"hub.docker.com.attacker.example",
+		"api.github.com.attacker.example",
+	} {
+		if err := httpx.DockerGitHubRedirectPolicy(redirectReq(host), redirectVia(0)); err == nil {
+			t.Errorf("DockerGitHubRedirectPolicy(%q) = nil, want refused (substring/bare-domain must not match a dot-anchored suffix)", host)
+		}
+	}
+}
+
+// TestRedirectPolicyFunc_empty_suffix_fails_closed pins the fail-closed guard
+// in normalizeSuffixes: an empty, bare-dot, or whitespace-only allowed suffix
+// is DROPPED rather than dot-anchored to a bare ".", so a policy configured
+// with only such a suffix (and no hosts) refuses every redirect -- including a
+// trailing-dot FQDN, which a surviving "." suffix would otherwise match via
+// hostMatchesSuffix's strings.HasSuffix(host, ".") branch (the documented
+// redirect-allowlist bypass). FuzzRedirectPolicyFunc skips empty suffixes, so
+// this branch is otherwise unexercised.
+func TestRedirectPolicyFunc_empty_suffix_fails_closed(t *testing.T) {
+	for _, suffix := range []string{"", ".", "   "} {
+		policy := httpx.RedirectPolicyFunc(httpx.WithAllowedSuffixes(suffix))
+		if err := policy(redirectReq("evil.example."), nil); err == nil {
+			t.Errorf("RedirectPolicyFunc(WithAllowedSuffixes(%q)) allowed a trailing-dot FQDN, want refused (empty/bare-dot suffix must be dropped, failing closed)", suffix)
+		}
+		if err := policy(redirectReq("anything.example"), nil); err == nil {
+			t.Errorf("RedirectPolicyFunc(WithAllowedSuffixes(%q)) allowed anything.example, want refused (no usable suffix, no hosts)", suffix)
+		}
+	}
+}

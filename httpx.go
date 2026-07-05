@@ -267,15 +267,17 @@ func parseRetryAfterValue(h string) time.Duration {
 	if h == "" {
 		return 0
 	}
-	if n, err := strconv.Atoi(h); err == nil {
+	if n, err := strconv.ParseInt(h, 10, 64); err == nil {
 		if n <= 0 {
 			return 0
 		}
-		// int64 guard is correct on 32-bit platforms (the old per-copy guard
-		// used platform int, which collapsed maxSecs to ~2 on 32-bit and
-		// capped any Retry-After above 2s).
+		// int64 guard is correct on 32-bit platforms: ParseInt(...,10,64)
+		// keeps parsing and the guard in int64 space, so a large delta-seconds
+		// value is capped rather than (as strconv.Atoi did) failing with a
+		// range error above the platform int max on GOARCH=386 and falling
+		// through to HTTP-date parsing.
 		const maxSecs = (1<<63 - 1) / int64(time.Second)
-		if int64(n) > maxSecs {
+		if n > maxSecs {
 			return time.Duration(maxSecs) * time.Second
 		}
 		return time.Duration(n) * time.Second
@@ -572,7 +574,8 @@ func WithLogger(l *slog.Logger) Option {
 //   - rich per-attempt slog logging plus the "retries exhausted after %s: %w"
 //     wrapper, which the RoundTripper exposes only as an OnRetry hook;
 //   - classification of every 5xx (not just 502/503/504) as retryable and of
-//     any non-200 as a permanent *StatusError.
+//     any non-2xx (3xx included) as a permanent *StatusError. A 2xx response
+//     returns the body; Retry cannot surface a redirect, so 3xx is an error.
 //
 // Routing Retry through RoundTrip would silently change one or more of these,
 // so the loop is intentionally not merged.
@@ -603,6 +606,9 @@ func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Opti
 		}
 		lastErr = err
 		overrideWait = retryAfter
+		if attempt == cfg.maxAttempts-1 {
+			break
+		}
 		log.Debug("http request failed, will retry",
 			"url", redactURL(reqURL), "attempt", attempt+1, "max", cfg.maxAttempts, "error", logSafeError(err))
 	}
@@ -682,15 +688,20 @@ func retryAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *
 		}
 		return nil, 0, &retryableError{err: err}
 	}
-	// 429 and 5xx are both retryable and, after h-f4, handled identically
-	// (both honor capped Retry-After); one guard avoids two byte-identical copies.
+	// 429 and 5xx are both retryable and handled identically (both honor a
+	// capped Retry-After); one guard avoids two byte-identical copies.
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		ra := ParseRetryAfter(resp.Header.Get("Retry-After"))
 		Drain(resp.Body)
 		resp.Body.Close()
 		return nil, ra, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}
 	}
-	if resp.StatusCode != http.StatusOK {
+	// Success is any 2xx. Retry returns the body bytes, so a 3xx (which reaches
+	// here only when the client is configured not to follow redirects) is a
+	// permanent *StatusError: the redirect stub is not the requested resource and
+	// Retry cannot surface Location. Intentional divergence from CheckHTTPStatus,
+	// a general error-classifier that treats 3xx as non-error.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		Drain(resp.Body)
 		resp.Body.Close()
 		return nil, 0, &StatusError{Code: resp.StatusCode, URL: reqURL}
@@ -853,12 +864,21 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 // normalizeSuffixes dot-anchors and lowercases each allowed redirect suffix so a
 // bare "docker.com" cannot be bypassed by a substring match like "evildocker.com".
 func normalizeSuffixes(suffixes []string) []string {
-	out := make([]string, len(suffixes))
-	for i, s := range suffixes {
+	out := make([]string, 0, len(suffixes))
+	for _, s := range suffixes {
+		s = strings.TrimSpace(s)
 		if !strings.HasPrefix(s, ".") {
 			s = "." + s
 		}
-		out[i] = asciiLower(s)
+		// Drop an empty or label-less suffix (""/"."/whitespace): it would
+		// dot-anchor to a bare ".", which hostMatchesSuffix then matches
+		// against any trailing-dot FQDN ("evil.com.") and the empty host --
+		// a redirect-allowlist bypass. Dropping it fails closed: a policy
+		// left with no hosts and no suffixes refuses every redirect.
+		if len(s) <= 1 {
+			continue
+		}
+		out = append(out, asciiLower(s))
 	}
 	return out
 }

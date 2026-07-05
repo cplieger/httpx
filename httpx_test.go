@@ -720,3 +720,21 @@ func TestRetryOnRateLimit_retry_debug_log_reports_one_indexed_attempt(t *testing
 		t.Errorf("retry debug log = %q, want attribute attempt=1", logged)
 	}
 }
+
+func TestLogSlowUpstream_warns_and_redacts_on_slow_response(t *testing.T) {
+	t.Parallel()
+	// The >10s branch (Warn + redactURL) is otherwise unexercised; only the
+	// fast-path negative is tested. An attemptStart 11s in the past forces it.
+	var buf bytes.Buffer
+	logSlowUpstream(bufLogger(&buf), "https://h.example/api?apikey=supersecret", time.Now().Add(-11*time.Second))
+	logged := buf.String()
+	if !strings.Contains(logged, "slow upstream response") {
+		t.Errorf("logSlowUpstream(11s ago) logged %q, want the slow-upstream Warn", logged)
+	}
+	if strings.Contains(logged, "supersecret") {
+		t.Errorf("slow-upstream log leaked the query secret:\n%s", logged)
+	}
+	if !strings.Contains(logged, "apikey=REDACTED") {
+		t.Errorf("slow-upstream log did not redact the query value:\n%s", logged)
+	}
+}

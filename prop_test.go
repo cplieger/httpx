@@ -215,3 +215,70 @@ func FuzzRedirectPolicyFunc(f *testing.F) {
 		}
 	})
 }
+
+func TestAsciiLower_invariants_property(t *testing.T) {
+	t.Parallel()
+	rapid.Check(t, func(t *rapid.T) {
+		s := string(rapid.SliceOf(rapid.Byte()).Draw(t, "bytes"))
+		got := asciiLower(s)
+		// Length is preserved. strings.ToLower would fold each invalid-UTF-8 byte
+		// to the 3-byte U+FFFD, changing length and collapsing distinct hosts into
+		// one allowlist-matching class (the documented bypass).
+		if len(got) != len(s) {
+			t.Fatalf("asciiLower(%q) len = %d, want %d", s, len(got), len(s))
+		}
+		// Only ASCII A-Z change (to a-z); every other byte is byte-identical.
+		for i := range len(s) {
+			in := s[i]
+			want := in
+			if 'A' <= in && in <= 'Z' {
+				want += 'a' - 'A'
+			}
+			if got[i] != want {
+				t.Fatalf("asciiLower(%q) byte %d = %#x, want %#x", s, i, got[i], want)
+			}
+		}
+		// Idempotent.
+		if again := asciiLower(got); again != got {
+			t.Fatalf("asciiLower not idempotent: %q -> %q -> %q", s, got, again)
+		}
+	})
+}
+
+func TestAsciiLower_distinct_non_ascii_bytes_never_collapse_property(t *testing.T) {
+	t.Parallel()
+	rapid.Check(t, func(t *rapid.T) {
+		b1 := byte(rapid.IntRange(0x80, 0xFF).Draw(t, "b1"))
+		b2 := byte(rapid.IntRange(0x80, 0xFF).Draw(t, "b2"))
+		if b1 == b2 {
+			return
+		}
+		// Distinct non-ASCII bytes must stay distinct after folding — the
+		// no-collapse invariant strings.ToLower violates (both would become
+		// U+FFFD and compare equal, bypassing the redirect allowlist).
+		if asciiLower(string(b1)) == asciiLower(string(b2)) {
+			t.Fatalf("asciiLower collapsed distinct bytes %#x and %#x", b1, b2)
+		}
+	})
+}
+
+func FuzzRedactURL(f *testing.F) {
+	f.Add("apikey")
+	f.Add("weird key&=#%")
+	f.Add("")
+	f.Add("user:pw@evil")
+	f.Fuzz(func(t *testing.T, rawKey string) {
+		// Panic-safety on arbitrary URL input.
+		_ = redactURL("https://h.example/p?" + rawKey)
+		// Security invariant (CWE-532): a distinctive sentinel placed as a query
+		// VALUE never survives redaction. rawKey is QueryEscaped into the KEY
+		// position so it can neither inject extra params nor turn the sentinel into
+		// a (kept) query key — the sound sentinel form FuzzRedactTransportError uses
+		// to avoid short-secret coincidences.
+		const sentinel = "AKIAIOSFODNN7EXAMPLE"
+		out := redactURL("https://h.example/p?" + url.QueryEscape(rawKey) + "=" + sentinel)
+		if strings.Contains(out, sentinel) {
+			t.Fatalf("sentinel query value survived redaction: %q", out)
+		}
+	})
+}

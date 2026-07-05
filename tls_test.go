@@ -169,3 +169,21 @@ func FuzzCACertPool(f *testing.F) {
 		}
 	})
 }
+
+func TestCATransport_errors_when_DefaultTransport_replaced(t *testing.T) {
+	// Documented contract: if http.DefaultTransport has been replaced by a
+	// wrapping RoundTripper, CATransport returns an error. Swaps the process
+	// global (stubRT is the package-internal RoundTripper from bench_test.go),
+	// so this must NOT run in parallel with the TLS tests that clone it.
+	orig := http.DefaultTransport
+	http.DefaultTransport = &stubRT{}
+	defer func() { http.DefaultTransport = orig }()
+
+	tr, err := CATransport(testCAPEM(t))
+	if tr != nil {
+		t.Errorf("CATransport = %v, want nil transport when DefaultTransport is not *http.Transport", tr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not *http.Transport") {
+		t.Errorf("CATransport err = %v, want an error containing 'not *http.Transport'", err)
+	}
+}

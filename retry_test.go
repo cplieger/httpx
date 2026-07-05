@@ -52,6 +52,62 @@ func TestRetry_error_status_fails_fast(t *testing.T) {
 	}
 }
 
+func TestRetry_all_2xx_are_success(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"200 OK", http.StatusOK, "hello"},
+		{"201 Created", http.StatusCreated, "created"},
+		{"204 No Content", http.StatusNoContent, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tt.status != http.StatusOK {
+					w.WriteHeader(tt.status)
+				}
+				if tt.body != "" {
+					_, _ = w.Write([]byte(tt.body))
+				}
+			}))
+			defer srv.Close()
+
+			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+			if err != nil {
+				t.Fatalf("Retry(%d) = %v, want nil", tt.status, err)
+			}
+			if string(body) != tt.body {
+				t.Errorf("Retry(%d) body = %q, want %q", tt.status, body, tt.body)
+			}
+		})
+	}
+}
+
+func TestRetry_non_followed_3xx_is_status_error(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "https://example.com/moved")
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	defer srv.Close()
+
+	client := srv.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	_, err := httpx.Retry(t.Context(), client, srv.URL, shortOpts()...)
+	if err == nil {
+		t.Fatal("expected *StatusError for a non-followed 3xx")
+	}
+	var se *httpx.StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("error = %T, want *httpx.StatusError", err)
+	}
+	if se.Code != http.StatusMovedPermanently {
+		t.Errorf("StatusError.Code = %d, want 301", se.Code)
+	}
+}
+
 func TestRetry_recovers_after_retryable_status(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -266,12 +322,19 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+// TestDrain_small_body swaps slog.Default; not parallel.
 func TestDrain_small_body(t *testing.T) {
-	httpx.Drain(io.NopCloser(strings.NewReader("small")))
-}
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
 
-func TestDrain_truncated_at_limit(t *testing.T) {
-	httpx.Drain(io.NopCloser(strings.NewReader(strings.Repeat("y", 128<<10))))
+	// A sub-limit body drains via io.CopyN returning io.EOF, which Drain must
+	// treat as a clean drain (the !errors.Is(err, io.EOF) guard), never a failure.
+	httpx.Drain(io.NopCloser(strings.NewReader("small")))
+	if strings.Contains(buf.String(), "failed to drain") {
+		t.Errorf("clean small-body drain logged a failure:\n%s", buf.String())
+	}
 }
 
 func TestRetry_returns_typed_StatusError_on_exhaustion(t *testing.T) {
