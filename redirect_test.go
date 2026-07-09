@@ -297,6 +297,17 @@ func TestRedirectPolicyFunc_sameHost(t *testing.T) {
 	}
 }
 
+// TestRedirectPolicyFunc_sameHost_nil_via_refuses pins the nil-origin guard on
+// the WithSameHost clause: with no via chain there is no origin to match
+// against, so the policy must refuse gracefully rather than panic. Every other
+// same-host test supplies a non-nil origin, leaving this branch undriven.
+func TestRedirectPolicyFunc_sameHost_nil_via_refuses(t *testing.T) {
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost())
+	if err := policy(reqTo(t, "https://arr.example/b"), nil); err == nil {
+		t.Error("WithSameHost policy with nil via = nil, want refusal (no origin to match against)")
+	}
+}
+
 // TestRedirectPolicyFunc_allowSchemeDowngrade confirms WithAllowSchemeDowngrade
 // opts back into following a same-host https->http downgrade.
 func TestRedirectPolicyFunc_allowSchemeDowngrade(t *testing.T) {

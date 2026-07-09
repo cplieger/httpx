@@ -860,6 +860,32 @@ func TestRetryWithBackoff_honorsRetryAfterHint(t *testing.T) {
 	}
 }
 
+func TestRetryWithBackoff_hintOverridesLargerBackoff(t *testing.T) {
+	var calls int
+	start := time.Now()
+	got, err := httpx.RetryWithBackoff(context.Background(), 2, time.Millisecond, "hint-over-backoff",
+		func(context.Context) (int, error) {
+			calls++
+			if calls == 1 {
+				return 0, &retryAfterHintErr{d: 250 * time.Millisecond}
+			}
+			return 9, nil
+		})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("RetryWithBackoff: %v", err)
+	}
+	if got != 9 || calls != 2 {
+		t.Fatalf("got=%d calls=%d, want 9 and 2", got, calls)
+	}
+	if elapsed < 200*time.Millisecond {
+		t.Errorf("waited %v; a hint larger than the base delay must override it (not min(hint, backoff))", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("waited %v; far longer than the 250ms hint", elapsed)
+	}
+}
+
 // TestRetryWithBackoff_ignoresNonPositiveHint confirms a hint of zero leaves the
 // jittered exponential backoff in charge (no override, no panic).
 func TestRetryWithBackoff_ignoresNonPositiveHint(t *testing.T) {
