@@ -412,7 +412,8 @@ func IsTransient(err error) bool {
 	if errors.As(err, &t) {
 		return t.IsTransient()
 	}
-	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
@@ -520,8 +521,8 @@ func RetryOnRateLimit(ctx context.Context, maxAttempts int, maxWait time.Duratio
 		if lastErr == nil {
 			return nil
 		}
-		rlErr, ok := errors.AsType[*RateLimitError](lastErr)
-		if !ok {
+		var rlErr *RateLimitError
+		if !errors.As(lastErr, &rlErr) {
 			return lastErr
 		}
 		if attempt == maxAttempts-1 {
@@ -724,8 +725,7 @@ func retryAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *
 	// capped Retry-After); one guard avoids two byte-identical copies.
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		ra := ParseRetryAfter(resp.Header.Get("Retry-After"))
-		Drain(resp.Body)
-		resp.Body.Close()
+		DrainClose(resp.Body)
 		return nil, ra, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}
 	}
 	// Success is any 2xx. Retry returns the body bytes, so a 3xx (which reaches
@@ -734,8 +734,7 @@ func retryAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *
 	// Retry cannot surface Location. Intentional divergence from CheckHTTPStatus,
 	// a general error-classifier that treats 3xx as non-error.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		Drain(resp.Body)
-		resp.Body.Close()
+		DrainClose(resp.Body)
 		return nil, 0, &StatusError{Code: resp.StatusCode, URL: reqURL}
 	}
 	// Read one byte past the cap so an over-limit body is detected rather than
