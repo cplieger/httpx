@@ -100,7 +100,7 @@ defer rc.Close()
 ### Retry
 
 - `Retry` — HTTP GET with exponential backoff on 429/5xx **and transient transport errors** (timeouts, connection resets, DNS failures — see `IsTransient`); 4xx (non-429) and non-transient transport errors return immediately (functional options: `WithMaxAttempts`, `WithBaseDelay`, `WithMaxBodyBytes`, `WithHeaders`, `WithLogger`). Counts **total** attempts (a non-positive count clamps to 1).
-- `RetryWithBackoff[T]` — generic retry with jittered exponential backoff
+- `RetryWithBackoff[T]` — generic retry with jittered exponential backoff; when a transient error implements `RetryAfterHint`, its pre-capped duration replaces the backoff for the next wait (the exponential base keeps advancing)
 - `RetryOnRateLimit` — retry on `*RateLimitError` only (passes ctx to fn)
 - `NewRetryRoundTripper` — create a retrying `http.RoundTripper` (functional options: `WithRTMaxAttempts`, `WithRTBaseDelay`, `WithRTMaxElapsedTime`, `WithBackoffFunc`, `WithCheckRetry`, `WithOnRetry`, `WithPrepareRetry`, `WithRetryNonIdempotent`)
 - `StandardClient()` — returns `*http.Client` using the `RetryRoundTripper`
@@ -132,6 +132,7 @@ defer rc.Close()
 ### Classification & Parsing
 
 - `IsTransient` — classify errors as transient (retryable); respects `PermanentError`
+- `RetryAfterHint` is an interface (`RetryAfterHint() time.Duration`) an error implements to supply the next retry wait; `RetryWithBackoff` honors it when the error is transient and the duration is positive (the implementer must cap the value, since httpx applies no ceiling of its own here)
 - `CheckHTTPStatus` — map HTTP status to typed errors
 - `ParseRetryAfter` / `ParseRetryAfterResponse` — parse Retry-After header
 
@@ -147,9 +148,11 @@ defer rc.Close()
 
 ### Redirect Policies
 
-- `DefaultRedirectPolicy` — same-host-only redirect policy (used by `NewClient`)
+- `DefaultRedirectPolicy` — same-host-only redirect policy (used by `NewClient`). It also refuses a same-host `https`->`http` scheme downgrade and allows an `http`->`https` upgrade, which makes it equivalent to `RedirectPolicyFunc(WithSameHost())`.
 - `DockerGitHubRedirectPolicy` — optional example policy for docker.com/github.com
-- `RedirectPolicyFunc` — build a custom redirect allowlist (functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithMaxHops`)
+- `RedirectPolicyFunc` — build a custom redirect allowlist (functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithSameHost`, `WithAllowSchemeDowngrade`, `WithMaxHops`)
+  - `WithSameHost` additionally allows a redirect whose target host equals the original request's host (layered on any allowlisted hosts or suffixes); it is the building block for a same-origin policy.
+  - `WithAllowSchemeDowngrade(bool)` permits an `https`->`http` downgrade redirect. The default `false` refuses it, so a custom auth header is never forwarded onto a cleartext hop; an `http`->`https` upgrade is always allowed. The downgrade is judged against the original request's scheme, and the guard applies to allowlisted and same-host targets alike.
 
 ### Client Helpers
 

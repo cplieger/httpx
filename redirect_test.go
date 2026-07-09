@@ -244,3 +244,87 @@ func TestRedirectPolicyFunc_empty_suffix_fails_closed(t *testing.T) {
 		}
 	}
 }
+
+// reqTo builds a redirect target request for the given URL.
+func reqTo(t *testing.T, rawURL string) *http.Request {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", rawURL, err)
+	}
+	return &http.Request{URL: u}
+}
+
+// viaWithOrigin builds a one-element via chain whose original request carries
+// the given URL, so same-host and scheme-downgrade checks have an origin to
+// compare against.
+func viaWithOrigin(t *testing.T, rawURL string) []*http.Request {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", rawURL, err)
+	}
+	return []*http.Request{{URL: u}}
+}
+
+// TestRedirectPolicyFunc_sameHost pins the WithSameHost behavior: same-host
+// redirects (including an http->https upgrade) are followed, a cross-host hop
+// and a same-host https->http downgrade are refused, host matching is
+// ASCII-case-insensitive, and a differing port on the same host is still same
+// host.
+func TestRedirectPolicyFunc_sameHost(t *testing.T) {
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithMaxHops(10))
+	tests := []struct {
+		name    string
+		orig    string
+		target  string
+		wantErr bool
+	}{
+		{"same host same scheme", "https://arr.example/a", "https://arr.example/b", false},
+		{"same host http->https upgrade", "http://arr.example/a", "https://arr.example/b", false},
+		{"same host https->http downgrade refused", "https://arr.example/a", "http://arr.example/b", true},
+		{"same host case-insensitive", "https://ARR.Example/a", "https://arr.example/b", false},
+		{"cross host refused", "https://arr.example/a", "https://other.example/b", true},
+		{"same host differing port allowed", "https://arr.example:8989/a", "https://arr.example:9090/b", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := policy(reqTo(t, tt.target), viaWithOrigin(t, tt.orig))
+			if tt.wantErr != (err != nil) {
+				t.Errorf("policy(%s -> %s) err=%v, wantErr=%v", tt.orig, tt.target, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRedirectPolicyFunc_allowSchemeDowngrade confirms WithAllowSchemeDowngrade
+// opts back into following a same-host https->http downgrade.
+func TestRedirectPolicyFunc_allowSchemeDowngrade(t *testing.T) {
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithAllowSchemeDowngrade(true))
+	if err := policy(reqTo(t, "http://arr.example/b"), viaWithOrigin(t, "https://arr.example/a")); err != nil {
+		t.Errorf("WithAllowSchemeDowngrade(true): same-host https->http should be allowed, got %v", err)
+	}
+}
+
+// TestRedirectPolicyFunc_downgrade_refused_for_allowlist confirms the
+// scheme-downgrade guard also applies to an allowlisted host, not only the
+// same-host path: a custom auth header must not follow onto a cleartext hop
+// even to an allowed host.
+func TestRedirectPolicyFunc_downgrade_refused_for_allowlist(t *testing.T) {
+	policy := httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("cdn.example"))
+	if err := policy(reqTo(t, "http://cdn.example/x"), viaWithOrigin(t, "https://api.example/start")); err == nil {
+		t.Error("https->http redirect to an allowlisted host should be refused by default")
+	}
+}
+
+// TestDefaultRedirectPolicy_scheme pins the hardened DefaultRedirectPolicy:
+// a same-host http->https upgrade is allowed, a same-host https->http downgrade
+// is refused.
+func TestDefaultRedirectPolicy_scheme(t *testing.T) {
+	if err := httpx.DefaultRedirectPolicy(reqTo(t, "https://arr.example/b"), viaWithOrigin(t, "http://arr.example/a")); err != nil {
+		t.Errorf("same-host http->https upgrade should be allowed, got %v", err)
+	}
+	if err := httpx.DefaultRedirectPolicy(reqTo(t, "http://arr.example/b"), viaWithOrigin(t, "https://arr.example/a")); err == nil {
+		t.Error("same-host https->http downgrade should be refused")
+	}
+}

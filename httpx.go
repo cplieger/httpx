@@ -50,6 +50,19 @@ type Transient interface {
 	IsTransient() bool
 }
 
+// RetryAfterHint is implemented by errors that carry an explicit wait duration
+// for the next retry, typically a parsed and capped Retry-After. When fn's
+// returned error is transient AND implements this interface with a positive
+// duration, RetryWithBackoff waits that duration before the next attempt
+// instead of its jittered exponential backoff. The exponential base still
+// advances, so a later transient error without a hint resumes the normal
+// progression. The hint MUST already be capped by the implementer (e.g. via
+// ParseRetryAfter); RetryWithBackoff sleeps on it verbatim and applies no
+// ceiling of its own, so an uncapped value is an unbounded-wait hazard.
+type RetryAfterHint interface {
+	RetryAfterHint() time.Duration
+}
+
 // ErrRateLimited is a sentinel callers use with errors.Is to detect 429 responses.
 var ErrRateLimited = errors.New("rate limited")
 
@@ -422,6 +435,21 @@ func logRetrySuccess(label string, attempt int) {
 	}
 }
 
+// nextRetryWait returns the wait before the next retry: a positive Retry-After
+// hint carried by err (via the RetryAfterHint interface, already capped by the
+// implementer) takes precedence over the jittered exponential backoff. The
+// value is used verbatim, so an implementer must cap it (see the RetryAfterHint
+// doc); httpx applies no ceiling of its own here.
+func nextRetryWait(err error, backoff time.Duration) time.Duration {
+	var h RetryAfterHint
+	if errors.As(err, &h) {
+		if d := h.RetryAfterHint(); d > 0 {
+			return d
+		}
+	}
+	return JitteredBackoff(backoff)
+}
+
 // RetryWithBackoff calls fn up to maxAttempts times (total, including the first
 // call) with jittered exponential backoff, returning the first success.
 // Non-transient errors are returned immediately. maxAttempts is the TOTAL
@@ -457,7 +485,11 @@ func RetryWithBackoff[T any](ctx context.Context, maxAttempts int, baseDelay tim
 		if attempt == maxAttempts-1 {
 			break
 		}
-		wait := JitteredBackoff(backoff)
+		// A transient error may carry an explicit (capped) Retry-After hint;
+		// nextRetryWait honors it in place of the jittered backoff. The
+		// exponential base still advances below, so a later hintless transient
+		// error resumes the normal progression.
+		wait := nextRetryWait(err, backoff)
 		slog.Debug(label+" failed, retrying",
 			"attempt", attempt+1, "max", maxAttempts,
 			"delay", wait.String(), "error", logSafeError(err))
@@ -773,9 +805,11 @@ type limitedReadCloser struct {
 
 // redirectCfg holds internal configuration for the redirect policy.
 type redirectCfg struct {
-	allowedHosts    []string
-	allowedSuffixes []string
-	maxHops         int
+	allowedHosts         []string
+	allowedSuffixes      []string
+	maxHops              int
+	sameHost             bool
+	allowSchemeDowngrade bool
 }
 
 // RedirectOption configures a redirect policy created by RedirectPolicyFunc.
@@ -794,6 +828,30 @@ func WithAllowedSuffixes(suffixes ...string) RedirectOption {
 // WithMaxHops sets the maximum number of redirect hops. Default: 5.
 func WithMaxHops(n int) RedirectOption {
 	return func(c *redirectCfg) { c.maxHops = n }
+}
+
+// WithSameHost additionally allows a redirect whose target host equals the
+// original request's host (ASCII case-insensitive, RFC 3986 §6.2.2.1), in
+// addition to any WithAllowedHosts / WithAllowedSuffixes entries. It is the
+// building block for a same-origin policy: combined with the default
+// scheme-downgrade refusal (see WithAllowSchemeDowngrade), it follows a
+// service's own same-host redirects (including an http->https upgrade) while
+// refusing a cross-host hop that would forward a custom auth header to another
+// origin. A policy built with only WithSameHost (no allowlisted hosts) permits
+// exactly the same-host set.
+func WithSameHost() RedirectOption {
+	return func(c *redirectCfg) { c.sameHost = true }
+}
+
+// WithAllowSchemeDowngrade permits a redirect that downgrades the scheme
+// (https on the original request -> http on the target). The default (false)
+// refuses such a downgrade so a credential carried in a custom request header
+// (which Go forwards across a redirect, stripping only Authorization/Cookie) is
+// never sent over a cleartext hop. A scheme upgrade (http->https) is always
+// allowed regardless of this setting. The downgrade is judged against the
+// ORIGINAL request's scheme (via[0]).
+func WithAllowSchemeDowngrade(allow bool) RedirectOption {
+	return func(c *redirectCfg) { c.allowSchemeDowngrade = allow }
 }
 
 // asciiLower lowercases only ASCII letters A-Z, leaving every other byte
@@ -827,8 +885,13 @@ func hostMatchesSuffix(host, suffix string) bool {
 	return host == suffix[1:] || strings.HasSuffix(host, suffix)
 }
 
-// RedirectPolicyFunc returns a CheckRedirect function configured with the
-// given options. With no options, all redirects are refused.
+// RedirectPolicyFunc returns a CheckRedirect function configured with the given
+// options. A redirect is followed only when its target host is allowed — an
+// exact WithAllowedHosts entry, a WithAllowedSuffixes match, or (with
+// WithSameHost) the original request's own host — and, unless
+// WithAllowSchemeDowngrade is set, the redirect does not downgrade https->http.
+// With no allowlist and no WithSameHost, all redirects are refused. The hop cap
+// is WithMaxHops (default 5).
 func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Request) error {
 	cfg := redirectCfg{}
 	for _, o := range opts {
@@ -836,7 +899,7 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 			o(&cfg)
 		}
 	}
-	if len(cfg.allowedHosts) == 0 && len(cfg.allowedSuffixes) == 0 {
+	if len(cfg.allowedHosts) == 0 && len(cfg.allowedSuffixes) == 0 && !cfg.sameHost {
 		return func(_ *http.Request, _ []*http.Request) error {
 			return errors.New("redirects not allowed")
 		}
@@ -847,18 +910,66 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 	}
 	// Hostnames are case-insensitive (RFC 3986 §6.2.2.1) and suffixes are
 	// dot-anchored to prevent substring bypass; normalize once up front.
-	normalized := normalizeSuffixes(cfg.allowedSuffixes)
-	allowedHosts := lowercaseAll(cfg.allowedHosts)
-	return func(req *http.Request, via []*http.Request) error {
-		if len(via) >= maxHops {
-			return errors.New("too many redirects")
-		}
-		host := asciiLower(req.URL.Hostname())
-		if redirectAllowed(host, allowedHosts, normalized) {
-			return nil
-		}
+	rp := &resolvedRedirect{
+		allowedHosts:   lowercaseAll(cfg.allowedHosts),
+		suffixes:       normalizeSuffixes(cfg.allowedSuffixes),
+		maxHops:        maxHops,
+		sameHost:       cfg.sameHost,
+		allowDowngrade: cfg.allowSchemeDowngrade,
+	}
+	return rp.check
+}
+
+// resolvedRedirect is a compiled redirect policy: RedirectPolicyFunc resolves
+// its options into one of these once and returns its check method as the
+// http.Client CheckRedirect.
+type resolvedRedirect struct {
+	allowedHosts   []string
+	suffixes       []string
+	maxHops        int
+	sameHost       bool
+	allowDowngrade bool
+}
+
+// check implements the CheckRedirect contract for a resolved policy: it caps
+// hops, refuses a target that is neither allowlisted nor (with sameHost) the
+// origin's own host, and refuses a scheme downgrade unless allowed.
+func (rp *resolvedRedirect) check(req *http.Request, via []*http.Request) error {
+	if len(via) >= rp.maxHops {
+		return errors.New("too many redirects")
+	}
+	// via[0] is the original request; net/http always populates its URL, but
+	// guard against a nil URL so the policy degrades gracefully rather than
+	// panicking if invoked with a hand-built via chain.
+	var origURL *url.URL
+	if len(via) > 0 {
+		origURL = via[0].URL
+	}
+	host := asciiLower(req.URL.Hostname())
+	if !rp.targetAllowed(host, origURL) {
 		return fmt.Errorf("refusing redirect to %s", host)
 	}
+	if !rp.allowDowngrade && origURL != nil && isSchemeDowngrade(origURL.Scheme, req.URL.Scheme) {
+		return fmt.Errorf("refusing scheme downgrade to %s", host)
+	}
+	return nil
+}
+
+// targetAllowed reports whether host is an allowed redirect target: an exact or
+// suffix allowlist match, or (with sameHost) the origin request's own host.
+func (rp *resolvedRedirect) targetAllowed(host string, origURL *url.URL) bool {
+	if redirectAllowed(host, rp.allowedHosts, rp.suffixes) {
+		return true
+	}
+	return rp.sameHost && origURL != nil && host == asciiLower(origURL.Hostname())
+}
+
+// isSchemeDowngrade reports whether redirecting from scheme `from` to scheme
+// `to` drops transport security (https -> http). Comparison is ASCII
+// case-insensitive. A same-scheme redirect and an http->https upgrade are not
+// downgrades.
+func isSchemeDowngrade(from, to string) bool {
+	return strings.EqualFold(from, "https") && strings.EqualFold(to, "http")
 }
 
 // normalizeSuffixes dot-anchors and lowercases each allowed redirect suffix so a
@@ -906,9 +1017,14 @@ func redirectAllowed(host string, allowedHosts, normalizedSuffixes []string) boo
 	return false
 }
 
-// DefaultRedirectPolicy is the default redirect policy: it denies cross-host
-// redirects, allowing only redirects to the same host as the original request.
-// For custom allowlists, use RedirectPolicyFunc.
+// DefaultRedirectPolicy is the default redirect policy: it allows a redirect
+// only to the same host as the original request, and refuses a same-host
+// https->http scheme downgrade (which would forward a custom auth header onto a
+// cleartext hop). A cross-host redirect is refused (Go forwards a custom header
+// across a redirect, so it would leak) and an http->https upgrade is allowed.
+// Equivalent to RedirectPolicyFunc(WithSameHost()); use RedirectPolicyFunc for
+// a custom allowlist, a higher hop cap (WithMaxHops), or to permit downgrades
+// (WithAllowSchemeDowngrade).
 func DefaultRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) >= redirectCap {
 		return errors.New("too many redirects")
@@ -916,11 +1032,14 @@ func DefaultRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
 	}
-	origHost := asciiLower(via[0].URL.Hostname())
-	if asciiLower(req.URL.Hostname()) == origHost {
-		return nil
+	orig := via[0].URL
+	if asciiLower(req.URL.Hostname()) != asciiLower(orig.Hostname()) {
+		return fmt.Errorf("refusing redirect to %s", req.URL.Hostname())
 	}
-	return fmt.Errorf("refusing redirect to %s", req.URL.Hostname())
+	if isSchemeDowngrade(orig.Scheme, req.URL.Scheme) {
+		return fmt.Errorf("refusing same-host scheme downgrade to %s", req.URL.Hostname())
+	}
+	return nil
 }
 
 // DockerGitHubRedirectPolicy is an OPTIONAL example redirect policy allowing
