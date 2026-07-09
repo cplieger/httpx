@@ -282,3 +282,47 @@ func FuzzRedactURL(f *testing.F) {
 		}
 	})
 }
+
+// FuzzSameOriginRedirect exercises the WithSameHost + WithAllowSchemeDowngrade
+// invariants (white-box, so it can reuse the policy's own asciiLower /
+// isSchemeDowngrade oracle): with WithSameHost and downgrades refused (the
+// default), a redirect is accepted iff its target host equals the origin host
+// AND it is not an https->http downgrade; with downgrades allowed, only the
+// same-host check gates acceptance. FuzzRedirectPolicyFunc seeds an empty origin
+// scheme, so it never drives the scheme-downgrade branch this covers.
+func FuzzSameOriginRedirect(f *testing.F) {
+	f.Add("https", "arr.example", "https", "arr.example")   // same origin
+	f.Add("http", "arr.example", "https", "arr.example")    // upgrade
+	f.Add("https", "arr.example", "http", "arr.example")    // downgrade
+	f.Add("https", "arr.example", "https", "other.example") // cross-host
+	f.Add("https", "ARR.example", "https", "arr.example")   // case-fold
+
+	f.Fuzz(func(t *testing.T, origScheme, origHost, tgtScheme, tgtHost string) {
+		if (origScheme != "http" && origScheme != "https") || (tgtScheme != "http" && tgtScheme != "https") {
+			return
+		}
+		orig, err := url.Parse(origScheme + "://" + origHost + "/a")
+		if err != nil || orig.Hostname() == "" {
+			return
+		}
+		tgt, err := url.Parse(tgtScheme + "://" + tgtHost + "/b")
+		if err != nil || tgt.Hostname() == "" {
+			return
+		}
+		via := []*http.Request{{URL: orig}}
+		sameHost := asciiLower(tgt.Hostname()) == asciiLower(orig.Hostname())
+		downgrade := isSchemeDowngrade(orig.Scheme, tgt.Scheme)
+
+		// Default: downgrades refused.
+		gotErr := RedirectPolicyFunc(WithSameHost())(&http.Request{URL: tgt}, via)
+		if want := sameHost && !downgrade; want != (gotErr == nil) {
+			t.Fatalf("WithSameHost %s->%s: err=%v (sameHost=%v downgrade=%v, wantAllowed=%v)", orig, tgt, gotErr, sameHost, downgrade, want)
+		}
+
+		// Downgrades allowed: only the host gates acceptance.
+		gotAllow := RedirectPolicyFunc(WithSameHost(), WithAllowSchemeDowngrade(true))(&http.Request{URL: tgt}, via)
+		if sameHost != (gotAllow == nil) {
+			t.Fatalf("WithSameHost+AllowDowngrade %s->%s: err=%v (sameHost=%v)", orig, tgt, gotAllow, sameHost)
+		}
+	})
+}

@@ -822,3 +822,57 @@ func TestRetry_cancel_during_backoff_aborts_before_next_attempt(t *testing.T) {
 		t.Errorf("attempts = %d, want 1 (cancellation during backoff must abort before a second attempt)", got)
 	}
 }
+
+// retryAfterHintErr is a transient error carrying an explicit Retry-After hint,
+// exercising RetryWithBackoff's RetryAfterHint honoring.
+type retryAfterHintErr struct{ d time.Duration }
+
+func (e *retryAfterHintErr) Error() string                 { return "rate limited" }
+func (e *retryAfterHintErr) IsTransient() bool             { return true }
+func (e *retryAfterHintErr) RetryAfterHint() time.Duration { return e.d }
+
+// TestRetryWithBackoff_honorsRetryAfterHint proves a transient error that
+// implements RetryAfterHint drives the wait: the base delay is set very high,
+// so a fast retry proves the small hint was used instead of the 10s backoff.
+func TestRetryWithBackoff_honorsRetryAfterHint(t *testing.T) {
+	var calls int
+	start := time.Now()
+	got, err := httpx.RetryWithBackoff(context.Background(), 2, 10*time.Second, "hint-test",
+		func(context.Context) (int, error) {
+			calls++
+			if calls == 1 {
+				return 0, &retryAfterHintErr{d: 200 * time.Millisecond}
+			}
+			return 42, nil
+		})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("RetryWithBackoff: %v", err)
+	}
+	if got != 42 || calls != 2 {
+		t.Fatalf("got=%d calls=%d, want 42 and 2", got, calls)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("waited %v; the 200ms Retry-After hint was not honored over the 10s base delay", elapsed)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("waited %v; expected to honor the ~200ms hint", elapsed)
+	}
+}
+
+// TestRetryWithBackoff_ignoresNonPositiveHint confirms a hint of zero leaves the
+// jittered exponential backoff in charge (no override, no panic).
+func TestRetryWithBackoff_ignoresNonPositiveHint(t *testing.T) {
+	var calls int
+	got, err := httpx.RetryWithBackoff(context.Background(), 2, time.Millisecond, "hint-test",
+		func(context.Context) (int, error) {
+			calls++
+			if calls == 1 {
+				return 0, &retryAfterHintErr{d: 0}
+			}
+			return 7, nil
+		})
+	if err != nil || got != 7 || calls != 2 {
+		t.Fatalf("err=%v got=%d calls=%d, want nil/7/2", err, got, calls)
+	}
+}

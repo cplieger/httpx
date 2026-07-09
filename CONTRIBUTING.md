@@ -95,10 +95,11 @@ Tests double as the spec, so match the existing style when adding behavior:
   et al. compiling and their `// Output:` accurate.
 - **Property tests** (`prop_test.go`) use `pgregory.net/rapid`; invariants like
   backoff bounds and parse round-trips belong here.
-- **Fuzz targets** exist for the parsing/redaction/backoff surface
+- **Fuzz targets** exist for the parsing/redaction/backoff/redirect surface
   (`FuzzParseRetryAfter`, `FuzzParseRetryAfterResponse`,
-  `FuzzRedactTransportError`, `FuzzSafeDouble`, `FuzzRedirectPolicyFunc`). Run
-  one with, e.g., `go test -run=^$ -fuzz=FuzzParseRetryAfter -fuzztime=30s`.
+  `FuzzRedactTransportError`, `FuzzSafeDouble`, `FuzzRedirectPolicyFunc`,
+  `FuzzSameOriginRedirect`). Run one with, e.g.,
+  `go test -run=^$ -fuzz=FuzzParseRetryAfter -fuzztime=30s`.
 
 New parsing, classification, or redirect logic should land with a property test
 or fuzz target, not just table tests.
