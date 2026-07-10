@@ -129,6 +129,31 @@ func TestRedactSecret_replaces_secret_occurrences(t *testing.T) {
 	}
 }
 
+// TestRedactSecretString pins the string-level redaction primitive: every
+// occurrence of a non-empty secret becomes "REDACTED", an empty secret is a
+// no-op, and an absent secret leaves the string unchanged.
+func TestRedactSecretString(t *testing.T) {
+	tests := []struct {
+		name   string
+		s      string
+		secret string
+		want   string
+	}{
+		{"single occurrence", "body key=abc123 end", "abc123", "body key=REDACTED end"},
+		{"multiple occurrences", "abc123 and abc123", "abc123", "REDACTED and REDACTED"},
+		{"secret absent", "nothing to see here", "abc123", "nothing to see here"},
+		{"empty secret is a no-op", "keep abc123 intact", "", "keep abc123 intact"},
+		{"empty input", "", "abc123", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RedactSecretString(tc.s, tc.secret); got != tc.want {
+				t.Errorf("RedactSecretString(%q, %q) = %q, want %q", tc.s, tc.secret, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRedactTransportError_prefix_controls_wrapping pins the prefix branch: an
 // empty prefix returns the cause verbatim, while a non-empty prefix renders
 // "prefix: cause". No *url.Error and no secret are involved, isolating the

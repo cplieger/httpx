@@ -145,6 +145,7 @@ defer rc.Close()
 
 - `Drain` / `DrainClose` — body drain for connection reuse (64 KB limit)
 - `LimitedBody` — wrap response body with a size cap
+- `ReadLimitedBody` — read a body to a cap (closing it) with overflow detection, returning `*ResponseTooLargeError` instead of a silently truncated body
 
 ### Redirect Policies
 
@@ -160,7 +161,7 @@ defer rc.Close()
 
 ### Secret Redaction
 
-- `RedactTransportError` / `RedactSecret` — secret redaction
+- `RedactTransportError` / `RedactSecret` / `RedactSecretString` — secret redaction (error- and string-level)
 
 ### Error Types
 

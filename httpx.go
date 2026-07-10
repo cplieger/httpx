@@ -714,7 +714,7 @@ func retryAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *
 	if cfg.setHeaders != nil {
 		cfg.setHeaders(req)
 	}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:bodyclose // resp.Body is closed on every path: DrainClose (429/5xx, non-2xx) or ReadLimitedBody's deferred close (2xx); bodyclose can't trace the close through the helper.
 	if err != nil {
 		if !IsTransient(err) {
 			return nil, 0, err
@@ -737,23 +737,17 @@ func retryAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *
 		DrainClose(resp.Body)
 		return nil, 0, &StatusError{Code: resp.StatusCode, URL: reqURL}
 	}
-	// Read one byte past the cap so an over-limit body is detected rather than
-	// silently truncated (a truncated payload that looks complete is a
-	// corruption hazard). On overflow, fail loud with *ResponseTooLargeError.
-	// Guard the probe against int64 overflow: a cap of math.MaxInt64 means
-	// "effectively unlimited"; incrementing it would wrap negative and make
-	// io.LimitReader read zero bytes (silent data loss).
-	probe := cfg.maxBodyBytes
-	if probe < math.MaxInt64 {
-		probe++
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, probe))
-	resp.Body.Close()
+	// Read the body with overflow detection: an over-limit body fails loud with
+	// *ResponseTooLargeError rather than being silently truncated (a truncated
+	// payload that looks complete is a corruption hazard). ReadLimitedBody owns
+	// the cap+1 probe, its int64-overflow guard, and closing the body.
+	body, err := ReadLimitedBody(resp.Body, cfg.maxBodyBytes)
 	if err != nil {
+		var tooLarge *ResponseTooLargeError
+		if errors.As(err, &tooLarge) {
+			return nil, 0, err
+		}
 		return nil, 0, fmt.Errorf("read response: %w", err)
-	}
-	if int64(len(body)) > cfg.maxBodyBytes {
-		return nil, 0, &ResponseTooLargeError{Limit: cfg.maxBodyBytes}
 	}
 	return body, 0, nil
 }
@@ -798,6 +792,34 @@ func LimitedBody(resp *http.Response, limit int64) io.ReadCloser {
 type limitedReadCloser struct {
 	io.Reader
 	io.Closer
+}
+
+// ReadLimitedBody reads body up to limit bytes, always closes body, and returns
+// the bytes read. It reads one byte past limit to detect an over-limit body and
+// returns *ResponseTooLargeError (with nil bytes) rather than a silently
+// truncated payload — a truncated body indistinguishable from a complete one is
+// a corruption hazard. A limit of math.MaxInt64 means "effectively unlimited"
+// and is guarded against probe-size overflow.
+//
+// It is the read-all-with-overflow-detection companion to LimitedBody (which
+// only caps the stream and leaves reading and overflow handling to the caller),
+// and is the same cap+1 read Retry applies internally — exposed for callers that
+// issue their own request and decode outside Retry but still want the fail-loud
+// size bound. On any error the body is already closed.
+func ReadLimitedBody(body io.ReadCloser, limit int64) ([]byte, error) {
+	defer body.Close()
+	probe := limit
+	if probe < math.MaxInt64 {
+		probe++
+	}
+	data, err := io.ReadAll(io.LimitReader(body, probe))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, &ResponseTooLargeError{Limit: limit}
+	}
+	return data, nil
 }
 
 // --- Redirect allowlist (functional options) ---
@@ -1104,12 +1126,25 @@ func RedactTransportError(err error, prefix, secret string) error {
 	if !strings.Contains(msg, secret) {
 		return wrapped
 	}
-	return errors.New(strings.ReplaceAll(msg, secret, "REDACTED"))
+	return errors.New(RedactSecretString(msg, secret))
 }
 
 // RedactSecret replaces occurrences of secret in err's message with "REDACTED".
 func RedactSecret(err error, secret string) error {
 	return RedactTransportError(err, "", secret)
+}
+
+// RedactSecretString replaces every occurrence of secret in s with "REDACTED"
+// and returns the result. It is the string-level building block behind
+// RedactSecret and RedactTransportError, exposed for callers that must redact a
+// secret from a plain string — a captured HTTP response body destined for an
+// error field or a log line — rather than from an error value. An empty secret
+// is a no-op (s is returned unchanged), matching the error-shaped variants.
+func RedactSecretString(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, "REDACTED")
 }
 
 // redactURL returns a log-safe rendering of rawURL. It masks the userinfo

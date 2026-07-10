@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/cplieger/httpx/v2"
@@ -428,6 +430,69 @@ type trackingCloser struct {
 func (tc *trackingCloser) Close() error {
 	tc.onClose()
 	return nil
+}
+
+func TestReadLimitedBody(t *testing.T) {
+	tests := []struct {
+		name         string
+		body         string
+		limit        int64
+		want         string
+		wantTooLarge bool
+	}{
+		{"under limit", "hello", 100, "hello", false},
+		{"exactly at limit", "hello", 5, "hello", false},
+		{"one byte over limit", "hello!", 5, "", true},
+		{"empty body", "", 5, "", false},
+		{"maxint64 is unlimited", "hello world", math.MaxInt64, "hello world", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			closed := false
+			body := &trackingCloser{Reader: strings.NewReader(tc.body), onClose: func() { closed = true }}
+			data, err := httpx.ReadLimitedBody(body, tc.limit)
+			if !closed {
+				t.Error("ReadLimitedBody did not close the body")
+			}
+			if tc.wantTooLarge {
+				var tooLarge *httpx.ResponseTooLargeError
+				if !errors.As(err, &tooLarge) {
+					t.Fatalf("err = %v, want *ResponseTooLargeError", err)
+				}
+				if tooLarge.Limit != tc.limit {
+					t.Errorf("ResponseTooLargeError.Limit = %d, want %d", tooLarge.Limit, tc.limit)
+				}
+				if data != nil {
+					t.Errorf("data = %q, want nil bytes on overflow", data)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if string(data) != tc.want {
+				t.Errorf("data = %q, want %q", data, tc.want)
+			}
+		})
+	}
+}
+
+// TestReadLimitedBody_readErrorPropagates pins that a mid-read error is returned
+// as-is (not masked as an overflow) and the body is still closed.
+func TestReadLimitedBody_readErrorPropagates(t *testing.T) {
+	errBoom := errors.New("boom")
+	closed := false
+	body := &trackingCloser{Reader: iotest.ErrReader(errBoom), onClose: func() { closed = true }}
+	data, err := httpx.ReadLimitedBody(body, 100)
+	if !closed {
+		t.Error("ReadLimitedBody did not close the body on read error")
+	}
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("err = %v, want boom", err)
+	}
+	if data != nil {
+		t.Errorf("data = %q, want nil bytes on read error", data)
+	}
 }
 
 func TestRetry_non200_statusCodes(t *testing.T) {
