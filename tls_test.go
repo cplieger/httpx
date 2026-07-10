@@ -1,51 +1,24 @@
 package httpx
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
-)
 
-// testCAPEM generates a throwaway self-signed CA certificate and returns it
-// PEM-encoded. Used to exercise the pool/transport builders without touching
-// disk or the system trust store.
-func testCAPEM(t *testing.T) []byte {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "httpx-test-ca"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		IsCA:         true,
-		KeyUsage:     x509.KeyUsageCertSign,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("CreateCertificate: %v", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-}
+	"github.com/cplieger/httpx/v2/certtest"
+)
 
 // TestCACertPool exercises the internal caCertPool primitive directly (this is
 // an in-package test so it can reach the unexported builder).
 func TestCACertPool(t *testing.T) {
 	t.Run("valid PEM builds a pool", func(t *testing.T) {
-		pool, err := caCertPool(testCAPEM(t))
+		pool, err := caCertPool(certtest.SelfSignedCA(t))
 		if err != nil {
 			t.Fatalf("caCertPool: %v", err)
 		}
@@ -69,7 +42,7 @@ func TestCACertPool(t *testing.T) {
 	t.Run("valid cert alongside a junk block still builds", func(t *testing.T) {
 		// AppendCertsFromPEM returns true if it parsed at least one cert, so a
 		// valid cert followed by an unparseable block yields a usable pool.
-		mixed := append(testCAPEM(t), "\n-----BEGIN CERTIFICATE-----\nnotvalidbase64\n-----END CERTIFICATE-----\n"...)
+		mixed := append(certtest.SelfSignedCA(t), "\n-----BEGIN CERTIFICATE-----\nnotvalidbase64\n-----END CERTIFICATE-----\n"...)
 		if pool, err := caCertPool(mixed); err != nil || pool == nil {
 			t.Errorf("caCertPool(valid+junk) = (%v, %v), want (pool, nil)", pool, err)
 		}
@@ -78,7 +51,7 @@ func TestCACertPool(t *testing.T) {
 
 func TestCATransport(t *testing.T) {
 	t.Run("pins CA with verification on and TLS 1.2 floor", func(t *testing.T) {
-		tr, err := CATransport(testCAPEM(t))
+		tr, err := CATransport(certtest.SelfSignedCA(t))
 		if err != nil {
 			t.Fatalf("CATransport: %v", err)
 		}
@@ -138,7 +111,7 @@ func TestCATransport_verification(t *testing.T) {
 
 	// A transport pinning an unrelated CA must reject the server with a
 	// certificate/authority error — proving the pin is enforced, not bypassed.
-	wrong, err := CATransport(testCAPEM(t))
+	wrong, err := CATransport(certtest.SelfSignedCA(t))
 	if err != nil {
 		t.Fatalf("CATransport(wrongCA): %v", err)
 	}
@@ -179,7 +152,7 @@ func TestCATransport_errors_when_DefaultTransport_replaced(t *testing.T) {
 	http.DefaultTransport = &stubRT{}
 	defer func() { http.DefaultTransport = orig }()
 
-	tr, err := CATransport(testCAPEM(t))
+	tr, err := CATransport(certtest.SelfSignedCA(t))
 	if tr != nil {
 		t.Errorf("CATransport = %v, want nil transport when DefaultTransport is not *http.Transport", tr)
 	}

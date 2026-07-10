@@ -110,6 +110,13 @@ defer rc.Close()
 - `CATransport(pem)` — build an `*http.Transport` (cloned from `http.DefaultTransport`, so pooling/timeouts/proxy are preserved) that pins the CA certificate(s) in `pem` as the **sole** trust anchors. Verification stays **on** (`InsecureSkipVerify` is never set) with a TLS 1.2 minimum. Returns the concrete, mutable transport so it composes with `NewRetryRoundTripper`.
 - `ErrNoCertsInPEM` — returned by `CATransport` when `pem` yields no certificates (a loud error instead of a silently-empty pool). The caller reads the PEM bytes, keeping the helper I/O-free.
 
+### Test helpers (`certtest` subpackage)
+
+The `github.com/cplieger/httpx/v2/certtest` subpackage supplies throwaway self-signed CA material for tests — the companion to `CATransport`. It lives in a separate package so the certificate-generation code is never linked into a production binary (only the `_test.go` files that import it pull it in, exactly as the standard library ships `net/http/httptest` alongside `net/http`).
+
+- `certtest.SelfSignedCA(tb)` — a fresh, throwaway self-signed CA certificate, PEM-encoded (`[]byte`); feed it to `CATransport` or an `x509.CertPool`. A new key each call, so two certs are mutually untrusted (handy for asserting a pin is enforced).
+- `certtest.WriteSelfSignedCA(tb)` — the same certificate written to a `ca.pem` file (mode `0o600`) under `tb.TempDir()`, returning the path — for code under test that reads its CA from a file path.
+
 ### Hooks & Policies
 
 - `CheckRetry` — pluggable retry policy: `func(ctx, resp, err) (bool, error)`
