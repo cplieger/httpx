@@ -7,14 +7,18 @@ this file covers what makes httpx different.
 
 ## What this library is
 
-A single-package, zero-runtime-dependency Go toolkit for resilient outbound
-HTTP: jittered exponential backoff, transient-error classification, Retry-After
-parsing, HTTP status→typed-error mapping, secret redaction, body draining, a
-transparent retrying `http.RoundTripper` with body replay, and a configurable
-redirect allowlist, and a custom-CA TLS transport. Everything lives in the root
-package `httpx` across three files: `httpx.go` (errors, backoff, retry, parsing,
-redirect, redaction), `roundtripper.go` (the `RetryRoundTripper`), and `tls.go`
-(the custom-CA TLS transport and `ErrNoCertsInPEM`).
+A zero-runtime-dependency Go toolkit for resilient outbound HTTP: jittered
+exponential backoff, transient-error classification, Retry-After parsing, HTTP
+status→typed-error mapping, secret redaction, body draining, a transparent
+retrying `http.RoundTripper` with body replay, a configurable redirect
+allowlist, and a custom-CA TLS transport. The production toolkit is a single
+package: everything lives in the root package `httpx` across three files:
+`httpx.go` (errors, backoff, retry, parsing, redirect, redaction),
+`roundtripper.go` (the `RetryRoundTripper`), and `tls.go` (the custom-CA TLS
+transport and `ErrNoCertsInPEM`). A test-support subpackage, `certtest`, adds
+throwaway self-signed CA helpers for consumers' TLS tests — import-only from
+`_test.go` files, so its certificate-generation code never links into a
+production binary.
 
 ## The SKIP list is a contract, not a backlog
 
