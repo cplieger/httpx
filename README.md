@@ -200,6 +200,20 @@ The `RoundTripper` performs no URL logging of its own — wire any logging throu
 - **`Retry`** returns `nil` body and a wrapped error: `retries exhausted after <elapsed>: <lastErr>` (unwrap with `errors.Is`/`errors.As`). A response that overflows `WithMaxBodyBytes` returns `*ResponseTooLargeError` (no body).
 - **`RetryRoundTripper`** returns the **last response with a nil error**, even when that response is a retryable 5xx (e.g. a 503) — mirroring how a non-retried request behaves. A caller that checks only `err != nil` will treat an exhausted 503 as success, so **inspect `resp.StatusCode` and close the body**. (A budget abort via `WithRTMaxElapsedTime` or a `BackoffStop` does return an error.)
 
+## Timeouts and deadlines
+
+httpx retries transient failures, not budget expiry, and that distinction drives how you should bound a retried call. `IsTransient` classifies `context.DeadlineExceeded` and `context.Canceled` as **non-transient** (checked first), while a transport-level `net.Error` timeout, a connection reset, a DNS error, and a 429/5xx are transient. So a context deadline means "the budget is exhausted, stop", and a transport timeout means "this attempt failed, try again".
+
+- **Total budget: a context deadline.** Pass a `context.WithTimeout` (or a caller-supplied deadline) as the single authoritative bound over the whole operation. `Retry` / `RetryWithBackoff` stop the moment `ctx` is done, and `SleepCtx` caps the backoff by it, so the deadline spans every attempt and every backoff sleep. On expiry the call ends; it is terminal, not retried.
+- **Per-attempt bound.** Where a per-attempt cap lives depends on the retry entry point, because that is what decides whether `http.Client.Timeout` is per-attempt or total:
+  - With the one-shot `Retry` / `RetryWithBackoff` (the retry loop runs _outside_ `client.Do`), an `http.Client.Timeout` bounds each attempt and fires as a `net.Error` timeout, so it is **retried**; a `context.WithTimeout` wrapped inside the retry `fn` is instead a context deadline and is **terminal**. Choose the stall behavior you want.
+  - With `NewRetryRoundTripper` (the retry loop runs _inside_ `client.Do`), `http.Client.Timeout` is NOT per-attempt: it caps the whole retry sequence, and because it is a context deadline a slow attempt that trips it aborts the remaining retries. For a per-attempt bound here, set a transport timeout such as `ResponseHeaderTimeout` on the base transport (it fires as a retryable `net.Error`); bound the total with the caller's context or `WithRTMaxElapsedTime`.
+- **RoundTripper budget.** `NewRetryRoundTripper` takes `WithRTMaxElapsedTime` as a hard total-time ceiling across retries (computed after any honored `Retry-After`). Pair it with a per-attempt **transport** timeout (e.g. `ResponseHeaderTimeout`); do **not** wrap the client in an `http.Client.Timeout`, which is a total cap in disguise and defeats the retries it sits above.
+
+**Recommended:** give the operation a context deadline as its total budget (honored end-to-end, and it keeps a slow attempt from running unbounded), and add a per-attempt bound only when a single try needs its own cap. Through the one-shot `Retry` helper a bare `http.Client.Timeout` with no context deadline is fine for a simple call to a trusted or local endpoint (there it is per-attempt, so a retried call can run up to `maxAttempts` times its value); under `NewRetryRoundTripper` reach for `ResponseHeaderTimeout` plus a total from the context or `WithRTMaxElapsedTime` instead.
+
+A per-attempt timeout that is **itself retried** (a stalled attempt abandoned and a fresh one tried within the remaining total budget, the gRPC per-try-timeout model) is not built into the retry primitives today. Approximate it by pairing a per-attempt bound (a `context.WithTimeout` inside the one-shot `fn`, or `ResponseHeaderTimeout` under the RoundTripper) with an outer context deadline or `WithRTMaxElapsedTime` for the total.
+
 ## Unsupported by Design (SKIP List)
 
 The following features are intentionally not provided:
