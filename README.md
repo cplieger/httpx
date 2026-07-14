@@ -109,6 +109,7 @@ defer rc.Close()
 
 - `CATransport(pem)` — build an `*http.Transport` (cloned from `http.DefaultTransport`, so pooling/timeouts/proxy are preserved) that pins the CA certificate(s) in `pem` as the **sole** trust anchors. Verification stays **on** (`InsecureSkipVerify` is never set) with a TLS 1.2 minimum. Returns the concrete, mutable transport so it composes with `NewRetryRoundTripper`.
 - `ErrNoCertsInPEM` — returned by `CATransport` when `pem` yields no certificates (a loud error instead of a silently-empty pool). The caller reads the PEM bytes, keeping the helper I/O-free.
+- `CloneDefaultTransport()` — a private clone of `http.DefaultTransport` (pooling/timeouts/HTTP2/proxy preserved) that is yours to mutate — set a per-attempt `ResponseHeaderTimeout`, tune `MaxIdleConnsPerHost`, or use it as the base of `NewRetryRoundTripper` — without reconfiguring every other client in the process. Errors when `http.DefaultTransport` has been replaced by a non-`*http.Transport` (nothing concrete to clone). The building block `CATransport` is assembled on.
 
 ### Test helpers (`certtest` subpackage)
 
@@ -157,6 +158,7 @@ The `github.com/cplieger/httpx/v2/certtest` subpackage supplies throwaway self-s
 ### Redirect Policies
 
 - `DefaultRedirectPolicy` — same-host-only redirect policy (used by `NewClient`). It also refuses a same-host `https`->`http` scheme downgrade and allows an `http`->`https` upgrade, which makes it equivalent to `RedirectPolicyFunc(WithSameHost())`.
+- `RefuseAllRedirects` — follows **no** redirect: returns `http.ErrUseLastResponse`, so the client surfaces the 3xx response itself (nil error) instead of following. The policy for a token-bearing client of an API that issues no redirects — Go forwards custom headers (`X-Plex-Token`, `X-Api-Key`) across redirects, so a hostile 302 would exfiltrate the credential.
 - `DockerGitHubRedirectPolicy` — optional example policy for docker.com/github.com
 - `RedirectPolicyFunc` — build a custom redirect allowlist (functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithSameHost`, `WithAllowSchemeDowngrade`, `WithMaxHops`)
   - `WithSameHost` additionally allows a redirect whose target host equals the original request's host (layered on any allowlisted hosts or suffixes); it is the building block for a same-origin policy.
@@ -169,6 +171,7 @@ The `github.com/cplieger/httpx/v2/certtest` subpackage supplies throwaway self-s
 ### Secret Redaction
 
 - `RedactTransportError` / `RedactSecret` / `RedactSecretString` — secret redaction (error- and string-level)
+- `LogSafeError` — reduce a URL-embedding transport `*url.Error` to its underlying cause (everything else passes through, `errors.Is`/`As` preserved). The same reduction httpx applies to every transport error it logs; equivalent to `RedactTransportError(err, "", "")`.
 
 ### Error Types
 
@@ -189,7 +192,7 @@ To avoid leaking credentials into logs (CWE-532, the class of [go-retryablehttp 
 
 - Every logged `url` attribute is redacted — the userinfo password is masked (like `url.URL.Redacted`) and query values are replaced with `REDACTED` (query values commonly carry api keys, tokens, and signatures — the same default [.NET 9's `IHttpClientFactory`](https://learn.microsoft.com/en-us/dotnet/core/compatibility/networking/9.0/query-redaction-logs) adopted). Query keys, scheme, host, and path are kept for debugging.
 - `StatusError.Error()` renders that same redacted URL, so the secret stays out of returned errors too; the raw `StatusError.URL` field remains available for programmatic use.
-- Transport errors (`*url.Error`, which embed the full URL) are reduced to their underlying cause before logging.
+- Transport errors (`*url.Error`, which embed the full URL) are reduced to their underlying cause before logging — the reduction is exported as `LogSafeError` so callers wrapping transport errors into their own messages can apply the same one.
 
 The `RoundTripper` performs no URL logging of its own — wire any logging through its `WithOnRetry` hook, where redaction is the caller's responsibility.
 

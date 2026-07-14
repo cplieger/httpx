@@ -26,11 +26,33 @@ func caCertPool(pem []byte) (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// CloneDefaultTransport returns a private clone of http.DefaultTransport,
+// keeping the standard connection pooling, dial/keepalive timeouts, HTTP/2
+// negotiation, and proxy support (ProxyFromEnvironment). The clone is the
+// caller's to mutate — set a per-attempt ResponseHeaderTimeout, tune
+// MaxIdleConnsPerHost, or pass it as the base RoundTripper of
+// NewRetryRoundTripper — without the global footgun of mutating
+// http.DefaultTransport itself, which would silently reconfigure every other
+// client in the process.
+//
+// It returns an error when http.DefaultTransport has been replaced by a
+// non-*http.Transport RoundTripper (request instrumentation, a test stub): a
+// wrapping RoundTripper offers no concrete transport to clone, and failing
+// loudly beats silently dropping the wrapper's behavior. It is the building
+// block CATransport is assembled on.
+func CloneDefaultTransport() (*http.Transport, error) {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("httpx: http.DefaultTransport is not *http.Transport")
+	}
+	return base.Clone(), nil
+}
+
 // CATransport builds an *http.Transport that trusts ONLY the CA certificate(s)
 // in pem for TLS verification (pinning). It is cloned from
-// http.DefaultTransport, so it keeps the standard connection pooling,
-// dial/keepalive timeouts, HTTP/2 negotiation, and proxy support
-// (ProxyFromEnvironment). A FRESH TLS config is then installed — RootCAs from
+// http.DefaultTransport (via CloneDefaultTransport), so it keeps the standard
+// connection pooling, dial/keepalive timeouts, HTTP/2 negotiation, and proxy
+// support (ProxyFromEnvironment). A FRESH TLS config is then installed — RootCAs from
 // pem, a TLS 1.2 minimum, and verification always ENABLED (InsecureSkipVerify
 // is not set). Any TLS settings already on http.DefaultTransport are
 // intentionally NOT carried over, so the returned transport's trust posture
@@ -63,11 +85,10 @@ func CATransport(pem []byte) (*http.Transport, error) {
 	if err != nil {
 		return nil, err
 	}
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, errors.New("httpx: http.DefaultTransport is not *http.Transport")
+	tr, err := CloneDefaultTransport()
+	if err != nil {
+		return nil, err
 	}
-	tr := base.Clone()
 	// Install a FRESH TLS config rather than inheriting the cloned base's. This
 	// guarantees the documented trust posture — verification on, no inherited
 	// InsecureSkipVerify or accept-all VerifyPeerCertificate/VerifyConnection

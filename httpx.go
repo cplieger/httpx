@@ -493,7 +493,7 @@ func RetryWithBackoff[T any](ctx context.Context, maxAttempts int, baseDelay tim
 		wait := nextRetryWait(err, backoff)
 		slog.Debug(label+" failed, retrying",
 			"attempt", attempt+1, "max", maxAttempts,
-			"delay", wait.String(), "error", logSafeError(err))
+			"delay", wait.String(), "error", LogSafeError(err))
 		if err := SleepCtx(ctx, wait); err != nil {
 			return zero, err
 		}
@@ -501,7 +501,7 @@ func RetryWithBackoff[T any](ctx context.Context, maxAttempts int, baseDelay tim
 	}
 	if lastErr != nil {
 		slog.Warn(label+" retries exhausted",
-			"attempts", maxAttempts, "error", logSafeError(lastErr))
+			"attempts", maxAttempts, "error", LogSafeError(lastErr))
 	}
 	return zero, lastErr
 }
@@ -534,14 +534,14 @@ func RetryOnRateLimit(ctx context.Context, maxAttempts int, maxWait time.Duratio
 		}
 		slog.Debug("rate limited, backing off",
 			"attempt", attempt+1, "max", maxAttempts,
-			"delay", wait.String(), "error", logSafeError(lastErr))
+			"delay", wait.String(), "error", LogSafeError(lastErr))
 		if err := SleepCtx(ctx, wait); err != nil {
 			return err
 		}
 	}
 	if lastErr != nil {
 		slog.Warn("rate limit retries exhausted",
-			"attempts", maxAttempts, "error", logSafeError(lastErr))
+			"attempts", maxAttempts, "error", LogSafeError(lastErr))
 	}
 	return lastErr
 }
@@ -602,7 +602,7 @@ func WithLogger(l *slog.Logger) Option {
 //   - []byte return with the body capped at cfg.maxBodyBytes (the RoundTripper
 //     hands back an *http.Response and never reads the body);
 //   - URL/secret redaction on every log "url" attr (redactURL) and every
-//     returned/wrapped error (logSafeError, StatusError.Error()), the
+//     returned/wrapped error (LogSafeError, StatusError.Error()), the
 //     CWE-532 hardening the RoundTripper path does not perform;
 //   - rich per-attempt slog logging plus the "retries exhausted after %s: %w"
 //     wrapper, which the RoundTripper exposes only as an OnRetry hook;
@@ -635,7 +635,7 @@ func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Opti
 			return body, nil
 		}
 		if err != nil && !isRetryStatus(err) {
-			return nil, logSafeError(err)
+			return nil, LogSafeError(err)
 		}
 		lastErr = err
 		overrideWait = retryAfter
@@ -643,12 +643,12 @@ func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Opti
 			break
 		}
 		log.Debug("http request failed, will retry",
-			"url", redactURL(reqURL), "attempt", attempt+1, "max", cfg.maxAttempts, "error", logSafeError(err))
+			"url", redactURL(reqURL), "attempt", attempt+1, "max", cfg.maxAttempts, "error", LogSafeError(err))
 	}
 	elapsed := time.Since(start)
 	log.Warn("http retries exhausted",
-		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", logSafeError(lastErr))
-	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), logSafeError(lastErr))
+		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", LogSafeError(lastErr))
+	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), LogSafeError(lastErr))
 }
 
 // newRetryCfg builds a retryCfg from opts (nil options are skipped) and applies
@@ -1083,6 +1083,21 @@ func DockerGitHubRedirectPolicy(req *http.Request, via []*http.Request) error {
 	}
 }
 
+// RefuseAllRedirects is a CheckRedirect policy that follows NO redirect: it
+// returns http.ErrUseLastResponse, so the client hands the caller the redirect
+// response itself (status 3xx, body open, nil error) instead of the followed
+// hop. It is the policy for a token-bearing client of an API that issues no
+// redirects: Go's client forwards custom request headers (an X-Plex-Token, an
+// X-Api-Key) across redirects — only Authorization, Cookie, and
+// WWW-Authenticate are stripped, and only on a cross-domain hop — so a hostile
+// 302 (MITM, DNS poisoning) would exfiltrate the credential to an
+// attacker-chosen origin. With the hop refused, the credential never leaves
+// the configured host and the unexpected 3xx surfaces to the caller's own
+// status handling.
+func RefuseAllRedirects(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 // --- Client helpers ---
 
 // NewClient returns an *http.Client with the given timeout and the
@@ -1171,12 +1186,17 @@ func redactURL(rawURL string) string {
 	return u.Redacted()
 }
 
-// logSafeError returns an error whose message is safe to log. A transport
+// LogSafeError returns an error whose message is safe to log. A transport
 // *url.Error embeds the full request URL (with any userinfo/query secrets), so
-// it is reduced to its underlying cause. *StatusError already renders a
-// redacted URL via Error(), so it (and everything else) passes through
-// unchanged — preserving errors.Is/As chains for callers.
-func logSafeError(err error) error {
+// it is reduced to its underlying cause. Nil returns nil; *StatusError already
+// renders a redacted URL via Error(), so it (and everything else) passes
+// through unchanged — preserving errors.Is/As chains for callers.
+//
+// httpx applies this reduction to every transport error it logs or wraps; it
+// is exported so a caller wrapping transport errors into its own messages can
+// apply the same one (equivalent to RedactTransportError(err, "", "") — reach
+// for that variant when a known secret must also be scrubbed from the text).
+func LogSafeError(err error) error {
 	if err == nil {
 		return nil
 	}

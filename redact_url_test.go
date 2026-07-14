@@ -63,31 +63,31 @@ func TestRedactURL_unparseableYieldsPlaceholder(t *testing.T) {
 }
 
 func TestLogSafeError(t *testing.T) {
-	if logSafeError(nil) != nil {
-		t.Fatal("logSafeError(nil) should be nil")
+	if LogSafeError(nil) != nil {
+		t.Fatal("LogSafeError(nil) should be nil")
 	}
 
-	// A transport *url.Error embeds the full URL; logSafeError drops it.
+	// A transport *url.Error embeds the full URL; LogSafeError drops it.
 	ue := &url.Error{
 		Op:  "Get",
 		URL: "https://example.com/p?apikey=supersecret",
 		Err: errors.New("dial tcp: connection refused"),
 	}
-	got := logSafeError(ue)
+	got := LogSafeError(ue)
 	if strings.Contains(got.Error(), "supersecret") || strings.Contains(got.Error(), "example.com") {
-		t.Errorf("logSafeError leaked URL: %q", got.Error())
+		t.Errorf("LogSafeError leaked URL: %q", got.Error())
 	}
 	if !strings.Contains(got.Error(), "connection refused") {
-		t.Errorf("logSafeError dropped the cause: %q", got.Error())
+		t.Errorf("LogSafeError dropped the cause: %q", got.Error())
 	}
 
 	// A *StatusError passes through (its Error() already redacts) and the
 	// errors.As chain is preserved.
 	se := &StatusError{Code: 429, URL: "https://example.com/p?apikey=supersecret"}
-	got2 := logSafeError(se)
+	got2 := LogSafeError(se)
 	var asSE *StatusError
 	if !errors.As(got2, &asSE) {
-		t.Error("logSafeError(*StatusError) broke the errors.As chain")
+		t.Error("LogSafeError(*StatusError) broke the errors.As chain")
 	}
 	if strings.Contains(got2.Error(), "supersecret") {
 		t.Errorf("StatusError still leaked the secret: %q", got2.Error())
