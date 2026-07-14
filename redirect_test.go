@@ -1,8 +1,11 @@
 package httpx_test
 
 import (
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -337,5 +340,52 @@ func TestDefaultRedirectPolicy_scheme(t *testing.T) {
 	}
 	if err := httpx.DefaultRedirectPolicy(reqTo(t, "http://arr.example/b"), viaWithOrigin(t, "https://arr.example/a")); err == nil {
 		t.Error("same-host https->http downgrade should be refused")
+	}
+}
+
+// TestRefuseAllRedirects_identity pins the mechanism: the policy is exactly
+// http.ErrUseLastResponse, which makes the client surface the redirect
+// response itself rather than fail the request with an error.
+func TestRefuseAllRedirects_identity(t *testing.T) {
+	if err := httpx.RefuseAllRedirects(redirectReq("anywhere.example"), redirectVia(3)); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Errorf("RefuseAllRedirects = %v, want http.ErrUseLastResponse", err)
+	}
+}
+
+// TestRefuseAllRedirects_surfaces_3xx_and_never_follows is the end-to-end
+// contract: a client configured with the policy hands back the 302 itself
+// (nil error), and the redirect target — which would have received the
+// token-bearing headers — is never contacted.
+func TestRefuseAllRedirects_surfaces_3xx_and_never_follows(t *testing.T) {
+	var targetHit atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hop", func(http.ResponseWriter, *http.Request) { targetHit.Store(true) })
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/hop", http.StatusFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: httpx.RefuseAllRedirects}
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/start", http.NoBody)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("X-Api-Token", "supersecret")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v (the refused redirect must surface as a response, not an error)", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("status = %d, want %d (the redirect response itself)", resp.StatusCode, http.StatusFound)
+	}
+	if loc := resp.Header.Get("Location"); loc == "" {
+		t.Error("Location header missing from the surfaced redirect response")
+	}
+	if targetHit.Load() {
+		t.Error("redirect target was contacted; the hop must never be followed")
 	}
 }

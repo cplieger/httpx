@@ -160,3 +160,42 @@ func TestCATransport_errors_when_DefaultTransport_replaced(t *testing.T) {
 		t.Errorf("CATransport err = %v, want an error containing 'not *http.Transport'", err)
 	}
 }
+
+// TestCloneDefaultTransport_returns_private_clone pins the clone contract:
+// a distinct *http.Transport that keeps the default's config (Proxy hook)
+// but whose mutation cannot reconfigure http.DefaultTransport itself.
+func TestCloneDefaultTransport_returns_private_clone(t *testing.T) {
+	tr, err := CloneDefaultTransport()
+	if err != nil {
+		t.Fatalf("CloneDefaultTransport() error: %v", err)
+	}
+	if tr == nil {
+		t.Fatal("CloneDefaultTransport() = nil transport with nil error")
+	}
+	if any(tr) == any(http.DefaultTransport) {
+		t.Fatal("CloneDefaultTransport() returned http.DefaultTransport itself, not a clone")
+	}
+	if tr.Proxy == nil {
+		t.Error("clone lost the default transport's Proxy hook")
+	}
+	tr.ResponseHeaderTimeout = 123 * time.Second
+	if dt := http.DefaultTransport.(*http.Transport); dt.ResponseHeaderTimeout == 123*time.Second {
+		t.Error("mutating the clone reconfigured http.DefaultTransport")
+	}
+}
+
+func TestCloneDefaultTransport_errors_when_DefaultTransport_replaced(t *testing.T) {
+	// Swaps the process global (same caveat as the CATransport variant above):
+	// must NOT run in parallel with tests that read http.DefaultTransport.
+	orig := http.DefaultTransport
+	http.DefaultTransport = &stubRT{}
+	defer func() { http.DefaultTransport = orig }()
+
+	tr, err := CloneDefaultTransport()
+	if tr != nil {
+		t.Errorf("CloneDefaultTransport = %v, want nil transport when DefaultTransport is not *http.Transport", tr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not *http.Transport") {
+		t.Errorf("CloneDefaultTransport err = %v, want an error containing 'not *http.Transport'", err)
+	}
+}

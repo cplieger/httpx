@@ -596,7 +596,7 @@ func TestRetry_retries_on_transient_transport_error(t *testing.T) {
 
 func TestRetry_create_request_error_fails_fast(t *testing.T) {
 	// DEL control character (0x7f) makes http.NewRequestWithContext fail;
-	// logSafeError drops the url.Error wrapper so the url-parse cause is returned.
+	// LogSafeError drops the url.Error wrapper so the url-parse cause is returned.
 	_, err := httpx.Retry(t.Context(), http.DefaultClient, "http://example.com/\x7f",
 		httpx.WithBaseDelay(time.Millisecond))
 	if err == nil {
