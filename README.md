@@ -155,6 +155,12 @@ The `github.com/cplieger/httpx/v2/certtest` subpackage supplies throwaway self-s
 - `LimitedBody` — wrap response body with a size cap
 - `ReadLimitedBody` — read a body to a cap (closing it) with overflow detection, returning `*ResponseTooLargeError` instead of a silently truncated body
 
+### Conditional GET
+
+- `Validators{ETag, LastModified}` — the cache validators captured from a previous 200, replayed on the next request
+- `ConditionalResult{Validators, Body, NotModified}` — one conditional-request outcome
+- `DoConditional(client, req, v, maxBodyBytes)` — a single conditional attempt: sets `If-None-Match` / `If-Modified-Since` from `v` (empty fields unsent) and classifies the response — 304 (`NotModified`, body drained, zero `Validators`: keep the ones you sent), 200 (bounded body + the response's fresh validators), anything else an error (the `CheckHTTPStatus` mapping for `>= 400`, a plain non-transient error for a status that is neither content nor a revalidation). Deliberately single-shot so the caller owns retry and cache policy: wrap it in `RetryWithBackoff` (transient classification composes through the returned errors), rebuild the request per attempt, persist body and validators together, and send the zero `Validators` when the cached body is unusable so an empty cache can never be "revalidated" into a 304 with nothing to reuse.
+
 ### Redirect Policies
 
 - `DefaultRedirectPolicy` — same-host-only redirect policy (used by `NewClient`). It also refuses a same-host `https`->`http` scheme downgrade and allows an `http`->`https` upgrade, which makes it equivalent to `RedirectPolicyFunc(WithSameHost())`.
