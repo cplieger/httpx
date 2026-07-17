@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v2"
+	"github.com/cplieger/httpx/v3"
 )
 
 // Nil-option guards (a nil functional option must be skipped, not panic) and the
 // negative-attempt clamp edge case.
 
-func TestRetry_nil_option_is_skipped(t *testing.T) {
+func TestGetBytes_nil_option_is_skipped(t *testing.T) {
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -24,35 +24,28 @@ func TestRetry_nil_option_is_skipped(t *testing.T) {
 		}, nil
 	})
 	client := &http.Client{Transport: transport}
-	var nilOpt httpx.Option
-	if _, err := httpx.Retry(context.Background(), client, "http://example.com/nilopt", nilOpt); err != nil {
-		t.Fatalf("nil Option caused error: %v", err)
+	var nilOpt httpx.GetOption
+	if _, err := httpx.GetBytes(context.Background(), client, "http://example.com/nilopt", nilOpt); err != nil {
+		t.Fatalf("nil GetOption caused error: %v", err)
+	}
+	// A shared Option (interface superset) is accepted by both doors; nil is
+	// skipped there too.
+	var nilShared httpx.Option
+	if _, err := httpx.GetBytes(context.Background(), client, "http://example.com/nilopt2", nilShared); err != nil {
+		t.Fatalf("nil shared Option caused error: %v", err)
 	}
 }
 
-func TestRetryRoundTripper_nil_option_is_skipped(t *testing.T) {
-	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader("ok")),
-			Header:     http.Header{},
-		}, nil
-	})
-	var nilOpt httpx.RTOption
-	rt := httpx.NewRetryRoundTripper(transport, nilOpt)
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com/nilrtopt", http.NoBody)
-	resp, err := rt.RoundTrip(req)
+func TestDo_nil_option_is_skipped(t *testing.T) {
+	var nilOpt httpx.DoOption
+	got, err := httpx.Do(context.Background(), func(_ context.Context) (string, error) {
+		return "ok", nil
+	}, nilOpt)
 	if err != nil {
-		t.Fatalf("nil RTOption caused error: %v", err)
+		t.Fatalf("nil DoOption caused error: %v", err)
 	}
-	resp.Body.Close()
-}
-
-func TestExponentialBackoff_nil_option_is_skipped(t *testing.T) {
-	var nilOpt httpx.ExpBackoffOption
-	bo := httpx.NewExponentialBackoff(nilOpt)
-	if d := bo.NextBackOff(); d < 0 {
-		t.Fatalf("negative backoff: %v", d)
+	if got != "ok" {
+		t.Fatalf("Do = %q, want ok", got)
 	}
 }
 
@@ -66,8 +59,9 @@ func TestRedirectPolicyFunc_nil_option_still_refuses(t *testing.T) {
 }
 
 // TestRetryRoundTripper_negative_max_attempts_clamps_to_one covers the negative
-// edge (the {0,1,2,3} exact-count table lives in v2_test.go): -1 clamps to a
-// single attempt, never a silent no-op and never the old coerce-to-default-3.
+// edge (the exact-count table lives in contract_test.go): a negative
+// MaxAttempts means exactly one attempt (the v3 "try once" configuration; zero
+// means unset and takes the default).
 func TestRetryRoundTripper_negative_max_attempts_clamps_to_one(t *testing.T) {
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
@@ -78,16 +72,16 @@ func TestRetryRoundTripper_negative_max_attempts_clamps_to_one(t *testing.T) {
 			Header:     http.Header{},
 		}, nil
 	})
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTMaxAttempts(-1),
-		httpx.WithRTBaseDelay(time.Millisecond),
-	)
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{
+		MaxAttempts: -1,
+		BaseDelay:   time.Millisecond,
+	})
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/neg", http.NoBody)
 	resp, _ := rt.RoundTrip(req)
 	if resp != nil {
 		resp.Body.Close()
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("WithRTMaxAttempts(-1): calls=%d, want 1 (clamped to a single attempt)", got)
+		t.Fatalf("TransportConfig{MaxAttempts: -1}: calls=%d, want 1 (negative means a single attempt)", got)
 	}
 }

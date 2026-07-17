@@ -48,8 +48,8 @@ type ConditionalResult struct {
 //     redirect-refusing client). The body is always closed.
 //
 // It is deliberately a SINGLE attempt so the caller owns the retry and cache
-// policy: wrap it in RetryWithBackoff (transient classification composes
-// through the returned errors), rebuild req per attempt, and decide app-side
+// policy: wrap it in Do (transient classification composes through the
+// returned errors), rebuild req per attempt, and decide app-side
 // when a cached copy may be reused on failure (stale-on-error) and whether
 // validators may be sent at all (send the zero Validators when the cached body
 // is unusable, so an empty cache can never be "revalidated" into a 304 with

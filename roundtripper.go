@@ -2,7 +2,6 @@ package httpx
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -23,94 +22,62 @@ type OnRetry func(attempt int, req *http.Request, resp *http.Response, err error
 // (e.g., re-signing with a fresh token). Mirrors go-retryablehttp PrepareRetry.
 type PrepareRetry func(req *http.Request) error
 
-// --- RetryRoundTripper functional options ---
-
-// rtCfg holds the configuration for a RetryRoundTripper.
-type rtCfg struct {
-	checkRetry         CheckRetry
-	onRetry            OnRetry
-	prepareRetry       PrepareRetry
-	backoffFunc        func() Backoff
-	baseDelay          time.Duration
-	maxAttempts        int
-	maxElapsedTime     time.Duration
-	retryNonIdempotent bool
-}
-
-// RTOption configures a RetryRoundTripper via NewRetryRoundTripper.
-type RTOption func(*rtCfg)
-
-// WithRTMaxAttempts sets the maximum number of attempts (TOTAL, including the
-// initial request). Default: DefaultMaxAttempts (3). A value below 1 is treated
-// as 1, so the request is always sent at least once. This counts total
-// attempts, not retries-beyond-first.
-func WithRTMaxAttempts(n int) RTOption {
-	return func(c *rtCfg) { c.maxAttempts = n }
-}
-
-// WithRTBaseDelay sets the initial backoff delay for the round-tripper
-// (used when no custom Backoff is provided). Default: DefaultBaseDelay (1s).
-func WithRTBaseDelay(d time.Duration) RTOption {
-	return func(c *rtCfg) { c.baseDelay = d }
-}
-
-// WithRTMaxElapsedTime caps total time spent retrying. Zero means no cap.
-func WithRTMaxElapsedTime(d time.Duration) RTOption {
-	return func(c *rtCfg) { c.maxElapsedTime = d }
-}
-
-// WithBackoffFunc sets a factory that returns a fresh custom backoff strategy
-// for each request. When set, the round-tripper's base delay is ignored.
-//
-// The factory is invoked once per RoundTrip, so every request drives its own
-// independent Backoff instance. This is required for correctness under the
-// documented shared-transport pattern (one StandardClient fanned across
-// goroutines): a single long-lived Backoff would have its progression rewound
-// and advanced concurrently by unrelated requests. Return a new instance (e.g.
-// NewExponentialBackoff(...)) from the factory; the fresh instance needs no
-// Reset.
-func WithBackoffFunc(f func() Backoff) RTOption {
-	return func(c *rtCfg) { c.backoffFunc = f }
-}
-
-// WithCheckRetry sets a custom retry policy. If nil, the default policy
-// retries on transient transport errors and 429/502/503/504 responses.
-func WithCheckRetry(cr CheckRetry) RTOption {
-	return func(c *rtCfg) { c.checkRetry = cr }
-}
-
-// WithOnRetry sets a hook called before each retry attempt for observability.
-func WithOnRetry(fn OnRetry) RTOption {
-	return func(c *rtCfg) { c.onRetry = fn }
-}
-
-// WithPrepareRetry sets a hook called before each retry to mutate the request
-// (e.g., refresh auth tokens).
-func WithPrepareRetry(fn PrepareRetry) RTOption {
-	return func(c *rtCfg) { c.prepareRetry = fn }
-}
-
-// WithRetryNonIdempotent enables retry of non-idempotent methods (POST, PUT,
-// PATCH, DELETE) when the request has a GetBody function for body replay.
-func WithRetryNonIdempotent(enable bool) RTOption {
-	return func(c *rtCfg) { c.retryNonIdempotent = enable }
+// TransportConfig configures a RetryRoundTripper (and, through NewRetryClient,
+// the retrying client). The zero value is ready to use and behaves exactly
+// like an unconfigured v2 round-tripper: three total attempts, one-second
+// base delay, the default retry policy, no hooks, no elapsed ceiling, no
+// non-idempotent replay.
+type TransportConfig struct {
+	// CheckRetry overrides the retry policy. nil means the default policy:
+	// transient transport errors plus 429/502/503/504 responses (deliberately
+	// narrower than GetBytes, which retries every 5xx; supply a custom policy
+	// to broaden the set when an upstream returns transient 500s).
+	CheckRetry CheckRetry
+	// OnRetry is a hook called before each retry attempt, the transport's only
+	// observability seam (it logs nothing itself).
+	OnRetry OnRetry
+	// PrepareRetry is called before each retry to mutate the cloned request
+	// (e.g. refresh an auth token).
+	PrepareRetry PrepareRetry
+	// MaxAttempts is the TOTAL attempt count including the initial request.
+	// Zero means unset and takes DefaultMaxAttempts (3); a NEGATIVE value
+	// means exactly one attempt (the "try once" configuration — v2 expressed
+	// it as WithRTMaxAttempts(0), but a zero struct field cannot distinguish
+	// absent from zero, so v3 moves try-once to negatives).
+	MaxAttempts int
+	// BaseDelay is the initial backoff delay; non-positive means
+	// DefaultBaseDelay (1s). Waits are equal-jitter with overflow-safe
+	// doubling, and a retryable response's Retry-After header (capped at
+	// RetryAfterCap) overrides the computed wait.
+	BaseDelay time.Duration
+	// MaxElapsedTime is a hard ceiling on total time across retries,
+	// including any honored Retry-After: when now+wait would meet or pass it,
+	// the round-tripper aborts with an error instead of sleeping. It is
+	// checked BETWEEN attempts and cannot interrupt a stalled in-flight
+	// attempt; bound single attempts on the base transport (e.g.
+	// ResponseHeaderTimeout) and the whole call with the request context.
+	// Zero means no ceiling.
+	MaxElapsedTime time.Duration
+	// RetryNonIdempotent enables retry of non-idempotent methods (POST, PUT,
+	// PATCH, DELETE) when the request has a GetBody function for body replay.
+	RetryNonIdempotent bool
 }
 
 // RetryRoundTripper implements http.RoundTripper with automatic retry.
 //
 // By default, only idempotent methods (GET, HEAD, OPTIONS, TRACE) are retried.
-// Use WithRetryNonIdempotent to also retry POST/PUT/PATCH/DELETE when the
-// request has a GetBody function for body replay.
+// Use TransportConfig.RetryNonIdempotent to also retry POST/PUT/PATCH/DELETE
+// when the request has a GetBody function for body replay.
 //
 // Inspired by hashicorp/go-retryablehttp, but operates directly on stdlib
 // *http.Request without a custom request type, and counts TOTAL attempts
-// (WithRTMaxAttempts) rather than go-retryablehttp's retries-beyond-first.
+// (TransportConfig.MaxAttempts) rather than go-retryablehttp's
+// retries-beyond-first.
 type RetryRoundTripper struct {
 	next               http.RoundTripper
 	checkRetry         CheckRetry
 	onRetry            OnRetry
 	prepareRetry       PrepareRetry
-	backoffFunc        func() Backoff
 	baseDelay          time.Duration
 	maxAttempts        int
 	maxElapsedTime     time.Duration
@@ -118,30 +85,21 @@ type RetryRoundTripper struct {
 }
 
 // NewRetryRoundTripper creates a RetryRoundTripper wrapping next with the
-// given options. If next is nil, http.DefaultTransport is used.
-func NewRetryRoundTripper(next http.RoundTripper, opts ...RTOption) *RetryRoundTripper {
-	cfg := rtCfg{
-		baseDelay:   DefaultBaseDelay,
-		maxAttempts: DefaultMaxAttempts,
-	}
-	for _, o := range opts {
-		if o != nil {
-			o(&cfg)
-		}
-	}
+// given configuration. If next is nil, http.DefaultTransport is used.
+// TransportConfig{} gives the defaults (see its field docs).
+func NewRetryRoundTripper(next http.RoundTripper, cfg TransportConfig) *RetryRoundTripper {
 	if next == nil {
 		next = http.DefaultTransport
 	}
 	return &RetryRoundTripper{
 		next:               next,
-		checkRetry:         cfg.checkRetry,
-		onRetry:            cfg.onRetry,
-		prepareRetry:       cfg.prepareRetry,
-		backoffFunc:        cfg.backoffFunc,
-		baseDelay:          cfg.baseDelay,
-		maxAttempts:        cfg.maxAttempts,
-		maxElapsedTime:     cfg.maxElapsedTime,
-		retryNonIdempotent: cfg.retryNonIdempotent,
+		checkRetry:         cfg.CheckRetry,
+		onRetry:            cfg.OnRetry,
+		prepareRetry:       cfg.PrepareRetry,
+		baseDelay:          cfg.BaseDelay,
+		maxAttempts:        cfg.MaxAttempts,
+		maxElapsedTime:     cfg.MaxElapsedTime,
+		retryNonIdempotent: cfg.RetryNonIdempotent,
 	}
 }
 
@@ -173,11 +131,11 @@ func (rt *RetryRoundTripper) canRetry(req *http.Request) bool {
 // 429 (Too Many Requests), 502 (Bad Gateway), 503 (Service Unavailable),
 // 504 (Gateway Timeout).
 //
-// This is deliberately narrower than the one-shot Retry helper, which retries
-// every 5xx (including 500), and narrower than hashicorp/go-retryablehttp
-// (all 5xx except 501). A 500 Internal Server Error is NOT retried by default;
-// supply WithCheckRetry to broaden the set when an upstream returns transient
-// 500s.
+// This is deliberately narrower than GetBytes, which retries every 5xx
+// (including 500), and narrower than hashicorp/go-retryablehttp (all 5xx
+// except 501). A 500 Internal Server Error is NOT retried by default; supply
+// TransportConfig.CheckRetry to broaden the set when an upstream returns
+// transient 500s.
 func defaultCheckRetry(_ context.Context, resp *http.Response, err error) (bool, error) {
 	if err != nil {
 		return IsTransient(err), nil
@@ -194,9 +152,12 @@ func defaultCheckRetry(_ context.Context, resp *http.Response, err error) (bool,
 	return false, nil
 }
 
-// getMaxAttempts returns the total attempt count, clamped to a minimum of 1 so
-// the request is always sent at least once (never a silent zero-attempt no-op).
+// getMaxAttempts returns the total attempt count: zero means unset and takes
+// DefaultMaxAttempts; a negative value means exactly one attempt.
 func (rt *RetryRoundTripper) getMaxAttempts() int {
+	if rt.maxAttempts == 0 {
+		return DefaultMaxAttempts
+	}
 	if rt.maxAttempts < 1 {
 		return 1
 	}
@@ -242,10 +203,6 @@ func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	check := rt.getCheckRetry()
 	maxAttempts := rt.getMaxAttempts()
 
-	var bo Backoff
-	if rt.backoffFunc != nil {
-		bo = rt.backoffFunc()
-	}
 	backoff := rt.getBaseDelay()
 	start := time.Now()
 
@@ -254,11 +211,9 @@ func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 	for attempt := range maxAttempts {
 		if attempt > 0 {
-			if abortErr := rt.sleepBeforeRetry(ctx, attempt, req, resp, err, backoff, bo, start); abortErr != nil {
+			if abortErr := rt.sleepBeforeRetry(ctx, attempt, req, resp, err, backoff, start); abortErr != nil {
 				return nil, abortErr
 			}
-			// Advancing the default backoff unconditionally is harmless when a
-			// custom Backoff is in use (its value is then unused by sleepBeforeRetry).
 			backoff = SafeDouble(backoff)
 		}
 
@@ -322,19 +277,12 @@ func (rt *RetryRoundTripper) evaluateAttempt(ctx context.Context, check CheckRet
 
 // sleepBeforeRetry handles the pre-retry logic: hook, compute wait, honor
 // Retry-After, enforce the elapsed-time budget, drain, sleep.
-func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, req *http.Request, resp *http.Response, lastErr error, backoff time.Duration, bo Backoff, start time.Time) error {
+func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, req *http.Request, resp *http.Response, lastErr error, backoff time.Duration, start time.Time) error {
 	if rt.onRetry != nil {
 		rt.onRetry(attempt, req, resp, lastErr)
 	}
 
-	wait, stop := nextWait(bo, backoff)
-	if stop {
-		drainResp(resp)
-		if lastErr != nil {
-			return lastErr
-		}
-		return errors.New("backoff stopped")
-	}
+	wait := JitteredBackoff(backoff)
 
 	// Honor Retry-After on any retryable response (429, 502, 503, 504).
 	// ParseRetryAfter caps at RetryAfterCap, so a hostile header cannot force
@@ -365,20 +313,6 @@ func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, 
 	return nil
 }
 
-// nextWait returns the base wait for this retry. With a custom Backoff it
-// advances that instance (per-request, so no lock is needed); stop==true
-// signals the Backoff is exhausted (BackoffStop). Without one it derives an
-// equal-jitter wait from the doubling default backoff.
-func nextWait(bo Backoff, backoff time.Duration) (wait time.Duration, stop bool) {
-	if bo == nil {
-		return JitteredBackoff(backoff), false
-	}
-	if w := bo.NextBackOff(); w != BackoffStop {
-		return w, false
-	}
-	return 0, true
-}
-
 // elapsedBudgetExceeded reports whether sleeping for wait now would meet or pass
 // the maxElapsedTime ceiling. The comparison tests the remaining budget rather
 // than summing elapsed+wait, so a near-MaxInt64 wait cannot overflow (CWE-190);
@@ -399,27 +333,32 @@ func drainResp(resp *http.Response) {
 	}
 }
 
-// StandardClient returns an *http.Client using this RetryRoundTripper as its
-// Transport. Mirrors hashicorp/go-retryablehttp StandardClient().
+// NewRetryClient returns an *http.Client whose Transport is a
+// RetryRoundTripper over base (nil base means http.DefaultTransport) and
+// whose CheckRedirect is policy. It is the one-call form of the composition
+// plexapi-style consumers assemble by hand: retry transport plus an explicit
+// redirect policy.
 //
-// The returned client sets no Client.Timeout. Bound every request with a context
-// deadline (http.NewRequestWithContext) or configure the wrapped transport's own
-// timeouts: without one, a stalled upstream blocks RoundTrip indefinitely, the
-// retry loop never advances (it is suspended inside the transport), and because
-// the RoundTripper logs nothing itself the stall is silent. A Client.Timeout is
-// intentionally NOT set here because it would cap total time across all retries,
-// conflicting with WithRTMaxElapsedTime.
+// policy is REQUIRED and must be non-nil: NewRetryClient panics on a nil
+// policy, because a nil CheckRedirect silently means net/http's default
+// follow-anywhere behavior (up to 10 hops to any host, custom auth headers
+// forwarded) — exactly the unsafe omission this constructor exists to
+// prevent. Pass DefaultRedirectPolicy (same-host), RefuseAllRedirects, or a
+// RedirectPolicyFunc allowlist.
 //
-// The returned client sets no CheckRedirect: redirects follow the
-// net/http default policy (up to 10 hops to any host; Authorization
-// is stripped on cross-host redirects). This RoundTripper is a
-// Transport and cannot restrict redirect targets from RoundTrip.
-// Callers that need a redirect allowlist must set CheckRedirect on
-// the returned client explicitly, e.g.:
-//
-//	c := rt.StandardClient()
-//	c.CheckRedirect = httpx.DefaultRedirectPolicy // same-host only
-//	// or httpx.RedirectPolicyFunc(httpx.WithAllowedSuffixes(".example.com"))
-func (rt *RetryRoundTripper) StandardClient() *http.Client {
-	return &http.Client{Transport: rt}
+// The returned client sets no Client.Timeout: a Client.Timeout above a
+// retrying transport caps the WHOLE retry sequence and defeats the retries
+// beneath it. Note that neither MaxElapsedTime nor the request context can
+// interrupt a stalled in-flight attempt from between attempts: bound single
+// attempts on the base transport (e.g. ResponseHeaderTimeout on a
+// CloneDefaultTransport()) and bound the total with a context deadline
+// (http.NewRequestWithContext) or TransportConfig.MaxElapsedTime.
+func NewRetryClient(base http.RoundTripper, policy CheckRedirect, cfg TransportConfig) *http.Client {
+	if policy == nil {
+		panic("httpx.NewRetryClient: nil redirect policy (pass DefaultRedirectPolicy, RefuseAllRedirects, or a RedirectPolicyFunc allowlist)")
+	}
+	return &http.Client{
+		Transport:     NewRetryRoundTripper(base, cfg),
+		CheckRedirect: policy,
+	}
 }

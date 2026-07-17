@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v2"
+	"github.com/cplieger/httpx/v3"
 )
 
 // TestRetryRoundTripper_does_not_mutate_caller_request verifies the
@@ -34,14 +34,10 @@ func TestRetryRoundTripper_does_not_mutate_caller_request(t *testing.T) {
 		}, nil
 	})
 
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithRTMaxAttempts(3),
-		httpx.WithPrepareRetry(func(req *http.Request) error {
-			req.Header.Set("X-Mutated", "yes")
-			return nil
-		}),
-	)
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3, PrepareRetry: func(req *http.Request) error {
+		req.Header.Set("X-Mutated", "yes")
+		return nil
+	}})
 
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/test", http.NoBody)
 	req.Header.Set("X-Original", "keep")
@@ -82,11 +78,7 @@ func TestRetryRoundTripper_clone_isolates_caller_body(t *testing.T) {
 		}, nil
 	})
 
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithRTMaxAttempts(3),
-		httpx.WithRetryNonIdempotent(true),
-	)
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3, RetryNonIdempotent: true})
 
 	req, _ := http.NewRequest(http.MethodPost, "http://example.com", strings.NewReader("payload"))
 	req.GetBody = func() (io.ReadCloser, error) {
@@ -138,19 +130,15 @@ func TestRetryRoundTripper_prepareRetry_header_isolation_per_attempt(t *testing.
 	})
 
 	var prepareAttempt atomic.Int32
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithRTMaxAttempts(5),
-		httpx.WithPrepareRetry(func(req *http.Request) error {
-			n := prepareAttempt.Add(1)
-			// Distinct token per retry ('A','B','C',...); built via []byte to
-			// avoid an int-to-string conversion.
-			req.Header.Set("X-Token", string([]byte{byte('A' + n - 1)}))
-			// X-Accum would accumulate across attempts if clones leaked state.
-			req.Header.Add("X-Accum", "x")
-			return nil
-		}),
-	)
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 5, PrepareRetry: func(req *http.Request) error {
+		n := prepareAttempt.Add(1)
+		// Distinct token per retry ('A','B','C',...); built via []byte to
+		// avoid an int-to-string conversion.
+		req.Header.Set("X-Token", string([]byte{byte('A' + n - 1)}))
+		// X-Accum would accumulate across attempts if clones leaked state.
+		req.Header.Add("X-Accum", "x")
+		return nil
+	}})
 
 	origReq, _ := http.NewRequest(http.MethodGet, "http://example.com/prepareisolation", http.NoBody)
 	origReq.Header.Set("X-Token", "original")
@@ -200,10 +188,7 @@ func TestRetryRoundTripper_clone_preserves_trailers(t *testing.T) {
 		}, nil
 	})
 
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithRTMaxAttempts(3),
-	)
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3})
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/trailers", http.NoBody)
 	req.Trailer = http.Header{"X-Checksum": {"abc123"}}
 
@@ -237,10 +222,7 @@ func TestRetryRoundTripper_clone_preserves_host(t *testing.T) {
 		}, nil
 	})
 
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithRTMaxAttempts(3),
-	)
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3})
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/hostclone", http.NoBody)
 	req.Host = "custom.host.example"
 
@@ -263,14 +245,10 @@ func TestRetryRoundTripper_prepareRetry_error_does_not_leak_to_caller(t *testing
 		}, nil
 	})
 
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithRTMaxAttempts(4),
-		httpx.WithPrepareRetry(func(req *http.Request) error {
-			req.Header.Set("X-Mutated", "yes")
-			return io.ErrUnexpectedEOF
-		}),
-	)
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 4, PrepareRetry: func(req *http.Request) error {
+		req.Header.Set("X-Mutated", "yes")
+		return io.ErrUnexpectedEOF
+	}})
 
 	origReq, _ := http.NewRequest(http.MethodGet, "http://example.com/prepareerr", http.NoBody)
 	_, err := rt.RoundTrip(origReq) //nolint:bodyclose // error path, no response body
@@ -296,10 +274,7 @@ func TestRetryRoundTripper_cancel_during_backoff_no_goroutine_leak(t *testing.T)
 	before := runtime.NumGoroutine()
 	for range 20 {
 		ctx, cancel := context.WithCancel(context.Background())
-		rt := httpx.NewRetryRoundTripper(transport,
-			httpx.WithRTBaseDelay(time.Hour),
-			httpx.WithRTMaxAttempts(11),
-		)
+		rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Hour, MaxAttempts: 11})
 		go func() {
 			time.Sleep(time.Millisecond)
 			cancel()

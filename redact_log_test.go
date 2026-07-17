@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v2"
+	"github.com/cplieger/httpx/v3"
 )
 
 func TestStatusError_ErrorRedactsURL(t *testing.T) {
@@ -31,7 +31,7 @@ func TestStatusError_ErrorRedactsURL(t *testing.T) {
 	}
 }
 
-func TestRetry_doesNotLeakSecretInLogsOrError(t *testing.T) {
+func TestGetBytes_doesNotLeakSecretInLogsOrError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -40,7 +40,7 @@ func TestRetry_doesNotLeakSecretInLogsOrError(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	_, err := httpx.Retry(context.Background(), srv.Client(), srv.URL+"?apikey=supersecret",
+	_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL+"?apikey=supersecret",
 		httpx.WithMaxAttempts(2),
 		httpx.WithBaseDelay(time.Microsecond),
 		httpx.WithLogger(logger),

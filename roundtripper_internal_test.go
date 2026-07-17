@@ -28,7 +28,7 @@ func TestRetryRoundTripper_sleepBeforeRetry_surfaces_sleep_error(t *testing.T) {
 		t.Fatalf("setup: NewRequestWithContext = %v, want nil", err)
 	}
 
-	got := rt.sleepBeforeRetry(ctx, 1, req, nil, errors.New("prior attempt failed"), time.Second, nil, time.Now())
+	got := rt.sleepBeforeRetry(ctx, 1, req, nil, errors.New("prior attempt failed"), time.Second, time.Now())
 	if got == nil {
 		t.Fatal("sleepBeforeRetry(cancelled ctx) = nil, want context cancellation error")
 	}

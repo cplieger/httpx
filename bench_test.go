@@ -53,7 +53,7 @@ func BenchmarkRetryRoundTripper_Success(b *testing.B) {
 		Body:       io.NopCloser(strings.NewReader("ok")),
 		Header:     http.Header{},
 	}
-	rt := NewRetryRoundTripper(&stubRT{resp: okResp}, WithRTMaxAttempts(3))
+	rt := NewRetryRoundTripper(&stubRT{resp: okResp}, TransportConfig{MaxAttempts: 3})
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com", http.NoBody)
 
 	b.ResetTimer()
@@ -76,16 +76,14 @@ func BenchmarkRetryRoundTripper_RetryThenSuccess(b *testing.B) {
 		Header:     http.Header{},
 	}
 	inner := &failThenSucceedRT{failCount: 1, successResp: okResp}
-	// Use zero-delay backoff to benchmark the retry machinery, not sleep.
-	zeroBackoff := &zeroBO{}
-	rt := NewRetryRoundTripper(inner, WithRTMaxAttempts(4),
-		WithBackoffFunc(func() Backoff { return zeroBackoff }))
+	// A 1ns base delay keeps the benchmark measuring the retry machinery, not
+	// sleep (the jittered wait from a 1ns base is at most 1ns).
+	rt := NewRetryRoundTripper(inner, TransportConfig{MaxAttempts: 4, BaseDelay: time.Nanosecond})
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com", http.NoBody)
 
 	b.ResetTimer()
 	for range b.N {
 		inner.reset()
-		zeroBackoff.Reset()
 		resp, err := rt.RoundTrip(req)
 		if err != nil {
 			b.Fatal(err)
@@ -96,12 +94,6 @@ func BenchmarkRetryRoundTripper_RetryThenSuccess(b *testing.B) {
 		}
 	}
 }
-
-// zeroBO is a Backoff that always returns zero delay (for benchmarking retry logic).
-type zeroBO struct{}
-
-func (z *zeroBO) NextBackOff() time.Duration { return 0 }
-func (z *zeroBO) Reset()                     {}
 
 // --- JitteredBackoff benchmark ---
 
@@ -167,18 +159,5 @@ func BenchmarkIsTransient_PermanentError(b *testing.B) {
 	err := Permanent(errors.New("bad request"))
 	for range b.N {
 		_ = IsTransient(err)
-	}
-}
-
-// --- ExponentialBackoff.NextBackOff benchmark ---
-
-func BenchmarkExponentialBackoff_NextBackOff(b *testing.B) {
-	bo := NewExponentialBackoff(WithInitialInterval(100 * time.Millisecond))
-	b.ResetTimer()
-	for i := range b.N {
-		if i%5 == 0 {
-			bo.Reset()
-		}
-		_ = bo.NextBackOff()
 	}
 }

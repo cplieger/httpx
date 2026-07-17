@@ -177,7 +177,7 @@ func TestDoConditionalStatusMapping(t *testing.T) {
 			}
 			tc.check(t, err)
 			if got := IsTransient(err); got != tc.transient {
-				t.Errorf("IsTransient = %v, want %v (composability with RetryWithBackoff)", got, tc.transient)
+				t.Errorf("IsTransient = %v, want %v (composability with Do)", got, tc.transient)
 			}
 		})
 	}
@@ -206,10 +206,10 @@ func TestDoConditionalTransportErrorPassesThrough(t *testing.T) {
 	}
 }
 
-// TestDoConditionalComposesWithRetryWithBackoff pins the documented idiom: a
-// transient 503 retried by RetryWithBackoff, the request rebuilt per attempt,
-// succeeding on the second try.
-func TestDoConditionalComposesWithRetryWithBackoff(t *testing.T) {
+// TestDoConditionalComposesWithDo pins the documented idiom: a
+// transient 503 retried by Do, the request rebuilt per attempt, succeeding on
+// the second try.
+func TestDoConditionalComposesWithDo(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -222,16 +222,16 @@ func TestDoConditionalComposesWithRetryWithBackoff(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	res, err := RetryWithBackoff(t.Context(), 3, time.Millisecond, "conditional",
+	res, err := Do(t.Context(),
 		func(ctx context.Context) (ConditionalResult, error) {
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 			if err != nil {
 				return ConditionalResult{}, err
 			}
 			return DoConditional(srv.Client(), req, Validators{ETag: `"v1"`}, 0)
-		})
+		}, WithMaxAttempts(3), WithBaseDelay(time.Millisecond), WithLabel("conditional"))
 	if err != nil {
-		t.Fatalf("RetryWithBackoff: %v", err)
+		t.Fatalf("Do: %v", err)
 	}
 	if string(res.Body) != "fresh" || res.Validators.ETag != `"v2"` {
 		t.Errorf("result = %+v, want the second attempt's fresh body and validators", res)
