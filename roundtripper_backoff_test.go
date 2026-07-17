@@ -12,123 +12,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v2"
+	"github.com/cplieger/httpx/v3"
 )
 
-// testBackoff is a simple Backoff implementation for testing.
-type testBackoff struct {
-	delays []time.Duration
-	idx    int
-}
-
-func (b *testBackoff) NextBackOff() time.Duration {
-	if b.idx >= len(b.delays) {
-		return httpx.BackoffStop
-	}
-	d := b.delays[b.idx]
-	b.idx++
-	return d
-}
-
-func (b *testBackoff) Reset() { b.idx = 0 }
-
-func TestRetryRoundTripper_custom_Backoff(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) <= 2 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	bo := &testBackoff{delays: []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}}
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTMaxAttempts(6),
-		httpx.WithBackoffFunc(func() httpx.Backoff { return bo }),
-	)
-	client := rt.StandardClient()
-
-	resp, err := client.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
-	}
-	if got := calls.Load(); got != 3 {
-		t.Errorf("calls = %d, want 3", got)
-	}
-}
-
-func TestRetryRoundTripper_Backoff_Stop(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-
-	bo := &testBackoff{delays: []time.Duration{time.Millisecond}}
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTMaxAttempts(11),
-		httpx.WithBackoffFunc(func() httpx.Backoff { return bo }),
-	)
-	client := rt.StandardClient()
-
-	resp, err := client.Get(srv.URL)
-	if err != nil {
-		// Backoff stop returns error.
-		return
-	}
-	if resp != nil {
-		resp.Body.Close()
-	}
-	if got := calls.Load(); got > 3 {
-		t.Errorf("calls = %d, want <= 3 with Backoff stop", got)
-	}
-}
-
-func TestRetryRoundTripper_BackoffStop_returns_last_transport_error(t *testing.T) {
-	var calls atomic.Int32
-	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
-		calls.Add(1)
-		return nil, io.ErrUnexpectedEOF
-	})
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTMaxAttempts(6),
-		httpx.WithBackoffFunc(func() httpx.Backoff { return &testBackoff{} }),
-	)
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com/x", http.NoBody)
-	resp, err := rt.RoundTrip(req)
-	if resp != nil {
-		resp.Body.Close()
-	}
-	if err == nil {
-		t.Fatal("RoundTrip = nil, want last transport error on BackoffStop")
-	}
-	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Errorf("error = %v, want wrapping io.ErrUnexpectedEOF", err)
-	}
-	if got := calls.Load(); got != 1 {
-		t.Errorf("transport calls = %d, want 1", got)
-	}
-}
-
-func TestExponentialBackoff_zero_value_is_usable(t *testing.T) {
-	t.Parallel()
-	var b httpx.ExponentialBackoff
-	got := b.NextBackOff()
-	if got == httpx.BackoffStop {
-		t.Fatal("zero-value ExponentialBackoff.NextBackOff() = BackoffStop, want usable delay")
-	}
-	if got < httpx.DefaultBaseDelay/2 || got > httpx.DefaultBaseDelay {
-		t.Errorf("zero-value NextBackOff() = %v, want [%v, %v]",
-			got, httpx.DefaultBaseDelay/2, httpx.DefaultBaseDelay)
-	}
-}
+// Backoff/wait behavior of the RetryRoundTripper: the default jittered
+// doubling progression, the Retry-After override, and the MaxElapsedTime hard
+// ceiling. (v2's pluggable custom-Backoff subsystem was deleted in v3; the
+// equal-jitter progression configured by BaseDelay is the one strategy.)
 
 func TestRetryRoundTripper_MaxElapsedTime(t *testing.T) {
 	var calls atomic.Int32
@@ -138,12 +28,8 @@ func TestRetryRoundTripper_MaxElapsedTime(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(50*time.Millisecond),
-		httpx.WithRTMaxAttempts(11),
-		httpx.WithRTMaxElapsedTime(80*time.Millisecond),
-	)
-	client := rt.StandardClient()
+	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 50 * time.Millisecond, MaxAttempts: 11, MaxElapsedTime: 80 * time.Millisecond})
+	client := &http.Client{Transport: rt}
 
 	_, err := client.Get(srv.URL) //nolint:bodyclose // error path returns no body
 	if err == nil {
@@ -168,11 +54,7 @@ func TestRetryRoundTripper_MaxElapsedTime_wraps_transport_error(t *testing.T) {
 		calls.Add(1)
 		return nil, io.ErrUnexpectedEOF
 	})
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTBaseDelay(time.Hour),
-		httpx.WithRTMaxAttempts(3),
-		httpx.WithRTMaxElapsedTime(time.Millisecond),
-	)
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Hour, MaxAttempts: 3, MaxElapsedTime: time.Millisecond})
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/elapsed-transport-err", http.NoBody)
 	resp, err := rt.RoundTrip(req)
 	if resp != nil {
@@ -202,8 +84,7 @@ func TestRetryRoundTripper_zero_base_delay_defaults_to_base(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(0), httpx.WithRTMaxAttempts(2))
+	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 0, MaxAttempts: 2})
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
@@ -228,8 +109,7 @@ func TestRetryRoundTripper_default_backoff_doubles_between_retries(t *testing.T)
 	}))
 	defer srv.Close()
 
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(120*time.Millisecond), httpx.WithRTMaxAttempts(4))
+	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 120 * time.Millisecond, MaxAttempts: 4})
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
@@ -257,9 +137,8 @@ func TestRetryRoundTripper_zero_max_elapsed_does_not_cap(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(time.Millisecond), httpx.WithRTMaxAttempts(3))
-	resp, err := rt.StandardClient().Get(srv.URL)
+	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3})
+	resp, err := (&http.Client{Transport: rt}).Get(srv.URL)
 	if err != nil {
 		t.Fatalf("Get = %v, want nil", err)
 	}
@@ -283,11 +162,8 @@ func TestRetryRoundTripper_large_max_elapsed_allows_fast_retry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(time.Millisecond),
-		httpx.WithRTMaxAttempts(3),
-		httpx.WithRTMaxElapsedTime(10*time.Second))
-	resp, err := rt.StandardClient().Get(srv.URL)
+	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3, MaxElapsedTime: 10 * time.Second})
+	resp, err := (&http.Client{Transport: rt}).Get(srv.URL)
 	if err != nil {
 		t.Fatalf("Get = %v, want nil", err)
 	}
@@ -312,8 +188,7 @@ func TestRetryRoundTripper_429_without_retry_after_uses_backoff(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(10*time.Second), httpx.WithRTMaxAttempts(2))
+	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 10 * time.Second, MaxAttempts: 2})
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
@@ -337,8 +212,7 @@ func TestRetryRoundTripper_sleep_error_aborts_with_bare_context_error(t *testing
 	}))
 	defer srv.Close()
 
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport,
-		httpx.WithRTBaseDelay(10*time.Second), httpx.WithRTMaxAttempts(2))
+	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 10 * time.Second, MaxAttempts: 2})
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
@@ -360,44 +234,50 @@ func TestRetryRoundTripper_sleep_error_aborts_with_bare_context_error(t *testing
 }
 
 // TestRetryRoundTripper_aborts_when_wait_consumes_remaining_budget pins the
-// remaining-budget arithmetic (maxElapsedTime - elapsed). The custom backoff
-// returns a wait exactly equal to maxElapsedTime, so the remaining budget
-// (maxElapsedTime minus the tiny real elapsed) is strictly less than the wait
-// and the hard ceiling trips on the first retry: RoundTrip aborts after a single
-// transport call without sleeping. A budget computed as maxElapsedTime + elapsed
-// would instead exceed the wait, letting the round-tripper sleep and make a
-// second attempt.
+// remaining-budget arithmetic (maxElapsedTime - elapsed). The always-503
+// upstream sends a Retry-After equal to the whole budget, so the honored wait
+// is never smaller than the remaining budget (the real elapsed time only
+// shrinks it) and the hard ceiling trips on the first retry: RoundTrip aborts
+// after a single transport call without sleeping. A budget computed as
+// maxElapsedTime + elapsed would instead exceed the wait, letting the
+// round-tripper sleep out the full second and make more attempts (also caught
+// by the elapsed-time assertion).
 func TestRetryRoundTripper_aborts_when_wait_consumes_remaining_budget(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		calls.Add(1)
+		h := http.Header{}
+		h.Set("Retry-After", "1") // honored wait: exactly the 1s budget
 		return &http.Response{
 			StatusCode: http.StatusServiceUnavailable,
 			Body:       io.NopCloser(strings.NewReader("")),
-			Header:     http.Header{},
+			Header:     h,
 		}, nil
 	})
-	const budget = 50 * time.Millisecond
-	rt := httpx.NewRetryRoundTripper(transport,
-		httpx.WithRTMaxAttempts(3),
-		httpx.WithRTMaxElapsedTime(budget),
-		httpx.WithBackoffFunc(func() httpx.Backoff {
-			return &testBackoff{delays: []time.Duration{budget, budget}}
-		}),
-	)
+	const budget = time.Second
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{
+		BaseDelay:      time.Millisecond,
+		MaxAttempts:    3,
+		MaxElapsedTime: budget,
+	})
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/budget", http.NoBody)
+	start := time.Now()
 	resp, err := rt.RoundTrip(req)
+	elapsed := time.Since(start)
 	if resp != nil {
 		resp.Body.Close()
 	}
 	if err == nil {
-		t.Fatal("RoundTrip = nil, want max-elapsed-time abort (next wait equals the remaining budget)")
+		t.Fatal("RoundTrip = nil, want max-elapsed-time abort (next wait consumes the remaining budget)")
 	}
 	if !strings.Contains(err.Error(), "max elapsed time") {
 		t.Errorf("error = %v, want containing 'max elapsed time'", err)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("transport calls = %d, want 1 (abort before the second attempt)", got)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("elapsed = %v, want immediate abort (the 1s Retry-After must not be slept)", elapsed)
 	}
 }

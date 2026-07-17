@@ -16,7 +16,7 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/cplieger/httpx/v2"
+	"github.com/cplieger/httpx/v3"
 )
 
 // bufLogger returns a debug-level text logger writing into buf.
@@ -24,17 +24,17 @@ func bufLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-func shortOpts() []httpx.Option {
-	return []httpx.Option{httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(10 << 20)}
+func shortOpts() []httpx.GetOption {
+	return []httpx.GetOption{httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(10 << 20)}
 }
 
-func TestRetry_success_first_try(t *testing.T) {
+func TestGetBytes_success_first_try(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer srv.Close()
 
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+	body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err != nil {
 		t.Fatalf("Retry: %v", err)
 	}
@@ -43,18 +43,18 @@ func TestRetry_success_first_try(t *testing.T) {
 	}
 }
 
-func TestRetry_error_status_fails_fast(t *testing.T) {
+func TestGetBytes_error_status_fails_fast(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
 
-	if _, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...); err == nil {
+	if _, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...); err == nil {
 		t.Error("expected error for 404")
 	}
 }
 
-func TestRetry_all_2xx_are_success(t *testing.T) {
+func TestGetBytes_all_2xx_are_success(t *testing.T) {
 	tests := []struct {
 		name   string
 		status int
@@ -76,7 +76,7 @@ func TestRetry_all_2xx_are_success(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+			body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 			if err != nil {
 				t.Fatalf("Retry(%d) = %v, want nil", tt.status, err)
 			}
@@ -87,7 +87,7 @@ func TestRetry_all_2xx_are_success(t *testing.T) {
 	}
 }
 
-func TestRetry_non_followed_3xx_is_status_error(t *testing.T) {
+func TestGetBytes_non_followed_3xx_is_status_error(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "https://example.com/moved")
 		w.WriteHeader(http.StatusMovedPermanently)
@@ -97,7 +97,7 @@ func TestRetry_non_followed_3xx_is_status_error(t *testing.T) {
 	client := srv.Client()
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
-	_, err := httpx.Retry(t.Context(), client, srv.URL, shortOpts()...)
+	_, err := httpx.GetBytes(t.Context(), client, srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatal("expected *StatusError for a non-followed 3xx")
 	}
@@ -110,7 +110,7 @@ func TestRetry_non_followed_3xx_is_status_error(t *testing.T) {
 	}
 }
 
-func TestRetry_recovers_after_retryable_status(t *testing.T) {
+func TestGetBytes_recovers_after_retryable_status(t *testing.T) {
 	tests := []struct {
 		name       string
 		failStatus int
@@ -133,7 +133,7 @@ func TestRetry_recovers_after_retryable_status(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+			body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 			if err != nil {
 				t.Fatalf("Retry after retry = %v, want nil", err)
 			}
@@ -147,7 +147,7 @@ func TestRetry_recovers_after_retryable_status(t *testing.T) {
 	}
 }
 
-func TestRetry_exhausts_on_persistent_failure(t *testing.T) {
+func TestGetBytes_exhausts_on_persistent_failure(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
@@ -155,7 +155,7 @@ func TestRetry_exhausts_on_persistent_failure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+	body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatalf("Retry after all retries = nil, want error")
 	}
@@ -173,7 +173,7 @@ func TestRetry_exhausts_on_persistent_failure(t *testing.T) {
 	}
 }
 
-func TestRetry_aborts_on_context_cancellation(t *testing.T) {
+func TestGetBytes_aborts_on_context_cancellation(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
@@ -187,7 +187,7 @@ func TestRetry_aborts_on_context_cancellation(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := httpx.Retry(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(100*time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
+	_, err := httpx.GetBytes(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(100*time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
 	if err == nil {
 		t.Fatalf("Retry after ctx cancel = nil, want error")
 	}
@@ -199,7 +199,7 @@ func TestRetry_aborts_on_context_cancellation(t *testing.T) {
 	}
 }
 
-func TestRetry_body_size_limit(t *testing.T) {
+func TestGetBytes_body_size_limit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		buf := make([]byte, 1024)
 		for range 11 * 1024 {
@@ -210,7 +210,7 @@ func TestRetry_body_size_limit(t *testing.T) {
 
 	// The 11MB body exceeds the 10MB cap. v2 fails loud with
 	// *ResponseTooLargeError (no truncated body) and reports the cap via Limit.
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
+	body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
 	if body != nil {
 		t.Errorf("body = %d bytes, want nil (oversize body must not be truncated and returned)", len(body))
 	}
@@ -223,7 +223,7 @@ func TestRetry_body_size_limit(t *testing.T) {
 	}
 }
 
-func TestRetry_honors_retry_after(t *testing.T) {
+func TestGetBytes_honors_retry_after(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if calls.Add(1) == 1 {
@@ -237,7 +237,7 @@ func TestRetry_honors_retry_after(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+	body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("Retry = %v, want nil", err)
@@ -250,10 +250,10 @@ func TestRetry_honors_retry_after(t *testing.T) {
 	}
 }
 
-// TestRetry_honors_retry_after_on_503 asserts the Retry helper waits the
+// TestGetBytes_honors_retry_after_on_503 asserts the Retry helper waits the
 // server-requested Retry-After on a 5xx, not just on 429 (cycle-1 h-f4
 // extended honoring to every retryable 5xx via retryAttempt's >=500 branch).
-func TestRetry_honors_retry_after_on_503(t *testing.T) {
+func TestGetBytes_honors_retry_after_on_503(t *testing.T) {
 	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		t.Run(fmt.Sprintf("%d", status), func(t *testing.T) {
 			var calls atomic.Int32
@@ -269,7 +269,7 @@ func TestRetry_honors_retry_after_on_503(t *testing.T) {
 			defer srv.Close()
 
 			start := time.Now()
-			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+			body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 			elapsed := time.Since(start)
 			if err != nil {
 				t.Fatalf("Retry = %v, want nil", err)
@@ -339,13 +339,13 @@ func TestDrain_small_body(t *testing.T) {
 	}
 }
 
-func TestRetry_returns_typed_StatusError_on_exhaustion(t *testing.T) {
+func TestGetBytes_returns_typed_StatusError_on_exhaustion(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
 
-	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+	_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -361,13 +361,13 @@ func TestRetry_returns_typed_StatusError_on_exhaustion(t *testing.T) {
 	}
 }
 
-func TestRetry_returns_typed_StatusError_rate_limited(t *testing.T) {
+func TestGetBytes_returns_typed_StatusError_rate_limited(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer srv.Close()
 
-	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+	_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -376,13 +376,13 @@ func TestRetry_returns_typed_StatusError_rate_limited(t *testing.T) {
 	}
 }
 
-func TestRetry_4xx_returns_typed_StatusError(t *testing.T) {
+func TestGetBytes_4xx_returns_typed_StatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
 
-	_, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+	_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -495,7 +495,7 @@ func TestReadLimitedBody_readErrorPropagates(t *testing.T) {
 	}
 }
 
-func TestRetry_non200_statusCodes(t *testing.T) {
+func TestGetBytes_non200_statusCodes(t *testing.T) {
 	tests := []struct {
 		status int
 	}{
@@ -508,7 +508,7 @@ func TestRetry_non200_statusCodes(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+			body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
 			if err == nil {
 				t.Fatalf("nil error for status %d", tt.status)
 			}
@@ -523,13 +523,13 @@ func TestRetry_non200_statusCodes(t *testing.T) {
 	}
 }
 
-func TestRetry_non_transient_transport_error_fails_fast(t *testing.T) {
+func TestGetBytes_non_transient_transport_error_fails_fast(t *testing.T) {
 	client := &http.Client{
 		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 			return nil, errors.New("permanent transport failure")
 		}),
 	}
-	_, err := httpx.Retry(t.Context(), client, "http://example.com/test", shortOpts()...)
+	_, err := httpx.GetBytes(t.Context(), client, "http://example.com/test", shortOpts()...)
 	if err == nil {
 		t.Fatal("expected error for non-transient transport error")
 	}
@@ -542,7 +542,7 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
-func TestRetry_WithHeaders_appliesHeadersToRequest(t *testing.T) {
+func TestGetBytes_WithHeaders_appliesHeadersToRequest(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -550,7 +550,7 @@ func TestRetry_WithHeaders_appliesHeadersToRequest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
+	body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
 		httpx.WithBaseDelay(time.Millisecond),
 		httpx.WithHeaders(func(req *http.Request) {
 			req.Header.Set("Authorization", "Bearer token123")
@@ -567,7 +567,7 @@ func TestRetry_WithHeaders_appliesHeadersToRequest(t *testing.T) {
 	}
 }
 
-func TestRetry_retries_on_transient_transport_error(t *testing.T) {
+func TestGetBytes_retries_on_transient_transport_error(t *testing.T) {
 	var calls atomic.Int32
 	client := &http.Client{
 		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
@@ -581,7 +581,7 @@ func TestRetry_retries_on_transient_transport_error(t *testing.T) {
 			}, nil
 		}),
 	}
-	body, err := httpx.Retry(t.Context(), client, "http://example.com/x",
+	body, err := httpx.GetBytes(t.Context(), client, "http://example.com/x",
 		httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxAttempts(3))
 	if err != nil {
 		t.Fatalf("Retry = %v, want nil after transient transport error", err)
@@ -594,10 +594,10 @@ func TestRetry_retries_on_transient_transport_error(t *testing.T) {
 	}
 }
 
-func TestRetry_create_request_error_fails_fast(t *testing.T) {
+func TestGetBytes_create_request_error_fails_fast(t *testing.T) {
 	// DEL control character (0x7f) makes http.NewRequestWithContext fail;
 	// LogSafeError drops the url.Error wrapper so the url-parse cause is returned.
-	_, err := httpx.Retry(t.Context(), http.DefaultClient, "http://example.com/\x7f",
+	_, err := httpx.GetBytes(t.Context(), http.DefaultClient, "http://example.com/\x7f",
 		httpx.WithBaseDelay(time.Millisecond))
 	if err == nil {
 		t.Fatal("Retry with malformed URL = nil, want error")
@@ -610,7 +610,7 @@ func TestRetry_create_request_error_fails_fast(t *testing.T) {
 	}
 }
 
-func TestRetry_read_response_body_error(t *testing.T) {
+func TestGetBytes_read_response_body_error(t *testing.T) {
 	client := &http.Client{
 		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -620,7 +620,7 @@ func TestRetry_read_response_body_error(t *testing.T) {
 			}, nil
 		}),
 	}
-	_, err := httpx.Retry(t.Context(), client, "http://example.com/x",
+	_, err := httpx.GetBytes(t.Context(), client, "http://example.com/x",
 		httpx.WithBaseDelay(time.Millisecond))
 	if err == nil {
 		t.Fatal("Retry with erroring body = nil, want error")
@@ -688,7 +688,7 @@ func TestParseRetryAfterResponse(t *testing.T) {
 	}
 }
 
-func TestRetry_zero_base_delay_defaults_to_base(t *testing.T) {
+func TestGetBytes_zero_base_delay_defaults_to_base(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -700,13 +700,13 @@ func TestRetry_zero_base_delay_defaults_to_base(t *testing.T) {
 
 	// A zero base delay must be coerced to DefaultBaseDelay (1s), so the pre-retry
 	// sleep blows the 100ms deadline and surfaces the context error.
-	_, err := httpx.Retry(ctx, srv.Client(), srv.URL, httpx.WithMaxAttempts(2), httpx.WithBaseDelay(0))
+	_, err := httpx.GetBytes(ctx, srv.Client(), srv.URL, httpx.WithMaxAttempts(2), httpx.WithBaseDelay(0))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Retry(baseDelay=0) = %v, want context.DeadlineExceeded (delay defaulted)", err)
 	}
 }
 
-func TestRetry_zero_max_body_bytes_defaults_to_full_body(t *testing.T) {
+func TestGetBytes_zero_max_body_bytes_defaults_to_full_body(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("hello world"))
@@ -714,7 +714,7 @@ func TestRetry_zero_max_body_bytes_defaults_to_full_body(t *testing.T) {
 	defer srv.Close()
 
 	// Zero must be coerced to DefaultMaxBodyBytes, returning the whole body.
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
+	body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
 		httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxBodyBytes(0))
 	if err != nil {
 		t.Fatalf("Retry = %v, want nil", err)
@@ -724,7 +724,7 @@ func TestRetry_zero_max_body_bytes_defaults_to_full_body(t *testing.T) {
 	}
 }
 
-func TestRetry_does_not_sleep_before_first_attempt(t *testing.T) {
+func TestGetBytes_does_not_sleep_before_first_attempt(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -736,7 +736,7 @@ func TestRetry_does_not_sleep_before_first_attempt(t *testing.T) {
 
 	// The first attempt must NOT sleep, so a fast response returns before the
 	// deadline despite a huge base delay.
-	body, err := httpx.Retry(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(10*time.Second))
+	body, err := httpx.GetBytes(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(10*time.Second))
 	if err != nil {
 		t.Fatalf("Retry(first attempt) = %v, want nil (no pre-first-attempt sleep)", err)
 	}
@@ -745,7 +745,7 @@ func TestRetry_does_not_sleep_before_first_attempt(t *testing.T) {
 	}
 }
 
-func TestRetry_fast_response_does_not_log_slow_upstream(t *testing.T) {
+func TestGetBytes_fast_response_does_not_log_slow_upstream(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -753,7 +753,7 @@ func TestRetry_fast_response_does_not_log_slow_upstream(t *testing.T) {
 	defer srv.Close()
 
 	var buf bytes.Buffer
-	body, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
+	body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
 		httpx.WithBaseDelay(time.Millisecond), httpx.WithLogger(bufLogger(&buf)))
 	if err != nil {
 		t.Fatalf("Retry = %v, want nil", err)
@@ -767,7 +767,7 @@ func TestRetry_fast_response_does_not_log_slow_upstream(t *testing.T) {
 	}
 }
 
-func TestRetry_retry_debug_log_reports_one_indexed_attempt(t *testing.T) {
+func TestGetBytes_retry_debug_log_reports_one_indexed_attempt(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -780,7 +780,7 @@ func TestRetry_retry_debug_log_reports_one_indexed_attempt(t *testing.T) {
 	defer srv.Close()
 
 	var buf bytes.Buffer
-	if _, err := httpx.Retry(t.Context(), srv.Client(), srv.URL,
+	if _, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
 		httpx.WithBaseDelay(time.Millisecond), httpx.WithLogger(bufLogger(&buf))); err != nil {
 		t.Fatalf("Retry = %v, want nil", err)
 	}
@@ -829,10 +829,10 @@ func TestDrainClose_closes_body_on_read_error(t *testing.T) {
 	}
 }
 
-// TestRetry_maxAttempts_nonpositive_clamps_to_one verifies a degenerate attempt
+// TestGetBytes_maxAttempts_nonpositive_clamps_to_one verifies a degenerate attempt
 // count runs fn exactly once (try once), never the old coerce-to-default-3 and
 // never a silent zero-attempt no-op.
-func TestRetry_maxAttempts_nonpositive_clamps_to_one(t *testing.T) {
+func TestGetBytes_maxAttempts_nonpositive_clamps_to_one(t *testing.T) {
 	t.Parallel()
 	for _, maxAttempts := range []int{0, -1, -100} {
 		var calls atomic.Int32
@@ -844,7 +844,7 @@ func TestRetry_maxAttempts_nonpositive_clamps_to_one(t *testing.T) {
 				Header:     http.Header{},
 			}, nil
 		})}
-		_, _ = httpx.Retry(t.Context(), client, "http://example.com/retry-edge",
+		_, _ = httpx.GetBytes(t.Context(), client, "http://example.com/retry-edge",
 			httpx.WithBaseDelay(time.Millisecond), httpx.WithMaxAttempts(maxAttempts))
 		if got := calls.Load(); got != 1 {
 			t.Errorf("WithMaxAttempts(%d): calls = %d, want 1 (clamped to a single attempt)", maxAttempts, got)
@@ -852,13 +852,13 @@ func TestRetry_maxAttempts_nonpositive_clamps_to_one(t *testing.T) {
 	}
 }
 
-// TestRetry_cancel_during_backoff_aborts_before_next_attempt verifies that a
+// TestGetBytes_cancel_during_backoff_aborts_before_next_attempt verifies that a
 // context cancelled while Retry is sleeping between attempts aborts the loop
 // immediately: the interrupted-sleep error propagates and no further attempt is
 // made. The transport cancels the context on the first call so the subsequent
 // backoff sleep observes a dead context; the WithHeaders hook counts attempts
 // independently of the http.Client's transport-invocation details.
-func TestRetry_cancel_during_backoff_aborts_before_next_attempt(t *testing.T) {
+func TestGetBytes_cancel_during_backoff_aborts_before_next_attempt(t *testing.T) {
 	var attempts atomic.Int32
 	ctx, cancel := context.WithCancel(t.Context())
 	client := &http.Client{
@@ -875,7 +875,7 @@ func TestRetry_cancel_during_backoff_aborts_before_next_attempt(t *testing.T) {
 	// A one-hour base delay would dominate the run if the sleep were not
 	// interrupted; because the context is already cancelled, SleepCtx returns at
 	// once and the test stays fast.
-	_, err := httpx.Retry(ctx, client, "http://example.com/cancel-during-backoff",
+	_, err := httpx.GetBytes(ctx, client, "http://example.com/cancel-during-backoff",
 		httpx.WithBaseDelay(time.Hour),
 		httpx.WithMaxAttempts(3),
 		httpx.WithHeaders(func(*http.Request) { attempts.Add(1) }),
@@ -889,30 +889,30 @@ func TestRetry_cancel_during_backoff_aborts_before_next_attempt(t *testing.T) {
 }
 
 // retryAfterHintErr is a transient error carrying an explicit Retry-After hint,
-// exercising RetryWithBackoff's RetryAfterHint honoring.
+// exercising Do's RetryAfterHint honoring.
 type retryAfterHintErr struct{ d time.Duration }
 
 func (e *retryAfterHintErr) Error() string                 { return "rate limited" }
 func (e *retryAfterHintErr) IsTransient() bool             { return true }
 func (e *retryAfterHintErr) RetryAfterHint() time.Duration { return e.d }
 
-// TestRetryWithBackoff_honorsRetryAfterHint proves a transient error that
-// implements RetryAfterHint drives the wait: the base delay is set very high,
-// so a fast retry proves the small hint was used instead of the 10s backoff.
-func TestRetryWithBackoff_honorsRetryAfterHint(t *testing.T) {
+// TestDo_honorsRetryAfterHint proves a transient error that implements
+// RetryAfterHint drives the wait: the base delay is set very high, so a fast
+// retry proves the small hint was used instead of the 10s backoff.
+func TestDo_honorsRetryAfterHint(t *testing.T) {
 	var calls int
 	start := time.Now()
-	got, err := httpx.RetryWithBackoff(context.Background(), 2, 10*time.Second, "hint-test",
+	got, err := httpx.Do(context.Background(),
 		func(context.Context) (int, error) {
 			calls++
 			if calls == 1 {
 				return 0, &retryAfterHintErr{d: 200 * time.Millisecond}
 			}
 			return 42, nil
-		})
+		}, httpx.WithMaxAttempts(2), httpx.WithBaseDelay(10*time.Second), httpx.WithLabel("hint-test"))
 	elapsed := time.Since(start)
 	if err != nil {
-		t.Fatalf("RetryWithBackoff: %v", err)
+		t.Fatalf("Do: %v", err)
 	}
 	if got != 42 || calls != 2 {
 		t.Fatalf("got=%d calls=%d, want 42 and 2", got, calls)
@@ -925,20 +925,20 @@ func TestRetryWithBackoff_honorsRetryAfterHint(t *testing.T) {
 	}
 }
 
-func TestRetryWithBackoff_hintOverridesLargerBackoff(t *testing.T) {
+func TestDo_hintOverridesLargerBackoff(t *testing.T) {
 	var calls int
 	start := time.Now()
-	got, err := httpx.RetryWithBackoff(context.Background(), 2, time.Millisecond, "hint-over-backoff",
+	got, err := httpx.Do(context.Background(),
 		func(context.Context) (int, error) {
 			calls++
 			if calls == 1 {
 				return 0, &retryAfterHintErr{d: 250 * time.Millisecond}
 			}
 			return 9, nil
-		})
+		}, httpx.WithMaxAttempts(2), httpx.WithBaseDelay(time.Millisecond), httpx.WithLabel("hint-over-backoff"))
 	elapsed := time.Since(start)
 	if err != nil {
-		t.Fatalf("RetryWithBackoff: %v", err)
+		t.Fatalf("Do: %v", err)
 	}
 	if got != 9 || calls != 2 {
 		t.Fatalf("got=%d calls=%d, want 9 and 2", got, calls)
@@ -951,18 +951,18 @@ func TestRetryWithBackoff_hintOverridesLargerBackoff(t *testing.T) {
 	}
 }
 
-// TestRetryWithBackoff_ignoresNonPositiveHint confirms a hint of zero leaves the
-// jittered exponential backoff in charge (no override, no panic).
-func TestRetryWithBackoff_ignoresNonPositiveHint(t *testing.T) {
+// TestDo_ignoresNonPositiveHint confirms a hint of zero leaves the jittered
+// exponential backoff in charge (no override, no panic).
+func TestDo_ignoresNonPositiveHint(t *testing.T) {
 	var calls int
-	got, err := httpx.RetryWithBackoff(context.Background(), 2, time.Millisecond, "hint-test",
+	got, err := httpx.Do(context.Background(),
 		func(context.Context) (int, error) {
 			calls++
 			if calls == 1 {
 				return 0, &retryAfterHintErr{d: 0}
 			}
 			return 7, nil
-		})
+		}, httpx.WithMaxAttempts(2), httpx.WithBaseDelay(time.Millisecond), httpx.WithLabel("hint-test"))
 	if err != nil || got != 7 || calls != 2 {
 		t.Fatalf("err=%v got=%d calls=%d, want nil/7/2", err, got, calls)
 	}

@@ -70,7 +70,7 @@ func CloneDefaultTransport() (*http.Transport, error) {
 // NewRetryRoundTripper:
 //
 //	tr, err := httpx.CATransport(pem)
-//	client := httpx.NewRetryRoundTripper(tr, httpx.WithRTMaxAttempts(3)).StandardClient()
+//	client := httpx.NewRetryClient(tr, httpx.DefaultRedirectPolicy, httpx.TransportConfig{MaxAttempts: 3})
 //
 // It returns ErrNoCertsInPEM when pem yields no certificates. The caller owns
 // reading the PEM bytes (from a file, a secret, an env var), which keeps this

@@ -1,7 +1,9 @@
 // Package httpx provides a resilient outbound-HTTP toolkit: transient-error
-// classification, generic retry with jittered exponential backoff, Retry-After
-// parsing, HTTP status mapping, secret redaction, body draining, custom-CA TLS
-// transports, and a configurable redirect allowlist.
+// classification, generic typed retry (Do) and a bounded-bytes GET (GetBytes)
+// over one jittered-exponential-backoff loop, a transparent retrying
+// RoundTripper, Retry-After parsing, HTTP status mapping, secret redaction,
+// body draining, custom-CA TLS transports, and a configurable redirect
+// allowlist.
 package httpx
 
 import (
@@ -35,8 +37,9 @@ func (e *AuthError) Error() string { return e.Msg }
 // controls this value; a hostile or misconfigured server can supply a very
 // large duration (CWE-400 uncontrolled resource consumption). Callers that
 // sleep on it directly MUST bound it first, e.g. min(err.RetryAfter, cap).
-// RetryOnRateLimit already does this (caps at its maxWait argument). For a
-// pre-capped value use ParseRetryAfter (bounded at RetryAfterCap = 60s).
+// Do's rate-limit modes (WithRateLimitRetry, WithRateLimitOnly) already do
+// this (they cap at their maxWait argument). For a pre-capped value use
+// ParseRetryAfter (bounded at RetryAfterCap = 60s).
 type RateLimitError struct {
 	Msg        string
 	RetryAfter time.Duration
@@ -53,12 +56,12 @@ type Transient interface {
 // RetryAfterHint is implemented by errors that carry an explicit wait duration
 // for the next retry, typically a parsed and capped Retry-After. When fn's
 // returned error is transient AND implements this interface with a positive
-// duration, RetryWithBackoff waits that duration before the next attempt
-// instead of its jittered exponential backoff. The exponential base still
-// advances, so a later transient error without a hint resumes the normal
-// progression. The hint MUST already be capped by the implementer (e.g. via
-// ParseRetryAfter); RetryWithBackoff sleeps on it verbatim and applies no
-// ceiling of its own, so an uncapped value is an unbounded-wait hazard.
+// duration, Do waits that duration before the next attempt instead of its
+// jittered exponential backoff. The exponential base still advances, so a
+// later transient error without a hint resumes the normal progression. The
+// hint MUST already be capped by the implementer (e.g. via ParseRetryAfter);
+// Do sleeps on it verbatim and applies no ceiling of its own, so an uncapped
+// value is an unbounded-wait hazard.
 type RetryAfterHint interface {
 	RetryAfterHint() time.Duration
 }
@@ -92,7 +95,7 @@ func (e *HTTPStatusError) IsServerError() bool { return e.Code >= 500 }
 // IsClientError reports whether the status code is 4xx.
 func (e *HTTPStatusError) IsClientError() bool { return e.Code >= 400 && e.Code < 500 }
 
-// StatusError represents a non-2xx response with URL context. Used by Retry.
+// StatusError represents a non-2xx response with URL context. Used by GetBytes.
 // Supports errors.Is matching against ErrRateLimited and ErrServerError.
 type StatusError struct {
 	URL  string
@@ -114,11 +117,11 @@ func (e *StatusError) Is(target error) bool {
 	return false
 }
 
-// ResponseTooLargeError is returned by Retry when the response body exceeds the
-// configured maximum (WithMaxBodyBytes, default DefaultMaxBodyBytes). The body
-// is not returned: a truncated payload indistinguishable from a complete one is
-// a silent-corruption hazard, so Retry fails loud instead. Limit is the cap
-// that was exceeded, mirroring the stdlib *http.MaxBytesError shape.
+// ResponseTooLargeError is returned by GetBytes when the response body exceeds
+// the configured maximum (WithMaxBodyBytes, default DefaultMaxBodyBytes). The
+// body is not returned: a truncated payload indistinguishable from a complete
+// one is a silent-corruption hazard, so GetBytes fails loud instead. Limit is
+// the cap that was exceeded, mirroring the stdlib *http.MaxBytesError shape.
 type ResponseTooLargeError struct {
 	Limit int64
 }
@@ -160,102 +163,12 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &pe)
 }
 
-// --- Backoff strategy interface ---
-
-// Backoff is a pluggable backoff strategy. NextBackOff returns the duration to
-// wait before the next retry. Return BackoffStop to signal no more retries.
-// Mirrors cenkalti/backoff.BackOff.
-type Backoff interface {
-	// NextBackOff returns the next wait duration, or BackoffStop to stop.
-	NextBackOff() time.Duration
-	// Reset restores the strategy to its initial state.
-	Reset()
-}
-
-// BackoffStop signals that no more retries should be made.
-const BackoffStop time.Duration = -1
-
-// --- ExponentialBackoff with functional options ---
-
-// expBackoffCfg holds configuration for ExponentialBackoff.
-type expBackoffCfg struct {
-	initialInterval time.Duration
-	maxElapsedTime  time.Duration
-}
-
-// ExpBackoffOption configures an ExponentialBackoff.
-type ExpBackoffOption func(*expBackoffCfg)
-
-// WithInitialInterval sets the first backoff duration. Default: DefaultBaseDelay.
-func WithInitialInterval(d time.Duration) ExpBackoffOption {
-	return func(c *expBackoffCfg) { c.initialInterval = d }
-}
-
-// WithMaxElapsedTime caps total retry time for the backoff. Zero means no cap.
-func WithMaxElapsedTime(d time.Duration) ExpBackoffOption {
-	return func(c *expBackoffCfg) { c.maxElapsedTime = d }
-}
-
-// ExponentialBackoff implements Backoff with jittered exponential backoff.
-// This is the default strategy used throughout httpx.
-type ExponentialBackoff struct {
-	startTime       time.Time
-	initialInterval time.Duration
-	maxElapsedTime  time.Duration
-	current         time.Duration
-}
-
-// NewExponentialBackoff creates an ExponentialBackoff with functional options.
-func NewExponentialBackoff(opts ...ExpBackoffOption) *ExponentialBackoff {
-	cfg := expBackoffCfg{
-		initialInterval: DefaultBaseDelay,
-	}
-	for _, o := range opts {
-		if o != nil {
-			o(&cfg)
-		}
-	}
-	b := &ExponentialBackoff{
-		initialInterval: cfg.initialInterval,
-		maxElapsedTime:  cfg.maxElapsedTime,
-	}
-	b.Reset()
-	return b
-}
-
-// NextBackOff returns the next jittered backoff duration, or BackoffStop if
-// MaxElapsedTime has already elapsed. The check is made BEFORE the returned
-// interval is slept, so the caller's total time can overshoot MaxElapsedTime
-// by up to one interval (the final returned wait). When a hard ceiling is
-// required, use the RoundTripper's WithRTMaxElapsedTime, which aborts on
-// elapsed+wait and never overshoots.
-func (b *ExponentialBackoff) NextBackOff() time.Duration {
-	if b.current == 0 {
-		b.Reset()
-	}
-	if b.maxElapsedTime > 0 && time.Since(b.startTime) >= b.maxElapsedTime {
-		return BackoffStop
-	}
-	wait := JitteredBackoff(b.current)
-	b.current = SafeDouble(b.current)
-	return wait
-}
-
-// Reset restores the backoff to its initial state.
-func (b *ExponentialBackoff) Reset() {
-	if b.initialInterval <= 0 {
-		b.initialInterval = DefaultBaseDelay
-	}
-	b.current = b.initialInterval
-	b.startTime = time.Now()
-}
-
 // --- Constants ---
 
 const (
 	// DefaultBaseDelay is the production base for exponential-backoff retry.
 	DefaultBaseDelay = time.Second
-	// DefaultMaxAttempts caps Retry at three tries.
+	// DefaultMaxAttempts caps the retry doors at three total attempts.
 	DefaultMaxAttempts = 3
 	// DefaultMaxBodyBytes caps response bodies at 10 MB.
 	DefaultMaxBodyBytes int64 = 10 << 20
@@ -426,353 +339,6 @@ func IsTransient(err error) bool {
 	return errors.As(err, &dnsErr)
 }
 
-// --- Generic retry ---
-
-// logRetrySuccess emits the debug line when fn recovered after at least one
-// retry (attempt is 0-indexed, so attempt > 0 means a prior failure recovered).
-func logRetrySuccess(label string, attempt int) {
-	if attempt > 0 {
-		slog.Debug(label+" succeeded after retry", "attempts", attempt+1)
-	}
-}
-
-// nextRetryWait returns the wait before the next retry: a positive Retry-After
-// hint carried by err (via the RetryAfterHint interface, already capped by the
-// implementer) takes precedence over the jittered exponential backoff. The
-// value is used verbatim, so an implementer must cap it (see the RetryAfterHint
-// doc); httpx applies no ceiling of its own here.
-func nextRetryWait(err error, backoff time.Duration) time.Duration {
-	var h RetryAfterHint
-	if errors.As(err, &h) {
-		if d := h.RetryAfterHint(); d > 0 {
-			return d
-		}
-	}
-	return JitteredBackoff(backoff)
-}
-
-// RetryWithBackoff calls fn up to maxAttempts times (total, including the first
-// call) with jittered exponential backoff, returning the first success.
-// Non-transient errors are returned immediately. maxAttempts is the TOTAL
-// attempt count, not retries-beyond-first; a value below 1 is treated as 1, so
-// fn is always called at least once (it never silently no-ops).
-// Logging uses slog.Default() and cannot be overridden per-call; control output
-// via slog.SetDefault().
-func RetryWithBackoff[T any](ctx context.Context, maxAttempts int, baseDelay time.Duration,
-	label string, fn func(ctx context.Context) (T, error),
-) (T, error) {
-	if maxAttempts < 1 {
-		maxAttempts = 1
-	}
-	if baseDelay <= 0 {
-		baseDelay = DefaultBaseDelay
-	}
-	var zero T
-	var lastErr error
-	backoff := baseDelay
-	for attempt := range maxAttempts {
-		result, err := fn(ctx)
-		if err == nil {
-			logRetrySuccess(label, attempt)
-			return result, nil
-		}
-		lastErr = err
-		if ctx.Err() != nil {
-			return zero, ctx.Err()
-		}
-		if !IsTransient(err) {
-			return zero, err
-		}
-		if attempt == maxAttempts-1 {
-			break
-		}
-		// A transient error may carry an explicit (capped) Retry-After hint;
-		// nextRetryWait honors it in place of the jittered backoff. The
-		// exponential base still advances below, so a later hintless transient
-		// error resumes the normal progression.
-		wait := nextRetryWait(err, backoff)
-		slog.Debug(label+" failed, retrying",
-			"attempt", attempt+1, "max", maxAttempts,
-			"delay", wait.String(), "error", LogSafeError(err))
-		if err := SleepCtx(ctx, wait); err != nil {
-			return zero, err
-		}
-		backoff = SafeDouble(backoff)
-	}
-	if lastErr != nil {
-		slog.Warn(label+" retries exhausted",
-			"attempts", maxAttempts, "error", LogSafeError(lastErr))
-	}
-	return zero, lastErr
-}
-
-// RetryOnRateLimit calls fn up to maxAttempts times (total, including the first
-// call) when it returns a *RateLimitError. Non-rate-limit errors are returned
-// immediately. maxAttempts is the TOTAL attempt count; a value below 1 is
-// treated as 1, so fn is always called at least once. maxWait caps the honored
-// Retry-After hint and is the wait when the error carries no hint; a
-// non-positive maxWait falls back to RetryAfterCap (a zero ceiling would zero
-// every wait, and SleepCtx returns immediately for non-positive durations, so
-// the loop would hot-spin through the remaining attempts with no cancellation
-// check). With the fallback the inter-attempt wait is always positive, so a
-// canceled context is observed before every retry. The context is passed to fn
-// on each attempt.
-func RetryOnRateLimit(ctx context.Context, maxAttempts int, maxWait time.Duration, fn func(ctx context.Context) error) error {
-	if maxAttempts < 1 {
-		maxAttempts = 1
-	}
-	if maxWait <= 0 {
-		maxWait = RetryAfterCap
-	}
-	var lastErr error
-	for attempt := range maxAttempts {
-		lastErr = fn(ctx)
-		if lastErr == nil {
-			return nil
-		}
-		var rlErr *RateLimitError
-		if !errors.As(lastErr, &rlErr) {
-			return lastErr
-		}
-		if attempt == maxAttempts-1 {
-			break
-		}
-		wait := maxWait
-		if rlErr.RetryAfter > 0 {
-			wait = min(rlErr.RetryAfter, maxWait)
-		}
-		slog.Debug("rate limited, backing off",
-			"attempt", attempt+1, "max", maxAttempts,
-			"delay", wait.String(), "error", LogSafeError(lastErr))
-		if err := SleepCtx(ctx, wait); err != nil {
-			return err
-		}
-	}
-	if lastErr != nil {
-		slog.Warn("rate limit retries exhausted",
-			"attempts", maxAttempts, "error", LogSafeError(lastErr))
-	}
-	return lastErr
-}
-
-// --- HTTP GET with retry (functional options) ---
-
-// retryCfg holds internal configuration for a single Retry call.
-type retryCfg struct {
-	setHeaders   func(*http.Request)
-	logger       *slog.Logger
-	baseDelay    time.Duration
-	maxBodyBytes int64
-	maxAttempts  int
-}
-
-// Option configures a Retry call.
-type Option func(*retryCfg)
-
-// WithMaxAttempts sets the maximum number of attempts (including the first).
-// Default: DefaultMaxAttempts (3).
-func WithMaxAttempts(n int) Option {
-	return func(c *retryCfg) { c.maxAttempts = n }
-}
-
-// WithBaseDelay sets the initial backoff delay. Default: DefaultBaseDelay (1s).
-func WithBaseDelay(d time.Duration) Option {
-	return func(c *retryCfg) { c.baseDelay = d }
-}
-
-// WithMaxBodyBytes sets the maximum response body size to read.
-// Default: DefaultMaxBodyBytes (10 MB).
-func WithMaxBodyBytes(n int64) Option {
-	return func(c *retryCfg) { c.maxBodyBytes = n }
-}
-
-// WithHeaders sets a function that is called to set headers on each request.
-func WithHeaders(fn func(*http.Request)) Option {
-	return func(c *retryCfg) { c.setHeaders = fn }
-}
-
-// WithLogger sets the logger for retry diagnostics. Default: slog.Default().
-func WithLogger(l *slog.Logger) Option {
-	return func(c *retryCfg) { c.logger = l }
-}
-
-// Retry performs an HTTP GET with bounded exponential-backoff retry on
-// 429 and 5xx responses and on transient transport errors (timeouts,
-// connection resets, DNS failures - see IsTransient). 4xx (non-429) and
-// non-transient transport errors are returned immediately. Honors
-// Retry-After (capped at RetryAfterCap).
-//
-// Retry deliberately keeps its own retry loop rather than delegating to
-// RetryRoundTripper.RoundTrip. It is a decorator over the same shared
-// primitives (JitteredBackoff, SafeDouble, SleepCtx, ParseRetryAfter,
-// IsTransient, Drain), not a thin wrapper over the RoundTripper cycle, because
-// Retry carries behavior the transparent RoundTripper has no equivalent for and
-// which must stay byte-for-byte stable for existing consumers:
-//   - []byte return with the body capped at cfg.maxBodyBytes (the RoundTripper
-//     hands back an *http.Response and never reads the body);
-//   - URL/secret redaction on every log "url" attr (redactURL) and every
-//     returned/wrapped error (LogSafeError, StatusError.Error()), the
-//     CWE-532 hardening the RoundTripper path does not perform;
-//   - rich per-attempt slog logging plus the "retries exhausted after %s: %w"
-//     wrapper, which the RoundTripper exposes only as an OnRetry hook;
-//   - classification of every 5xx (not just 502/503/504) as retryable and of
-//     any non-2xx (3xx included) as a permanent *StatusError. A 2xx response
-//     returns the body; Retry cannot surface a redirect, so 3xx is an error.
-//
-// Routing Retry through RoundTrip would silently change one or more of these,
-// so the loop is intentionally not merged.
-func Retry(ctx context.Context, client *http.Client, reqURL string, opts ...Option) ([]byte, error) {
-	cfg := newRetryCfg(opts)
-	log := cfg.logger
-
-	start := time.Now()
-	var lastErr error
-	var overrideWait time.Duration
-	backoff := cfg.baseDelay
-	for attempt := range cfg.maxAttempts {
-		if attempt > 0 {
-			newBackoff, sleepErr := retrySleep(ctx, overrideWait, backoff)
-			if sleepErr != nil {
-				return nil, sleepErr
-			}
-			backoff = newBackoff
-		}
-		attemptStart := time.Now()
-		body, retryAfter, err := retryAttempt(ctx, client, reqURL, &cfg)
-		if body != nil {
-			logSlowUpstream(log, reqURL, attemptStart)
-			return body, nil
-		}
-		if err != nil && !isRetryStatus(err) {
-			return nil, LogSafeError(err)
-		}
-		lastErr = err
-		overrideWait = retryAfter
-		if attempt == cfg.maxAttempts-1 {
-			break
-		}
-		log.Debug("http request failed, will retry",
-			"url", redactURL(reqURL), "attempt", attempt+1, "max", cfg.maxAttempts, "error", LogSafeError(err))
-	}
-	elapsed := time.Since(start)
-	log.Warn("http retries exhausted",
-		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", LogSafeError(lastErr))
-	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), LogSafeError(lastErr))
-}
-
-// newRetryCfg builds a retryCfg from opts (nil options are skipped) and applies
-// defaults: maxAttempts clamps to >= 1, a non-positive baseDelay/maxBodyBytes
-// falls back to its default, and a nil logger resolves to slog.Default().
-func newRetryCfg(opts []Option) retryCfg {
-	cfg := retryCfg{
-		maxAttempts:  DefaultMaxAttempts,
-		baseDelay:    DefaultBaseDelay,
-		maxBodyBytes: DefaultMaxBodyBytes,
-	}
-	for _, o := range opts {
-		if o != nil {
-			o(&cfg)
-		}
-	}
-	if cfg.maxAttempts < 1 {
-		cfg.maxAttempts = 1
-	}
-	if cfg.baseDelay <= 0 {
-		cfg.baseDelay = DefaultBaseDelay
-	}
-	if cfg.maxBodyBytes <= 0 {
-		cfg.maxBodyBytes = DefaultMaxBodyBytes
-	}
-	if cfg.logger == nil {
-		cfg.logger = slog.Default()
-	}
-	return cfg
-}
-
-// retrySleep waits before a retry attempt: it honors a positive overrideWait (a
-// capped Retry-After) else an equal-jitter delay derived from backoff, then
-// returns the doubled backoff for the next attempt.
-func retrySleep(ctx context.Context, overrideWait, backoff time.Duration) (time.Duration, error) {
-	delay := overrideWait
-	if delay <= 0 {
-		delay = JitteredBackoff(backoff)
-	}
-	if err := SleepCtx(ctx, delay); err != nil {
-		return backoff, err
-	}
-	return SafeDouble(backoff), nil
-}
-
-// logSlowUpstream warns when a successful attempt took longer than 10s. Timed
-// per-attempt so the library's own backoff sleeps are not mislabeled as
-// upstream latency.
-func logSlowUpstream(log *slog.Logger, reqURL string, attemptStart time.Time) {
-	if elapsed := time.Since(attemptStart); elapsed > 10*time.Second {
-		log.Warn("slow upstream response", "url", redactURL(reqURL), "duration", elapsed.Round(time.Millisecond))
-	}
-}
-
-// retryAttempt performs a single HTTP GET attempt. Returns (body, 0, nil) on
-// success, (nil, retryAfter, err) on retryable failure, or (nil, 0, err) on
-// permanent failure.
-func retryAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *retryCfg) ([]byte, time.Duration, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
-	if err != nil {
-		return nil, 0, fmt.Errorf("create request: %w", err)
-	}
-	if cfg.setHeaders != nil {
-		cfg.setHeaders(req)
-	}
-	resp, err := client.Do(req) //nolint:bodyclose // resp.Body is closed on every path: DrainClose (429/5xx, non-2xx) or ReadLimitedBody's deferred close (2xx); bodyclose can't trace the close through the helper.
-	if err != nil {
-		if !IsTransient(err) {
-			return nil, 0, err
-		}
-		return nil, 0, &retryableError{err: err}
-	}
-	// 429 and 5xx are both retryable and handled identically (both honor a
-	// capped Retry-After); one guard avoids two byte-identical copies.
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		ra := ParseRetryAfter(resp.Header.Get("Retry-After"))
-		DrainClose(resp.Body)
-		return nil, ra, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}
-	}
-	// Success is any 2xx. Retry returns the body bytes, so a 3xx (which reaches
-	// here only when the client is configured not to follow redirects) is a
-	// permanent *StatusError: the redirect stub is not the requested resource and
-	// Retry cannot surface Location. Intentional divergence from CheckHTTPStatus,
-	// a general error-classifier that treats 3xx as non-error.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		DrainClose(resp.Body)
-		return nil, 0, &StatusError{Code: resp.StatusCode, URL: reqURL}
-	}
-	// Read the body with overflow detection: an over-limit body fails loud with
-	// *ResponseTooLargeError rather than being silently truncated (a truncated
-	// payload that looks complete is a corruption hazard). ReadLimitedBody owns
-	// the cap+1 probe, its int64-overflow guard, and closing the body.
-	body, err := ReadLimitedBody(resp.Body, cfg.maxBodyBytes)
-	if err != nil {
-		var tooLarge *ResponseTooLargeError
-		if errors.As(err, &tooLarge) {
-			return nil, 0, err
-		}
-		return nil, 0, fmt.Errorf("read response: %w", err)
-	}
-	return body, 0, nil
-}
-
-// retryableError is an internal marker for errors that should be retried.
-type retryableError struct{ err error }
-
-func (e *retryableError) Error() string { return e.err.Error() }
-func (e *retryableError) Unwrap() error { return e.err }
-
-// isRetryStatus reports whether an error from retryAttempt is retryable.
-func isRetryStatus(err error) bool {
-	var re *retryableError
-	return errors.As(err, &re)
-}
-
 // --- Body helpers ---
 
 // Drain reads and discards up to 64 KB of a response body to enable
@@ -812,9 +378,9 @@ type limitedReadCloser struct {
 //
 // It is the read-all-with-overflow-detection companion to LimitedBody (which
 // only caps the stream and leaves reading and overflow handling to the caller),
-// and is the same cap+1 read Retry applies internally — exposed for callers that
-// issue their own request and decode outside Retry but still want the fail-loud
-// size bound. On any error the body is already closed.
+// and is the same cap+1 read GetBytes applies internally — exposed for callers
+// that issue their own request and decode outside GetBytes but still want the
+// fail-loud size bound. On any error the body is already closed.
 func ReadLimitedBody(body io.ReadCloser, limit int64) ([]byte, error) {
 	defer body.Close()
 	probe := limit
@@ -1114,6 +680,12 @@ func RefuseAllRedirects(*http.Request, []*http.Request) error {
 }
 
 // --- Client helpers ---
+
+// CheckRedirect is the http.Client.CheckRedirect function shape. It is a type
+// alias, so values are assignable in both directions; every shipped policy
+// (DefaultRedirectPolicy, RefuseAllRedirects, DockerGitHubRedirectPolicy, and
+// anything built with RedirectPolicyFunc) is a CheckRedirect.
+type CheckRedirect = func(req *http.Request, via []*http.Request) error
 
 // NewClient returns an *http.Client with the given timeout and the
 // DefaultRedirectPolicy (same-host only). For custom redirect allowlists,

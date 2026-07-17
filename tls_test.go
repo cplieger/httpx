@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v2/certtest"
+	"github.com/cplieger/httpx/v3/certtest"
 )
 
 // TestCACertPool exercises the internal caCertPool primitive directly (this is
