@@ -343,6 +343,49 @@ func TestDefaultRedirectPolicy_scheme(t *testing.T) {
 	}
 }
 
+// TestDefaultRedirectPolicy_nil_origin_url_refuses pins the graceful-refusal
+// path inherited from the compiled policy it delegates to: a hand-built via
+// chain whose original request carries no URL yields a refusal, not a panic
+// (the previous hand-rolled implementation dereferenced via[0].URL
+// unconditionally). net/http always populates via[0].URL, so only hand-built
+// chains reach this branch.
+func TestDefaultRedirectPolicy_nil_origin_url_refuses(t *testing.T) {
+	if err := httpx.DefaultRedirectPolicy(reqTo(t, "https://example.com/x"), redirectVia(1)); err == nil {
+		t.Error("DefaultRedirectPolicy with nil origin URL = nil, want refusal (no origin to match against)")
+	}
+}
+
+// TestDockerGitHubRedirectPolicy_scheme_downgrade_refused pins the downgrade
+// guard on the example allowlist policy: an https->http redirect is refused
+// even when the target host is allowlisted, an http->https upgrade and a
+// same-scheme hop stay allowed, and a via entry carrying no URL (as the
+// hand-built table tests construct) skips the guard rather than tripping it.
+func TestDockerGitHubRedirectPolicy_scheme_downgrade_refused(t *testing.T) {
+	tests := []struct {
+		name    string
+		orig    string
+		target  string
+		wantErr bool
+	}{
+		{"downgrade to allowlisted host refused", "https://hub.docker.com/a", "http://hub.docker.com/b", true},
+		{"downgrade across allowlisted hosts refused", "https://github.com/a", "http://api.github.com/b", true},
+		{"http->https upgrade allowed", "http://hub.docker.com/a", "https://hub.docker.com/b", false},
+		{"same scheme allowed", "https://github.com/a", "https://raw.githubusercontent.com/b", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := httpx.DockerGitHubRedirectPolicy(reqTo(t, tt.target), viaWithOrigin(t, tt.orig))
+			if tt.wantErr != (err != nil) {
+				t.Errorf("policy(%s -> %s) err=%v, wantErr=%v", tt.orig, tt.target, err, tt.wantErr)
+			}
+		})
+	}
+	// A via entry with no URL must not trip the downgrade guard.
+	if err := httpx.DockerGitHubRedirectPolicy(reqTo(t, "http://hub.docker.com/b"), redirectVia(1)); err != nil {
+		t.Errorf("nil-URL via entry should skip the downgrade guard, got %v", err)
+	}
+}
+
 // TestRefuseAllRedirects_identity pins the mechanism: the policy is exactly
 // http.ErrUseLastResponse, which makes the client surface the redirect
 // response itself rather than fail the request with an error.

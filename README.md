@@ -42,6 +42,9 @@ rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
     }),
 )
 client := rt.StandardClient()
+// StandardClient sets no redirect policy (net/http's default follows up to 10
+// hops to any host); install one explicitly.
+client.CheckRedirect = httpx.DefaultRedirectPolicy // same-host only
 
 // Retry POST/PUT with body replay (opt-in, inspired by go-retryablehttp)
 rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
@@ -49,6 +52,7 @@ rt := httpx.NewRetryRoundTripper(http.DefaultTransport,
     httpx.WithRetryNonIdempotent(true),
 )
 client := rt.StandardClient()
+client.CheckRedirect = httpx.DefaultRedirectPolicy
 payload := []byte(`{"key":"value"}`)
 req, _ := http.NewRequest("POST", url, bytes.NewReader(payload))
 req.GetBody = func() (io.ReadCloser, error) {
@@ -83,9 +87,10 @@ policy := httpx.RedirectPolicyFunc(
 // ON, TLS 1.2 minimum). The caller reads the PEM bytes (file, secret, env),
 // keeping the helper I/O-free.
 tr, err := httpx.CATransport(pemBytes)
-client := &http.Client{Transport: tr}
+client := &http.Client{Transport: tr, CheckRedirect: httpx.DefaultRedirectPolicy}
 // ...or compose the pinned transport with retry:
 client = httpx.NewRetryRoundTripper(tr, httpx.WithRTMaxAttempts(3)).StandardClient()
+client.CheckRedirect = httpx.DefaultRedirectPolicy
 
 // Transient error classification
 if httpx.IsTransient(err) { /* safe to retry */ }
@@ -101,9 +106,9 @@ defer rc.Close()
 
 - `Retry` — HTTP GET with exponential backoff on 429/5xx **and transient transport errors** (timeouts, connection resets, DNS failures — see `IsTransient`); 4xx (non-429) and non-transient transport errors return immediately (functional options: `WithMaxAttempts`, `WithBaseDelay`, `WithMaxBodyBytes`, `WithHeaders`, `WithLogger`). Counts **total** attempts (a non-positive count clamps to 1).
 - `RetryWithBackoff[T]` — generic retry with jittered exponential backoff; when a transient error implements `RetryAfterHint`, its pre-capped duration replaces the backoff for the next wait (the exponential base keeps advancing)
-- `RetryOnRateLimit` — retry on `*RateLimitError` only (passes ctx to fn)
+- `RetryOnRateLimit` — retry on `*RateLimitError` only (passes ctx to fn); the honored Retry-After hint is capped at `maxWait`, and a non-positive `maxWait` falls back to `RetryAfterCap` (60s) so the inter-attempt wait is always positive (never a hot spin)
 - `NewRetryRoundTripper` — create a retrying `http.RoundTripper` (functional options: `WithRTMaxAttempts`, `WithRTBaseDelay`, `WithRTMaxElapsedTime`, `WithBackoffFunc`, `WithCheckRetry`, `WithOnRetry`, `WithPrepareRetry`, `WithRetryNonIdempotent`)
-- `StandardClient()` — returns `*http.Client` using the `RetryRoundTripper`
+- `StandardClient()` — returns `*http.Client` using the `RetryRoundTripper`; it sets no `CheckRedirect`, so install a redirect policy on the returned client (e.g. `DefaultRedirectPolicy`)
 
 ### TLS transports
 
@@ -163,9 +168,9 @@ The `github.com/cplieger/httpx/v2/certtest` subpackage supplies throwaway self-s
 
 ### Redirect Policies
 
-- `DefaultRedirectPolicy` — same-host-only redirect policy (used by `NewClient`). It also refuses a same-host `https`->`http` scheme downgrade and allows an `http`->`https` upgrade, which makes it equivalent to `RedirectPolicyFunc(WithSameHost())`.
+- `DefaultRedirectPolicy` — same-host-only redirect policy (used by `NewClient`). It also refuses a same-host `https`->`http` scheme downgrade and allows an `http`->`https` upgrade; it delegates to `RedirectPolicyFunc(WithSameHost())`, so the two cannot drift.
 - `RefuseAllRedirects` — follows **no** redirect: returns `http.ErrUseLastResponse`, so the client surfaces the 3xx response itself (nil error) instead of following. The policy for a token-bearing client of an API that issues no redirects — Go forwards custom headers (`X-Plex-Token`, `X-Api-Key`) across redirects, so a hostile 302 would exfiltrate the credential.
-- `DockerGitHubRedirectPolicy` — optional example policy for docker.com/github.com
+- `DockerGitHubRedirectPolicy` — optional example policy for docker.com/github.com; like the other policies it refuses an `https`->`http` downgrade, even to an allowlisted host
 - `RedirectPolicyFunc` — build a custom redirect allowlist (functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithSameHost`, `WithAllowSchemeDowngrade`, `WithMaxHops`)
   - `WithSameHost` additionally allows a redirect whose target host equals the original request's host (layered on any allowlisted hosts or suffixes); it is the building block for a same-origin policy.
   - `WithAllowSchemeDowngrade(bool)` permits an `https`->`http` downgrade redirect. The default `false` refuses it, so a custom auth header is never forwarded onto a cleartext hop; an `http`->`https` upgrade is always allowed. The downgrade is judged against the original request's scheme, and the guard applies to allowlisted and same-host targets alike.
@@ -227,15 +232,15 @@ A per-attempt timeout that is **itself retried** (a stalled attempt abandoned an
 
 The following features are intentionally not provided:
 
-| Feature                                                              | Rationale                                                                                                                                               |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Circuit breaker                                                      | Orthogonal pattern excluded by all comparables. Compose externally with sony/gobreaker.                                                                 |
-| Retry budget / token bucket                                          | None of the comparables implement it. Disproportionate complexity (~150 LOC + shared mutable state) for a focused library.                              |
-| Multiple jitter strategies (full, decorrelated)                      | Equal jitter is the recommended default per AWS Builders' Library. Full jitter risks near-zero delays.                                                  |
-| `ErrorHandler` for exhaustion                                        | Current `fmt.Errorf("retries exhausted: %w", lastErr)` is sufficient. Callers unwrap.                                                                   |
-| Response body on error                                               | Adds API complexity (ownership of body close). Use `RetryWithBackoff[T]` with custom logic.                                                             |
-| Idempotency key injection                                            | Application-level concern, not a retry library's responsibility.                                                                                        |
-| Configurable Retry-After cap / per-call `WithLogger` on the generics | A raisable cap would regress the fixed-60s DoS ceiling; a per-call logger on the positional generics forces an options refactor for no consumer demand. |
+| Feature                                                              | Rationale                                                                                                                                                                                                                                |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Circuit breaker                                                      | Orthogonal pattern excluded by all comparables. Compose externally with sony/gobreaker.                                                                                                                                                  |
+| Retry budget / token bucket                                          | None of the comparables implement it. Disproportionate complexity (~150 LOC + shared mutable state) for a focused library.                                                                                                               |
+| Multiple jitter strategies (full, decorrelated)                      | Equal jitter is the recommended default per AWS Builders' Library. Full jitter risks near-zero delays.                                                                                                                                   |
+| `ErrorHandler` for exhaustion                                        | Current `fmt.Errorf("retries exhausted: %w", lastErr)` is sufficient. Callers unwrap.                                                                                                                                                    |
+| Response body on error                                               | Adds API complexity (ownership of body close). Use `RetryWithBackoff[T]` with custom logic.                                                                                                                                              |
+| Idempotency key injection                                            | Application-level concern, not a retry library's responsibility.                                                                                                                                                                         |
+| Configurable Retry-After cap / per-call `WithLogger` on the generics | A raisable cap would regress the fixed-60s DoS ceiling; a per-call logger on the generics forces an options refactor — the one consumer wanting custom retry observability (subflux) composes its own loop from the exported primitives. |
 
 ## Disclaimer
 

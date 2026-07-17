@@ -509,11 +509,20 @@ func RetryWithBackoff[T any](ctx context.Context, maxAttempts int, baseDelay tim
 // RetryOnRateLimit calls fn up to maxAttempts times (total, including the first
 // call) when it returns a *RateLimitError. Non-rate-limit errors are returned
 // immediately. maxAttempts is the TOTAL attempt count; a value below 1 is
-// treated as 1, so fn is always called at least once. The context is passed to
-// fn on each attempt.
+// treated as 1, so fn is always called at least once. maxWait caps the honored
+// Retry-After hint and is the wait when the error carries no hint; a
+// non-positive maxWait falls back to RetryAfterCap (a zero ceiling would zero
+// every wait, and SleepCtx returns immediately for non-positive durations, so
+// the loop would hot-spin through the remaining attempts with no cancellation
+// check). With the fallback the inter-attempt wait is always positive, so a
+// canceled context is observed before every retry. The context is passed to fn
+// on each attempt.
 func RetryOnRateLimit(ctx context.Context, maxAttempts int, maxWait time.Duration, fn func(ctx context.Context) error) error {
 	if maxAttempts < 1 {
 		maxAttempts = 1
+	}
+	if maxWait <= 0 {
+		maxWait = RetryAfterCap
 	}
 	var lastErr error
 	for attempt := range maxAttempts {
@@ -1038,34 +1047,36 @@ func redirectAllowed(host string, allowedHosts, normalizedSuffixes []string) boo
 	return false
 }
 
+// defaultRedirectPolicy is the compiled same-host policy DefaultRedirectPolicy
+// delegates to, so the same-host + downgrade logic lives in exactly one place
+// (resolvedRedirect.check) and cannot drift from
+// RedirectPolicyFunc(WithSameHost()).
+var defaultRedirectPolicy = RedirectPolicyFunc(WithSameHost())
+
 // DefaultRedirectPolicy is the default redirect policy: it allows a redirect
 // only to the same host as the original request, and refuses a same-host
 // https->http scheme downgrade (which would forward a custom auth header onto a
 // cleartext hop). A cross-host redirect is refused (Go forwards a custom header
 // across a redirect, so it would leak) and an http->https upgrade is allowed.
-// Equivalent to RedirectPolicyFunc(WithSameHost()); use RedirectPolicyFunc for
-// a custom allowlist, a higher hop cap (WithMaxHops), or to permit downgrades
-// (WithAllowSchemeDowngrade).
+// It delegates to RedirectPolicyFunc(WithSameHost()), with one addition: a call
+// with an empty via chain (which net/http never produces — via always carries
+// at least the original request) is allowed rather than refused. Use
+// RedirectPolicyFunc for a custom allowlist, a higher hop cap (WithMaxHops), or
+// to permit downgrades (WithAllowSchemeDowngrade).
 func DefaultRedirectPolicy(req *http.Request, via []*http.Request) error {
-	if len(via) >= redirectCap {
-		return errors.New("too many redirects")
-	}
 	if len(via) == 0 {
 		return nil
 	}
-	orig := via[0].URL
-	if asciiLower(req.URL.Hostname()) != asciiLower(orig.Hostname()) {
-		return fmt.Errorf("refusing redirect to %s", req.URL.Hostname())
-	}
-	if isSchemeDowngrade(orig.Scheme, req.URL.Scheme) {
-		return fmt.Errorf("refusing same-host scheme downgrade to %s", req.URL.Hostname())
-	}
-	return nil
+	return defaultRedirectPolicy(req, via)
 }
 
 // DockerGitHubRedirectPolicy is an OPTIONAL example redirect policy allowing
-// docker.com and github.com hosts. Use it by assigning to Client.CheckRedirect
-// or pass RedirectOption values to RedirectPolicyFunc for other allowlists.
+// docker.com and github.com hosts. Like every shipped policy it refuses an
+// https->http scheme downgrade (judged against the original request's scheme,
+// see WithAllowSchemeDowngrade), so a custom auth header never rides a
+// cleartext hop even to an allowlisted host. Use it by assigning to
+// Client.CheckRedirect or pass RedirectOption values to RedirectPolicyFunc for
+// other allowlists.
 func DockerGitHubRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) >= redirectCap {
 		return errors.New("too many redirects")
@@ -1077,10 +1088,14 @@ func DockerGitHubRedirectPolicy(req *http.Request, via []*http.Request) error {
 		host == "github.com",
 		strings.HasSuffix(host, ".github.com"),
 		strings.HasSuffix(host, ".githubusercontent.com"):
-		return nil
+		// Allowed host; still subject to the scheme-downgrade guard below.
 	default:
 		return fmt.Errorf("refusing redirect to %s", host)
 	}
+	if len(via) > 0 && via[0].URL != nil && isSchemeDowngrade(via[0].URL.Scheme, req.URL.Scheme) {
+		return fmt.Errorf("refusing scheme downgrade to %s", host)
+	}
+	return nil
 }
 
 // RefuseAllRedirects is a CheckRedirect policy that follows NO redirect: it
