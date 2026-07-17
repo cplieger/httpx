@@ -600,6 +600,29 @@ func TestRetryOnRateLimit_positive_retry_after_caps_below_max_wait(t *testing.T)
 	}
 }
 
+// TestRetryOnRateLimit_non_positive_max_wait_clamps_to_cap pins the maxWait<=0
+// fallback to RetryAfterCap: the inter-attempt wait must stay positive (here
+// the clamped 60s against an expiring context), so the loop parks in SleepCtx
+// and surfaces the context error. Before the clamp, maxWait=0 zeroed the wait,
+// SleepCtx returned nil without checking ctx, and the loop hot-spun through
+// every attempt in microseconds returning the rate-limit error instead.
+func TestRetryOnRateLimit_non_positive_max_wait_clamps_to_cap(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	calls := 0
+	err := RetryOnRateLimit(ctx, 3, 0, func(_ context.Context) error {
+		calls++
+		return &RateLimitError{Msg: "rl"}
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("RetryOnRateLimit(maxWait=0) = %v, want context.DeadlineExceeded (clamped wait parked in SleepCtx)", err)
+	}
+	if calls != 1 {
+		t.Errorf("fn calls = %d, want 1 (no hot-spin through attempts)", calls)
+	}
+}
+
 // --- RetryWithBackoff: zero base delay coercion and structured-log content ---
 
 func TestRetryWithBackoff_zero_base_delay_defaults_to_base(t *testing.T) {
@@ -718,6 +741,36 @@ func TestRetryOnRateLimit_retry_debug_log_reports_one_indexed_attempt(t *testing
 	// The first retry logs the human (1-indexed) attempt number, attempt+1 == 1.
 	if !strings.Contains(logged, "attempt=1") {
 		t.Errorf("retry debug log = %q, want attribute attempt=1", logged)
+	}
+}
+
+// TestRetryOnRateLimit_zero_max_wait_still_honors_hint pins that the maxWait
+// clamp keeps hint capping intact: with maxWait=0 (clamped to RetryAfterCap) a
+// 5ms RetryAfter hint is honored as min(hint, cap) = 5ms. Before the clamp the
+// same call computed min(5ms, 0) = 0 and logged delay=0s. Swaps slog.Default,
+// so it must not run in parallel.
+func TestRetryOnRateLimit_zero_max_wait_still_honors_hint(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(bufLogger(&buf))
+	defer slog.SetDefault(prev)
+
+	calls := 0
+	err := RetryOnRateLimit(context.Background(), 2, 0, func(_ context.Context) error {
+		calls++
+		if calls == 1 {
+			return &RateLimitError{Msg: "rl", RetryAfter: 5 * time.Millisecond}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RetryOnRateLimit = %v, want nil", err)
+	}
+	if calls != 2 {
+		t.Fatalf("fn calls = %d, want 2", calls)
+	}
+	if !strings.Contains(buf.String(), "delay=5ms") {
+		t.Errorf("retry debug log = %q, want delay=5ms (hint honored under the clamped cap)", buf.String())
 	}
 }
 
