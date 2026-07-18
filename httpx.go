@@ -298,6 +298,25 @@ func SleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// ContextWithDefaultTimeout bounds ctx by def ONLY when ctx carries no
+// deadline; a deadline the caller already set is the authoritative budget
+// and is never undercut (or extended). A def <= 0 means "no default" and
+// leaves ctx unbounded. The returned cancel is always non-nil and must be
+// called (a no-op on the passthrough paths), matching context.WithTimeout's
+// contract.
+//
+// It is the per-request timeout rule for an API client: per-attempt bounds
+// live on the transport (ResponseHeaderTimeout), the total budget is the
+// caller's ctx, and this default applies only when the caller brought no
+// budget of its own. Extracted from the identical requestContext helpers in
+// the plexapi and arrapi client libraries.
+func ContextWithDefaultTimeout(ctx context.Context, def time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok || def <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, def)
+}
+
 // --- Transient classification ---
 
 // IsTransient returns true for errors likely caused by temporary server or
