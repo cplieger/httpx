@@ -195,21 +195,26 @@ func FuzzRedirectPolicyFunc(f *testing.F) {
 		err = policy(req, via)
 
 		if err == nil {
-			// Policy accepted — verify the invariant using the SAME ASCII
-			// case-normalization the policy applies (RFC 3986 §6.2.2.1). url.Parse
-			// preserves host case and the policy matches case-insensitively, so the
-			// oracle must lowercase host, allowed host, and suffix identically.
+			// Policy accepted — verify the invariant using the SAME
+			// normalization the policy applies: ASCII case-insensitivity
+			// (RFC 3986 §6.2.2.1) AND normalizeSuffixes' TrimSpace config
+			// hygiene (a suffix like "docker.com " is the caller's typo for
+			// "docker.com", so the policy trims before dot-anchoring; the
+			// oracle must trim identically or it declares a false bypass —
+			// fuzz findings 8530bd888043e0d0 / 9dba641065fc8e1a).
 			lhost := asciiLower(host)
 			if lhost == asciiLower(allowedHost) {
 				return // exact allowed-host match
 			}
-			// Must match the normalized (dot-anchored, ASCII-lowercased) suffix.
-			norm := suffix
+			// Must match the normalized (trimmed, dot-anchored,
+			// ASCII-lowercased) suffix.
+			norm := strings.TrimSpace(suffix)
 			if !strings.HasPrefix(norm, ".") {
 				norm = "." + norm
 			}
 			norm = asciiLower(norm)
-			if !hostMatchesSuffix(lhost, norm) {
+			matched := len(norm) > 1 && hostMatchesSuffix(lhost, norm)
+			if !matched {
 				t.Fatalf("policy accepted host %q but it doesn't match suffix %q or allowedHost %q", host, suffix, allowedHost)
 			}
 		}
