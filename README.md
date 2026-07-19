@@ -143,7 +143,6 @@ Shared by both loop doors (`Option`): `WithMaxAttempts`, `WithBaseDelay`, `WithL
 
 - `NewClient(timeout)` — simple client with the same-host `DefaultRedirectPolicy` preinstalled.
 - `NewRetryClient(base, policy, cfg)` — retrying client; `policy` is **required** (nil panics — a nil `CheckRedirect` would silently mean net/http's follow-anywhere default). Sets no `Client.Timeout` (it would cap the whole retry sequence); bound totals with a context deadline or `TransportConfig.MaxElapsedTime`, and single attempts on the base transport (e.g. `ResponseHeaderTimeout` on a `CloneDefaultTransport()`).
-- `Close` — drain idle connections.
 
 ### TLS transports
 
