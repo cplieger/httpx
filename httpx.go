@@ -1,9 +1,3 @@
-// Package httpx provides a resilient outbound-HTTP toolkit: transient-error
-// classification, generic typed retry (Do) and a bounded-bytes GET (GetBytes)
-// over one jittered-exponential-backoff loop, a transparent retrying
-// RoundTripper, Retry-After parsing, HTTP status mapping, secret redaction,
-// body draining, custom-CA TLS transports, and a configurable redirect
-// allowlist.
 package httpx
 
 import (
@@ -715,11 +709,6 @@ func NewClient(timeout time.Duration) *http.Client {
 		Timeout:       timeout,
 		CheckRedirect: DefaultRedirectPolicy,
 	}
-}
-
-// Close drains idle connections on the client's transport.
-func Close(c *http.Client) {
-	c.CloseIdleConnections()
 }
 
 // --- Secret redaction ---
