@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -81,7 +82,7 @@ func TestDoConditionalNotModified(t *testing.T) {
 	}
 }
 
-func TestDoConditionalSendsOnlySetValidators(t *testing.T) {
+func TestDoConditionalSendsOnlyValidValidators(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name    string
@@ -93,6 +94,16 @@ func TestDoConditionalSendsOnlySetValidators(t *testing.T) {
 		{name: "etag only", v: Validators{ETag: `"e"`}, wantINM: `"e"`},
 		{name: "last-modified only", v: Validators{LastModified: "yesterday"}, wantIMS: "yesterday"},
 		{name: "both", v: Validators{ETag: `"e"`, LastModified: "yesterday"}, wantINM: `"e"`, wantIMS: "yesterday"},
+		{
+			name: "header-injecting etag not sent",
+			v:    Validators{ETag: "\"e\"\r\nX-Injected: 1", LastModified: "yesterday"},
+			// The poisoned ETag is skipped (the request must SUCCEED as an
+			// unconditional GET, not fail net/http's header-write validation);
+			// the valid Last-Modified beside it still rides.
+			wantIMS: "yesterday",
+		},
+		{name: "control-byte last-modified not sent", v: Validators{LastModified: "bad\x00date"}},
+		{name: "oversized etag not sent", v: Validators{ETag: strings.Repeat("a", maxValidatorBytes+1)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,6 +123,65 @@ func TestDoConditionalSendsOnlySetValidators(t *testing.T) {
 					gotINM, gotIMS, tc.wantINM, tc.wantIMS)
 			}
 		})
+	}
+}
+
+func TestValidatorHygiene(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		in    string
+		valid bool
+	}{
+		{name: "typical quoted etag", in: `"33a64df551425fcc55e4d42a148795d9f25f89d4"`, valid: true},
+		{name: "http date", in: "Mon, 02 Jan 2006 15:04:05 GMT", valid: true},
+		{name: "empty", in: "", valid: true},
+		{name: "htab allowed", in: "a\tb", valid: true},
+		{name: "obs-text high bytes allowed", in: "et\xc3\xa4g", valid: true},
+		{name: "cr rejected", in: "a\rb", valid: false},
+		{name: "lf rejected", in: "a\nb", valid: false},
+		{name: "nul rejected", in: "a\x00b", valid: false},
+		{name: "del rejected", in: "a\x7fb", valid: false},
+		{name: "at cap accepted", in: strings.Repeat("a", maxValidatorBytes), valid: true},
+		{name: "over cap rejected", in: strings.Repeat("a", maxValidatorBytes+1), valid: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := validValidator(tc.in); got != tc.valid {
+				t.Errorf("validValidator(%q) = %v, want %v", tc.in, got, tc.valid)
+			}
+			wantCapture := tc.in
+			if !tc.valid {
+				wantCapture = ""
+			}
+			if got := captureValidator(tc.in); got != wantCapture {
+				t.Errorf("captureValidator(%q) = %q, want %q", tc.in, got, wantCapture)
+			}
+		})
+	}
+}
+
+func TestDoConditionalDropsOversizedCapturedValidator(t *testing.T) {
+	t.Parallel()
+	const lm = "Mon, 02 Jan 2006 15:04:05 GMT"
+	oversized := `"` + strings.Repeat("a", maxValidatorBytes) + `"`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("ETag", oversized)
+		w.Header().Set("Last-Modified", lm)
+		_, _ = w.Write([]byte("payload"))
+	}))
+	t.Cleanup(srv.Close)
+
+	res, err := DoConditional(srv.Client(), newConditionalReq(t, srv.URL), Validators{}, 0)
+	if err != nil {
+		t.Fatalf("DoConditional: %v", err)
+	}
+	if res.Validators.ETag != "" {
+		t.Errorf("Validators.ETag = %q, want empty for an over-cap upstream value", res.Validators.ETag)
+	}
+	if res.Validators.LastModified != lm {
+		t.Errorf("Validators.LastModified = %q, want %q kept beside the dropped ETag", res.Validators.LastModified, lm)
 	}
 }
 
