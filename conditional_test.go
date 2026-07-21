@@ -266,13 +266,72 @@ func TestDoConditionalOversizedBodyFailsLoud(t *testing.T) {
 	}
 }
 
-func TestDoConditionalTransportErrorPassesThrough(t *testing.T) {
+// TestDoConditionalTransportErrorRedacted pins the door's redaction contract:
+// a transport error is reduced via LogSafeError, so the *url.Error's embedded
+// request URL (query secrets included) never reaches caller error text, while
+// the underlying cause stays classifiable for composition with Do.
+func TestDoConditionalTransportErrorRedacted(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	srv.Close() // refuse the connection
-	_, err := DoConditional(http.DefaultClient, newConditionalReq(t, srv.URL), Validators{}, 0)
+	_, err := DoConditional(http.DefaultClient, newConditionalReq(t, srv.URL+"/?apikey=hunter2"), Validators{}, 0)
 	if err == nil {
 		t.Fatal("err = nil, want a transport error from a closed server")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("error text %q leaks the query secret; want the LogSafeError reduction", err)
+	}
+	if !IsTransient(err) {
+		t.Errorf("IsTransient(%v) = false, want true (connection refused must stay retryable through the reduction)", err)
+	}
+}
+
+// TestDoConditionalOwnsConditionalHeaders pins that DoConditional clears any
+// pre-existing If-None-Match / If-Modified-Since on the caller's request, so v
+// alone decides what is sent: a zero or invalid field means NOT SENT even on a
+// reused request, never a stale (or poisoned) leftover replayed behind the
+// caller's back.
+func TestDoConditionalOwnsConditionalHeaders(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		v       Validators
+		wantINM string
+		wantIMS string
+	}{
+		{name: "zero validators clear pre-existing headers", v: Validators{}},
+		{
+			name: "invalid replay field clears its pre-existing header",
+			v:    Validators{ETag: "\"e\"\r\nX-Injected: 1", LastModified: "bad\x00date"},
+		},
+		{
+			name:    "valid validators override pre-existing headers",
+			v:       Validators{ETag: `"fresh"`, LastModified: "today"},
+			wantINM: `"fresh"`,
+			wantIMS: "today",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var gotINM, gotIMS string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotINM = r.Header.Get("If-None-Match")
+				gotIMS = r.Header.Get("If-Modified-Since")
+				_, _ = w.Write([]byte("x"))
+			}))
+			t.Cleanup(srv.Close)
+			req := newConditionalReq(t, srv.URL)
+			req.Header.Set("If-None-Match", `"stale"`)
+			req.Header.Set("If-Modified-Since", "long ago")
+			if _, err := DoConditional(srv.Client(), req, tc.v, 0); err != nil {
+				t.Fatalf("DoConditional: %v", err)
+			}
+			if gotINM != tc.wantINM || gotIMS != tc.wantIMS {
+				t.Errorf("sent (If-None-Match=%q, If-Modified-Since=%q), want (%q, %q)",
+					gotINM, gotIMS, tc.wantINM, tc.wantIMS)
+			}
+		})
 	}
 }
 

@@ -35,9 +35,11 @@ type ConditionalResult struct {
 	NotModified bool
 }
 
-// DoConditional executes req as a single conditional request: it sets
-// If-None-Match / If-Modified-Since from v (an empty field is not sent),
-// performs the request on client, and classifies the response.
+// DoConditional executes req as a single conditional request: it owns both
+// conditional headers — any pre-existing If-None-Match / If-Modified-Since on
+// req is removed, then each is set from v (an empty field is not sent), so v
+// alone decides what is replayed — performs the request on client, and
+// classifies the response.
 //
 //   - 304 -> NotModified=true (body drained and closed; Validators zero — keep
 //     the ones you sent).
@@ -49,6 +51,12 @@ type ConditionalResult struct {
 //     transient for 502/503/504), or a plain non-transient error for a status
 //     that is neither usable content nor a revalidation (a 204, a 3xx from a
 //     redirect-refusing client). The body is always closed.
+//
+// A transport error from the request itself is reduced via LogSafeError
+// before it is returned: a *url.Error embeds the full request URL, so the
+// reduction keeps query-string secrets out of caller error text (the same
+// contract GetBytes applies to every error it returns), while preserving the
+// cause for transient classification when composed with Do.
 //
 // It is deliberately a SINGLE attempt so the caller owns the retry and cache
 // policy: wrap it in Do (transient classification composes through the
@@ -72,6 +80,8 @@ func DoConditional(client *http.Client, req *http.Request, v Validators, maxBody
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = DefaultMaxBodyBytes
 	}
+	req.Header.Del("If-None-Match")
+	req.Header.Del("If-Modified-Since")
 	if v.ETag != "" && validValidator(v.ETag) {
 		req.Header.Set("If-None-Match", v.ETag)
 	}
@@ -81,7 +91,7 @@ func DoConditional(client *http.Client, req *http.Request, v Validators, maxBody
 	//nolint:bodyclose,gosec // bodyclose: closed on every path below (ReadLimitedBody on 200, DrainClose otherwise); G704: the request is caller-built, so URL/SSRF policy is the caller's, as at every httpx entry point
 	resp, err := client.Do(req)
 	if err != nil {
-		return ConditionalResult{}, err
+		return ConditionalResult{}, LogSafeError(err)
 	}
 	switch resp.StatusCode {
 	case http.StatusNotModified:
