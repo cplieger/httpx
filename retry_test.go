@@ -16,7 +16,7 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/cplieger/httpx/v3"
+	"github.com/cplieger/httpx/v4"
 )
 
 // bufLogger returns a debug-level text logger writing into buf.
@@ -107,6 +107,32 @@ func TestGetBytes_non_followed_3xx_is_status_error(t *testing.T) {
 	}
 	if se.Code != http.StatusMovedPermanently {
 		t.Errorf("StatusError.Code = %d, want 301", se.Code)
+	}
+}
+
+// TestGetBytes_sub_200_is_status_error guards the v4 delegation: getAttempt no
+// longer restates the 2xx band, it asks CheckHTTPStatus, so this pins that a
+// status BELOW 200 is still a permanent *StatusError and not a body read. Only a
+// fake transport can produce a bare 1xx response (net/http resolves a real
+// 100-continue itself), and without this test a future loosening of the
+// classifier's low edge would silently make GetBytes return an informational
+// response's bytes as content.
+func TestGetBytes_sub_200_is_status_error(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusContinue,
+			Body:       io.NopCloser(strings.NewReader("not a result")),
+			Header:     http.Header{},
+		}, nil
+	})}
+
+	body, err := httpx.GetBytes(t.Context(), client, "http://example.test/informational", shortOpts()...)
+	if body != nil {
+		t.Errorf("body = %q, want nil (a 1xx carries no result)", body)
+	}
+	var se *httpx.StatusError
+	if !errors.As(err, &se) || se.Code != http.StatusContinue {
+		t.Fatalf("err = %v (%T), want *httpx.StatusError{100}", err, err)
 	}
 }
 
