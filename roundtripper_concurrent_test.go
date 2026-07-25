@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v3"
+	"github.com/cplieger/httpx/v4"
 )
 
 // TestRetryRoundTripper_does_not_mutate_caller_request verifies the

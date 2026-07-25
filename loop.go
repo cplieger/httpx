@@ -370,9 +370,13 @@ func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opt
 //     CWE-532 hardening the RoundTripper path does not perform;
 //   - rich per-attempt slog logging plus the "retries exhausted after %s: %w"
 //     wrapper, which the RoundTripper exposes only as an OnRetry hook;
-//   - classification of every 5xx (not just 502/503/504) as retryable and of
-//     any non-2xx (3xx included) as a permanent *StatusError. A 2xx response
-//     returns the body; GetBytes cannot surface a redirect, so 3xx is an error.
+//   - classification of every 5xx (not just 502/503/504) as retryable, and of
+//     every non-2xx as a permanent *StatusError carrying the request URL (the
+//     2xx success band is CheckHTTPStatus's, delegated to since v4; only the
+//     error value differs, because this door's errors render a redacted URL).
+//     A 3xx reaches here only when the client refuses redirects, and is an
+//     error: the redirect stub is not the requested resource and GetBytes
+//     cannot surface Location.
 //
 // Routing GetBytes through RoundTrip would silently change one or more of
 // these, so the loop is intentionally not merged.
@@ -448,13 +452,14 @@ func getAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *ge
 		DrainClose(resp.Body)
 		return nil, ra, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}
 	}
-	// Success is any 2xx. GetBytes returns the body bytes, so a 3xx (which
-	// reaches here only when the client is configured not to follow redirects)
-	// is a permanent *StatusError: the redirect stub is not the requested
-	// resource and GetBytes cannot surface Location. Intentional divergence
-	// from CheckHTTPStatus, a general error-classifier that treats 3xx as
-	// non-error.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	// Success is any 2xx. Everything else is a permanent failure for this
+	// door: it returns body bytes, and a redirect stub or an error page is not
+	// the requested resource. Since v4 CheckHTTPStatus draws the same line
+	// (nil only for 2xx), so the band decision is delegated to it rather than
+	// restated here — the one thing GetBytes substitutes is the error VALUE:
+	// its *StatusError carries the request URL (rendered redacted), which
+	// consumers type-assert on, where the classifier's errors are URL-less.
+	if CheckHTTPStatus(resp) != nil {
 		DrainClose(resp.Body)
 		return nil, 0, &StatusError{Code: resp.StatusCode, URL: reqURL}
 	}

@@ -2,14 +2,16 @@ package httpx_test
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v3"
+	"github.com/cplieger/httpx/v4"
 )
 
 func redirectReq(host string) *http.Request {
@@ -392,6 +394,331 @@ func TestDockerGitHubRedirectPolicy_scheme_downgrade_refused(t *testing.T) {
 func TestRefuseAllRedirects_identity(t *testing.T) {
 	if err := httpx.RefuseAllRedirects(redirectReq("anywhere.example"), redirectVia(3)); !errors.Is(err, http.ErrUseLastResponse) {
 		t.Errorf("RefuseAllRedirects = %v, want http.ErrUseLastResponse", err)
+	}
+}
+
+// TestRefuseAllRedirects_surfaced_3xx_is_a_CheckHTTPStatus_error closes the
+// loop the v4 strict window exists for: the response RefuseAllRedirects hands
+// back carries a nil error, so the caller's status handling is the only thing
+// standing between an unfollowed redirect and a "success". Since v4
+// CheckHTTPStatus reports it as *HTTPStatusError; under the old 200-399 window
+// it returned nil and the redirect stub passed as a completed request.
+func TestRefuseAllRedirects_surfaced_3xx_is_a_CheckHTTPStatus_error(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/hop", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: httpx.RefuseAllRedirects}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, http.NoBody)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	statusErr := httpx.CheckHTTPStatus(resp)
+	var se *httpx.HTTPStatusError
+	if !errors.As(statusErr, &se) || se.Code != http.StatusFound {
+		t.Fatalf("CheckHTTPStatus(surfaced 302) = %v, want *HTTPStatusError{302}", statusErr)
+	}
+	if httpx.IsTransient(statusErr) {
+		t.Error("IsTransient(surfaced 302) = true, want false")
+	}
+}
+
+// methodReq builds a redirect-target request carrying a method, for the
+// WithPreserveMethod checks (the other helpers leave Method empty).
+func methodReq(t *testing.T, method, rawURL string) *http.Request {
+	t.Helper()
+	r := reqTo(t, rawURL)
+	r.Method = method
+	return r
+}
+
+// methodVia builds a via chain whose entries carry the given methods, all
+// pointing at rawURL (the origin URL every entry shares in these tests).
+func methodVia(t *testing.T, rawURL string, methods ...string) []*http.Request {
+	t.Helper()
+	via := make([]*http.Request, 0, len(methods))
+	for _, m := range methods {
+		via = append(via, methodReq(t, m, rawURL))
+	}
+	return via
+}
+
+// TestRedirectPolicyFunc_preserveMethod pins the option's decision table at the
+// policy level: a method-changing hop is refused with http.ErrUseLastResponse
+// (so the 3xx surfaces to the caller rather than failing the request), a
+// same-method hop is untouched, an empty Method is read as GET (net/http's own
+// reading), the comparison is against the ORIGINAL request so a 307-then-302
+// chain is caught, and an empty via chain fails closed.
+func TestRedirectPolicyFunc_preserveMethod(t *testing.T) {
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+	const origin = "https://api.example/start"
+	const target = "https://api.example/next"
+	tests := []struct {
+		name      string
+		method    string
+		via       []string
+		wantRefus bool
+	}{
+		{name: "GET chain unchanged", method: http.MethodGet, via: []string{http.MethodGet}},
+		{name: "POST kept through 307/308", method: http.MethodPost, via: []string{http.MethodPost}},
+		{
+			name: "POST downgraded to GET refused", method: http.MethodGet,
+			via: []string{http.MethodPost}, wantRefus: true,
+		},
+		{
+			name: "PUT downgraded to GET refused", method: http.MethodGet,
+			via: []string{http.MethodPut}, wantRefus: true,
+		},
+		{
+			// via[0] is POST, hop 1 kept it (307), hop 2 downgraded it (302):
+			// comparing against via[0] catches it, comparing against the
+			// previous hop would not.
+			name: "307 then 302 refused at the second hop", method: http.MethodGet,
+			via: []string{http.MethodPost, http.MethodPost}, wantRefus: true,
+		},
+		{
+			name: "307 then 307 still allowed", method: http.MethodPost,
+			via: []string{http.MethodPost, http.MethodPost},
+		},
+		{name: "empty origin method reads as GET", method: http.MethodGet, via: []string{""}},
+		{name: "empty target method reads as GET", method: "", via: []string{http.MethodGet}},
+		{
+			name: "empty target method against POST origin refused", method: "",
+			via: []string{http.MethodPost}, wantRefus: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := policy(methodReq(t, tt.method, target), methodVia(t, origin, tt.via...))
+			if tt.wantRefus {
+				if !errors.Is(err, http.ErrUseLastResponse) {
+					t.Errorf("policy(%s via %v) = %v, want http.ErrUseLastResponse", tt.method, tt.via, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("policy(%s via %v) = %v, want nil (method unchanged)", tt.method, tt.via, err)
+			}
+		})
+	}
+}
+
+// TestRedirectPolicyFunc_preserveMethod_empty_via_fails_closed pins the
+// fail-closed branch: with no via chain the original method is unknowable, so
+// the hop is not followed (net/http never calls CheckRedirect this way; a
+// hand-built chain can).
+func TestRedirectPolicyFunc_preserveMethod_empty_via_fails_closed(t *testing.T) {
+	policy := httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("api.example"), httpx.WithPreserveMethod())
+	for _, via := range [][]*http.Request{nil, {}} {
+		err := policy(methodReq(t, http.MethodGet, "https://api.example/next"), via)
+		if err == nil {
+			t.Fatalf("policy(via=%v) = nil, want a refusal (no original method to verify against)", via)
+		}
+		if !errors.Is(err, http.ErrUseLastResponse) {
+			t.Errorf("policy(via=%v) = %v, want http.ErrUseLastResponse", via, err)
+		}
+	}
+}
+
+// TestRedirectPolicyFunc_preserveMethod_precedence pins the ORDER inside the
+// policy: the hop cap, the target allowlist, and the scheme-downgrade guard are
+// the stronger refusals and must win, because they fail the request with a hard
+// error while WithPreserveMethod returns ErrUseLastResponse (a nil-error 3xx the
+// caller must classify). A hop that both leaves the allowlist and changes the
+// method must be reported as the allowlist violation.
+func TestRedirectPolicyFunc_preserveMethod_precedence(t *testing.T) {
+	const origin = "https://api.example/start"
+	tests := []struct {
+		name    string
+		policy  httpx.CheckRedirect
+		target  string
+		via     []string
+		wantMsg string
+	}{
+		{
+			name:    "cross-host refusal wins",
+			policy:  httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("api.example"), httpx.WithPreserveMethod()),
+			target:  "https://evil.example/x",
+			via:     []string{http.MethodPost},
+			wantMsg: "refusing redirect to evil.example",
+		},
+		{
+			name:    "scheme-downgrade refusal wins",
+			policy:  httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod()),
+			target:  "http://api.example/x",
+			via:     []string{http.MethodPost},
+			wantMsg: "refusing scheme downgrade to api.example",
+		},
+		{
+			name:    "hop cap wins",
+			policy:  httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithMaxHops(2), httpx.WithPreserveMethod()),
+			target:  "https://api.example/x",
+			via:     []string{http.MethodPost, http.MethodPost},
+			wantMsg: "too many redirects",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.policy(methodReq(t, http.MethodGet, tt.target), methodVia(t, origin, tt.via...))
+			if err == nil {
+				t.Fatalf("policy = nil, want %q", tt.wantMsg)
+			}
+			if errors.Is(err, http.ErrUseLastResponse) {
+				t.Fatalf("policy = ErrUseLastResponse, want the hard refusal %q to take precedence", tt.wantMsg)
+			}
+			if err.Error() != tt.wantMsg {
+				t.Errorf("policy = %q, want %q", err.Error(), tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestRedirectPolicyFunc_preserveMethod_grants_nothing pins that the option only
+// ever narrows: on its own (no allowlist, no WithSameHost) the policy still
+// refuses every redirect via the fail-closed no-target branch.
+func TestRedirectPolicyFunc_preserveMethod_grants_nothing(t *testing.T) {
+	policy := httpx.RedirectPolicyFunc(httpx.WithPreserveMethod())
+	err := policy(methodReq(t, http.MethodGet, "https://api.example/next"),
+		methodVia(t, "https://api.example/start", http.MethodGet))
+	if err == nil {
+		t.Fatal("WithPreserveMethod alone allowed a redirect; want the no-target refusal")
+	}
+	if err.Error() != "redirects not allowed" {
+		t.Errorf("err = %q, want the no-target refusal", err.Error())
+	}
+}
+
+// preserveMethodChain starts an httptest server that redirects /start to /hop
+// with the given status and records the method /hop was reached with. The
+// returned pointer is nil-safe to read after the request completes.
+func preserveMethodChain(t *testing.T, status int) (srv *httptest.Server, hopMethod *atomic.Pointer[string]) {
+	t.Helper()
+	hopMethod = &atomic.Pointer[string]{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hop", func(w http.ResponseWriter, r *http.Request) {
+		m := r.Method
+		hopMethod.Store(&m)
+		_, _ = w.Write([]byte("hop reached"))
+	})
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/hop", status)
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, hopMethod
+}
+
+// TestWithPreserveMethod_end_to_end drives the option through the real net/http
+// redirect machinery, which is what actually rewrites the method: a POST is
+// downgraded to GET across 301/302/303 (RFC 9110 §15.4 / Go issue 18570) and
+// carried across 307/308. The refused hop must surface the 3xx itself with a
+// nil error (never a rewritten method, never a followed hop), and a GET chain
+// must be unaffected.
+func TestWithPreserveMethod_end_to_end(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		status     int
+		wantHop    bool
+		wantStatus int
+	}{
+		{"POST through 301 refused", http.MethodPost, http.StatusMovedPermanently, false, http.StatusMovedPermanently},
+		{"POST through 302 refused", http.MethodPost, http.StatusFound, false, http.StatusFound},
+		{"POST through 303 refused", http.MethodPost, http.StatusSeeOther, false, http.StatusSeeOther},
+		{"POST through 307 followed", http.MethodPost, http.StatusTemporaryRedirect, true, http.StatusOK},
+		{"POST through 308 followed", http.MethodPost, http.StatusPermanentRedirect, true, http.StatusOK},
+		{"GET through 302 followed", http.MethodGet, http.StatusFound, true, http.StatusOK},
+		{"GET through 307 followed", http.MethodGet, http.StatusTemporaryRedirect, true, http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, hopMethod := preserveMethodChain(t, tt.status)
+			client := srv.Client()
+			client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+
+			var body io.Reader = http.NoBody
+			if tt.method == http.MethodPost {
+				// A *strings.Reader gives NewRequest a GetBody, so a 307/308
+				// can replay the body (without it net/http declines the hop
+				// itself and this test would pass for the wrong reason).
+				body = strings.NewReader("payload")
+			}
+			req, err := http.NewRequestWithContext(t.Context(), tt.method, srv.URL+"/start", body)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v (a refused method-changing hop must surface the 3xx, not fail the request)", err)
+			}
+			defer resp.Body.Close()
+			httpx.Drain(resp.Body)
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			got := hopMethod.Load()
+			if !tt.wantHop {
+				if got != nil {
+					t.Errorf("hop was reached with %s; the method-changing hop must not be followed", *got)
+				}
+				if loc := resp.Header.Get("Location"); loc == "" {
+					t.Error("Location header missing from the surfaced redirect response")
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("hop was never reached, want the redirect followed")
+			}
+			if *got != tt.method {
+				t.Errorf("hop method = %s, want %s (the option never rewrites the method)", *got, tt.method)
+			}
+		})
+	}
+}
+
+// TestWithPreserveMethod_end_to_end_307_then_302 is the chained case through
+// real net/http: the 307 keeps POST (followed), the following 302 downgrades it
+// to GET (refused), so the caller receives the second hop's 302 and the final
+// target is never contacted.
+func TestWithPreserveMethod_end_to_end_307_then_302(t *testing.T) {
+	var endHit atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/end", func(http.ResponseWriter, *http.Request) { endHit.Store(true) })
+	mux.HandleFunc("/mid", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/end", http.StatusFound)
+	})
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/mid", http.StatusTemporaryRedirect)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := srv.Client()
+	client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+"/start", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	httpx.Drain(resp.Body)
+
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("status = %d, want 302 (the second hop's response, surfaced)", resp.StatusCode)
+	}
+	if endHit.Load() {
+		t.Error("final target was contacted; the method-changing second hop must not be followed")
 	}
 }
 

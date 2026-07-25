@@ -225,11 +225,32 @@ func TestDoConditionalStatusMapping(t *testing.T) {
 			},
 		},
 		{
+			// v4: a 3xx now flows through CheckHTTPStatus (which no longer
+			// treats it as success) instead of falling through to the
+			// unexpected-status fallback. A client that refuses redirects
+			// surfaces one here; net/http also hands back a Location-less 3xx
+			// verbatim, which is what this server sends.
+			name: "302 maps to HTTPStatusError", status: http.StatusFound,
+			check: func(t *testing.T, err error) {
+				t.Helper()
+				var se *HTTPStatusError
+				if !errors.As(err, &se) || se.Code != http.StatusFound {
+					t.Errorf("err = %v, want *HTTPStatusError{302}", err)
+				}
+			},
+		},
+		{
 			name: "204 is an unexpected-status error", status: http.StatusNoContent,
 			check: func(t *testing.T, err error) {
 				t.Helper()
 				if err == nil {
 					t.Error("err = nil, want an unexpected-status error for 204")
+				}
+				// The fallback is still reachable in v4, just narrower: a 2xx
+				// that is neither the 200 nor the 304 handled above.
+				var se *HTTPStatusError
+				if errors.As(err, &se) {
+					t.Errorf("err = %T, want the plain unexpected-status error, not a status mapping", err)
 				}
 			},
 		},

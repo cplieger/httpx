@@ -1,6 +1,6 @@
 # httpx
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx/v3.svg)](https://pkg.go.dev/github.com/cplieger/httpx/v3)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx/v4.svg)](https://pkg.go.dev/github.com/cplieger/httpx/v4)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/httpx)](https://github.com/cplieger/httpx/blob/main/go.mod)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/coverage.json)](https://github.com/cplieger/httpx/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/mutation.json)](https://github.com/cplieger/httpx/issues?q=label%3Agremlins-tracker)
@@ -11,7 +11,7 @@
 
 A resilient outbound-HTTP toolkit for Go providing jittered exponential backoff, transient-error classification, Retry-After parsing, HTTP status mapping, secret redaction, body draining, a transparent retrying `http.RoundTripper` with body replay, and a configurable redirect allowlist. Zero dependencies beyond the Go standard library and pgregory.net/rapid (test only).
 
-v3 presents the toolkit as three retry doors sharing one option vocabulary:
+The toolkit presents three retry doors sharing one option vocabulary:
 
 - **`Do[T]`** retries a typed operation you own (any closure returning `(T, error)`).
 - **`GetBytes`** retries an HTTP GET and returns bounded, redaction-safe body bytes.
@@ -19,9 +19,11 @@ v3 presents the toolkit as three retry doors sharing one option vocabulary:
 
 `NewRetryClient` assembles the retrying client (transport + an explicit, required redirect policy) in one call.
 
+v4 tightens what counts as success: `CheckHTTPStatus` returns nil for **2xx only**, so a 3xx surfaced by a non-following redirect policy is now an error (see [Status checking](#status-checking) and [Migrating from v3](#migrating-from-v3)).
+
 ## Install
 
-`go get github.com/cplieger/httpx/v3@latest`
+`go get github.com/cplieger/httpx/v4@latest`
 
 ## Usage
 
@@ -95,6 +97,15 @@ policy := httpx.RedirectPolicyFunc(
     httpx.WithMaxHops(3),
 )
 
+// Refuse a redirect that would change the method (POST -> GET across a
+// 301/302/303) instead of silently re-issuing it as a GET. The refused hop
+// surfaces the 3xx response itself, which CheckHTTPStatus reports as an error.
+policy = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+
+// Status checking: nil for 2xx only. A 3xx (surfaced by a non-following
+// policy) is an error.
+if err := httpx.CheckHTTPStatus(resp); err != nil { /* typed: Auth/RateLimit/HTTPStatus */ }
+
 // Pin a private / self-signed CA as the SOLE trust anchor (verification stays
 // ON, TLS 1.2 minimum). The caller reads the PEM bytes (file, secret, env),
 // keeping the helper I/O-free.
@@ -110,6 +121,22 @@ if httpx.IsTransient(err) { /* safe to retry */ }
 rc := httpx.LimitedBody(resp, 1<<20) // 1 MB cap
 defer rc.Close()
 ```
+
+## Migrating from v3
+
+Two changes, one of them breaking.
+
+| v3 | v4 |
+| --- | --- |
+| `CheckHTTPStatus` returns nil for 200-399 | **BREAKING**: nil for **2xx only**; every other status errors, a 3xx included (`*HTTPStatusError`) |
+| a method-changing redirect hop is followed as a GET | opt in to refusing it with `RedirectPolicyFunc(..., WithPreserveMethod())` (additive, off by default) |
+| `github.com/cplieger/httpx/v3` | `github.com/cplieger/httpx/v4` in `go.mod` and every import |
+
+**What changes:** a 3xx that reaches your code now returns `*HTTPStatusError{Code}` instead of nil.
+
+**Who is affected:** only callers that pair a non-following redirect policy (`RefuseAllRedirects`, or any `CheckRedirect` returning `http.ErrUseLastResponse`) with `CheckHTTPStatus` — a followed redirect never surfaces a 3xx, so a client on `DefaultRedirectPolicy` or an allowlist policy sees no difference. `GetBytes` and the `RetryRoundTripper` are untouched: `GetBytes` already returned a `*StatusError` for a 3xx (it now derives that from the classifier instead of restating the band), and the transport never classified statuses through it. `DoConditional` still errors on a 3xx, but the error is now `*HTTPStatusError{Code}` instead of the plain `unexpected status %d` fallback — a caller matching on that message must switch to `errors.As`.
+
+**What to do:** delete the hand-rolled band check next to the call — a guard like `if resp.StatusCode < 200 || resp.StatusCode >= 300 { ... }` sitting after `CheckHTTPStatus` (written precisely because the classifier accepted 3xx) is now redundant. If a 3xx must stay non-fatal for one call site, check `resp.StatusCode` there instead of widening the classifier back.
 
 ## Migrating from v2
 
@@ -153,7 +180,7 @@ Shared by both loop doors (`Option`): `WithMaxAttempts`, `WithBaseDelay`, `WithL
 
 ### Test helpers (`certtest` subpackage)
 
-The `github.com/cplieger/httpx/v3/certtest` subpackage supplies throwaway self-signed CA material for tests, the companion to `CATransport`. Only `_test.go` files import it, so its certificate-generation code never links into a production binary.
+The `github.com/cplieger/httpx/v4/certtest` subpackage supplies throwaway self-signed CA material for tests, the companion to `CATransport`. Only `_test.go` files import it, so its certificate-generation code never links into a production binary.
 
 - `certtest.SelfSignedCA(tb)`: a fresh self-signed CA certificate, PEM-encoded. Each call generates a new key, so two certs are mutually untrusted (handy for asserting a pin is enforced).
 - `certtest.WriteSelfSignedCA(tb)`: the same certificate written to a `ca.pem` file under `tb.TempDir()`, returning the path.
@@ -170,8 +197,25 @@ The `github.com/cplieger/httpx/v3/certtest` subpackage supplies throwaway self-s
 
 - `IsTransient`: classify errors as transient (retryable); respects `PermanentError`
 - `RetryAfterHint`: an interface (`RetryAfterHint() time.Duration`) an error implements to supply the next retry wait. `Do` honors it when the error is transient and the duration is positive; the implementer must cap the value, since httpx applies no ceiling of its own here.
-- `CheckHTTPStatus`: map an HTTP status to a typed error
+- `CheckHTTPStatus`: map an HTTP status to a typed error; success is 2xx only (see [Status checking](#status-checking))
 - `ParseRetryAfter` / `ParseRetryAfterResponse`: parse a Retry-After header (capped at `RetryAfterCap` / raw)
+
+### Status checking
+
+`CheckHTTPStatus(resp)` returns `nil` for **exactly 2xx** (200-299) and an error for every other status:
+
+| Status | Result |
+| --- | --- |
+| 2xx | `nil` |
+| 3xx | `*HTTPStatusError{Code}` — not transient, not a client or server error |
+| 401 / 403 | `*AuthError` (the message carries `(401)` / `(403)`) |
+| 429 | `*RateLimitError` with the raw, uncapped `Retry-After` hint |
+| other 4xx / 5xx | `*HTTPStatusError{Code}` — transient for 502/503/504 |
+| 1xx | `*HTTPStatusError{Code}` — not a completed response |
+
+The 2xx-only window is a **v4 breaking change** (v3 returned nil for the whole 200-399 band). A 3xx only ever reaches a caller when the client is configured _not_ to follow redirects — `RefuseAllRedirects`, or any `CheckRedirect` returning `http.ErrUseLastResponse`, which net/http hands back as the 3xx response itself with a **nil error**. Under the old window that redirect stub classified as success, so a token-bearing client that deliberately refuses the hop (exactly the client `RefuseAllRedirects` exists for) then treated the unfollowed redirect as a completed request. `CheckHTTPStatus` is the status handling that policy delegates to, and it now reports the 3xx as the failure it is.
+
+A 3xx is deliberately an `*HTTPStatusError` rather than a new type, so it flows through the existing plumbing unchanged: `IsTransient` is false (only 502/503/504 are transient), `IsServerError` and `IsClientError` are both false, and `LogSafeError` and the redaction helpers pass it through (it embeds no URL). There is no second, stricter classifier — this is the only one. See [Migrating from v3](#migrating-from-v3) for the migration.
 
 ### Error Control
 
@@ -194,14 +238,15 @@ The `github.com/cplieger/httpx/v3/certtest` subpackage supplies throwaway self-s
 
 - `Validators{ETag, LastModified}`: the cache validators captured from a previous 200, replayed on the next request
 - `ConditionalResult{Validators, Body, NotModified}`: one conditional-request outcome
-- `DoConditional(client, req, v, maxBodyBytes)`: one conditional attempt; `v` alone decides what is replayed (pre-existing conditional headers are cleared, empty fields unsent). A 304 returns `NotModified` with zero `Validators` (keep the ones you sent); a 200 returns the bounded body plus fresh validators; anything else is an error, with transport errors reduced via `LogSafeError` so no raw URL reaches caller error text. Single-shot by design: wrap it in `Do` for retry, rebuild the request per attempt, persist body and validators together, and send zero `Validators` when the cached body is unusable. Validators are checked in both directions (header field-value grammar, 1 KiB cap): an invalid upstream value is captured as empty and an invalid replayed field is unsent, so a poisoned validator degrades to an unconditional GET and self-heals on the next clean 200. Full semantics in the [godoc](https://pkg.go.dev/github.com/cplieger/httpx/v3#DoConditional).
+- `DoConditional(client, req, v, maxBodyBytes)`: one conditional attempt; `v` alone decides what is replayed (pre-existing conditional headers are cleared, empty fields unsent). A 304 returns `NotModified` with zero `Validators` (keep the ones you sent); a 200 returns the bounded body plus fresh validators; anything else is an error, with transport errors reduced via `LogSafeError` so no raw URL reaches caller error text. Single-shot by design: wrap it in `Do` for retry, rebuild the request per attempt, persist body and validators together, and send zero `Validators` when the cached body is unusable. Validators are checked in both directions (header field-value grammar, 1 KiB cap): an invalid upstream value is captured as empty and an invalid replayed field is unsent, so a poisoned validator degrades to an unconditional GET and self-heals on the next clean 200. Full semantics in the [godoc](https://pkg.go.dev/github.com/cplieger/httpx/v4#DoConditional).
 
 ### Redirect Policies
 
 - `DefaultRedirectPolicy`: same-host-only (used by `NewClient`); refuses a same-host `https`->`http` downgrade, allows an `http`->`https` upgrade.
-- `RefuseAllRedirects`: follows **no** redirect; returns `http.ErrUseLastResponse`, so the client surfaces the 3xx response itself (nil error). The policy for a token-bearing client of an API that issues no redirects: Go forwards custom headers (`X-Plex-Token`, `X-Api-Key`) across redirects, so a hostile 302 would exfiltrate the credential.
+- `RefuseAllRedirects`: follows **no** redirect; returns `http.ErrUseLastResponse`, so the client surfaces the 3xx response itself (nil error) and `CheckHTTPStatus` reports it as an error. The policy for a token-bearing client of an API that issues no redirects: Go forwards custom headers (`X-Plex-Token`, `X-Api-Key`) across redirects, so a hostile 302 would exfiltrate the credential.
 - `DockerGitHubRedirectPolicy`: example allowlist policy for docker.com/github.com.
-- `RedirectPolicyFunc`: build a custom redirect allowlist from functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithSameHost` (also allow the original request's host; the same-origin building block), `WithMaxHops`, and `WithAllowSchemeDowngrade`. Every policy refuses an `https`->`http` downgrade by default, even to an allowlisted or same-host target, so an auth header is never forwarded onto a cleartext hop; an `http`->`https` upgrade is always allowed, and `WithAllowSchemeDowngrade(true)` opts out of the refusal.
+- `RedirectPolicyFunc`: build a custom redirect allowlist from functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithSameHost` (also allow the original request's host; the same-origin building block), `WithMaxHops`, `WithAllowSchemeDowngrade`, and `WithPreserveMethod`. Every policy refuses an `https`->`http` downgrade by default, even to an allowlisted or same-host target, so an auth header is never forwarded onto a cleartext hop; an `http`->`https` upgrade is always allowed, and `WithAllowSchemeDowngrade(true)` opts out of the refusal.
+- `WithPreserveMethod`: **refuses** a hop that would change the request method instead of rewriting the method back. net/http downgrades a POST/PUT/PATCH/DELETE to a GET across a 301/302/303 and drops the body (RFC 9110 §15.4, Go issue 18570); only 307/308 carry the method forward. The refusal returns `http.ErrUseLastResponse`, so the 3xx surfaces to the caller (nil error) and errors under `CheckHTTPStatus` — the same pairing `RefuseAllRedirects` relies on. The comparison is against the **original** request, so a POST kept by a 307 and then downgraded by a 302 is refused at the second hop; an empty `via` chain fails closed. The hop cap, allowlist, and scheme-downgrade refusals (hard errors) keep precedence, and the option grants nothing on its own — with no allowlist and no `WithSameHost` the policy still refuses everything.
 - `CheckRedirect`: the `http.Client.CheckRedirect` function shape as a type alias; every shipped policy is one.
 
 ### Secret Redaction

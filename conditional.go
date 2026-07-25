@@ -46,11 +46,12 @@ type ConditionalResult struct {
 //   - 200 -> the bounded body plus the response's fresh validators. A body over
 //     maxBodyBytes fails loud with *ResponseTooLargeError rather than being
 //     silently truncated; maxBodyBytes <= 0 means DefaultMaxBodyBytes.
-//   - Anything else -> an error: the CheckHTTPStatus mapping for >= 400
-//     (*AuthError, *RateLimitError — non-transient; *HTTPStatusError —
-//     transient for 502/503/504), or a plain non-transient error for a status
-//     that is neither usable content nor a revalidation (a 204, a 3xx from a
-//     redirect-refusing client). The body is always closed.
+//   - Anything else -> an error: the CheckHTTPStatus mapping for every non-2xx
+//     status (*AuthError for 401/403, *RateLimitError for 429,
+//     *HTTPStatusError otherwise — transient only for 502/503/504, and since
+//     v4 that mapping covers a 3xx from a redirect-refusing client too), or a
+//     plain non-transient error for a 2xx that is neither usable content nor a
+//     revalidation (a 204, a 206). The body is always closed.
 //
 // A transport error from the request itself is reduced via LogSafeError
 // before it is returned: a *url.Error embeds the full request URL, so the
@@ -114,6 +115,13 @@ func DoConditional(client *http.Client, req *http.Request, v Validators, maxBody
 		if statusErr := CheckHTTPStatus(resp); statusErr != nil {
 			return ConditionalResult{}, statusErr
 		}
+		// Still reachable, narrower since v4: CheckHTTPStatus now returns nil
+		// only for 2xx, so this fallback covers exactly a 2xx that is neither
+		// the 200 nor the 304 handled above — a 204, a 206, a 201. Those are
+		// successful responses that carry no usable representation for a
+		// conditional GET, so they are a plain non-transient error rather than
+		// a status-mapped one. A 3xx from a redirect-refusing client no longer
+		// lands here; it is now a *HTTPStatusError from the mapping above.
 		return ConditionalResult{}, fmt.Errorf("unexpected status %d on conditional request", resp.StatusCode)
 	}
 }

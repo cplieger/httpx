@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v3"
+	"github.com/cplieger/httpx/v4"
 )
 
 func TestRetryRoundTripper_success_no_retry(t *testing.T) {

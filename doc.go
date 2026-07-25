@@ -48,6 +48,18 @@
 // [ResponseTooLargeError], and the [ErrRateLimited] and [ErrServerError]
 // sentinels.
 //
+// Success is EXACTLY 2xx. [CheckHTTPStatus] returns nil only for [200, 300)
+// and an error for every other status, a 3xx included — the v4 breaking change
+// (v3 accepted the whole 200-399 band as success). A 3xx reaches a caller only
+// under a non-following redirect policy ([RefuseAllRedirects], or any
+// CheckRedirect returning [http.ErrUseLastResponse], which net/http surfaces
+// as the 3xx response itself with a nil error), and the old window reported
+// that redirect stub as success. It is now an *[HTTPStatusError]: still
+// non-transient, still unchanged by the redaction helpers. Migrating from v3:
+// a surfaced 3xx now errors, which affects only callers pairing a
+// non-following policy with [CheckHTTPStatus]; a hand-rolled 2xx band check
+// beside such a call is now redundant and can be deleted.
+//
 // # Retry-After
 //
 // [ParseRetryAfter] and [ParseRetryAfterResponse] parse the header with a
@@ -62,7 +74,7 @@
 // [DockerGitHubRedirectPolicy], or a custom allowlist built with
 // [RedirectPolicyFunc] and [RedirectOption] ([WithAllowedHosts],
 // [WithAllowedSuffixes], [WithSameHost], [WithMaxHops],
-// [WithAllowSchemeDowngrade]).
+// [WithAllowSchemeDowngrade], [WithPreserveMethod]).
 //
 // # TLS transports
 //

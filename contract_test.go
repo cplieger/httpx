@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v3"
+	"github.com/cplieger/httpx/v4"
 )
 
 // === v3 contract: total-attempts semantics, hard body-overflow, bounded

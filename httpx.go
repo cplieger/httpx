@@ -228,11 +228,33 @@ func ParseRetryAfterResponse(resp *http.Response) time.Duration {
 
 // --- Status checking ---
 
-// CheckHTTPStatus maps HTTP error status codes to typed errors.
-// Returns nil for 2xx/3xx. 401/403 → *AuthError, 429 → *RateLimitError,
-// others ≥400 → *HTTPStatusError.
+// CheckHTTPStatus classifies an HTTP response, mapping anything that is not a
+// success to a typed error. Success is EXACTLY 2xx: a status in [200, 300)
+// returns nil and EVERY other status returns an error — 401/403 →
+// *AuthError, 429 → *RateLimitError, and everything else (a 3xx, any other
+// 4xx, any 5xx, and an informational 1xx) → *HTTPStatusError carrying the
+// code.
+//
+// The 2xx-only window is a v4 change; v3 and earlier returned nil for the
+// whole 200-399 band. A 3xx reaches a caller only when the client is
+// configured NOT to follow redirects — [RefuseAllRedirects], or any
+// CheckRedirect returning [http.ErrUseLastResponse], which net/http hands back
+// as the 3xx response itself with a nil error. Under the old window that
+// redirect stub classified as SUCCESS, so a token-bearing client that
+// deliberately refuses the hop then treated the unfollowed redirect as a
+// completed request; this is the "caller's own status handling"
+// [RefuseAllRedirects] delegates to, and it now reports the 3xx as the failure
+// it is. A caller that pairs a non-following policy with its own hand-rolled
+// 2xx band check no longer needs it.
+//
+// A 3xx is deliberately a *HTTPStatusError rather than a new error type or a
+// second classifier, so it flows through the existing plumbing unchanged:
+// [IsTransient] reports false (only 502/503/504 are transient),
+// [HTTPStatusError.IsServerError] and [HTTPStatusError.IsClientError] both
+// report false (a 3xx is neither ≥ 500 nor in [400, 500)), and [LogSafeError]
+// and the redaction helpers pass it through untouched (it embeds no URL).
 func CheckHTTPStatus(resp *http.Response) error {
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
 	switch resp.StatusCode {
@@ -243,10 +265,7 @@ func CheckHTTPStatus(resp *http.Response) error {
 	case http.StatusTooManyRequests:
 		return &RateLimitError{Msg: "rate limited (429)", RetryAfter: ParseRetryAfterResponse(resp)}
 	}
-	if resp.StatusCode >= 400 {
-		return &HTTPStatusError{Code: resp.StatusCode}
-	}
-	return nil
+	return &HTTPStatusError{Code: resp.StatusCode}
 }
 
 // --- Backoff helpers ---
@@ -419,6 +438,7 @@ type redirectCfg struct {
 	maxHops              int
 	sameHost             bool
 	allowSchemeDowngrade bool
+	preserveMethod       bool
 }
 
 // RedirectOption configures a redirect policy created by RedirectPolicyFunc.
@@ -463,6 +483,38 @@ func WithAllowSchemeDowngrade(allow bool) RedirectOption {
 	return func(c *redirectCfg) { c.allowSchemeDowngrade = allow }
 }
 
+// WithPreserveMethod REFUSES a redirect hop that would change the request
+// method, rather than rewriting the method back. net/http downgrades a POST
+// (or PUT/PATCH/DELETE) to a GET across a 301, 302, or 303 and drops the body,
+// per RFC 9110 §15.4 and Go's issue 18570 compatibility rule; only a 307 or 308
+// carries the method and body forward. For an API call whose meaning IS its
+// method, that silent downgrade turns a write into a read against a URL the
+// caller never named, so this option makes the client stop instead.
+//
+// A refused hop returns [http.ErrUseLastResponse], not an error: net/http then
+// hands the caller the 3xx response itself (status, Location header, body open,
+// nil error), exactly as [RefuseAllRedirects] does, and the surfaced 3xx is an
+// error under [CheckHTTPStatus]. The method is never rewritten back to the
+// original — the request is simply not re-sent.
+//
+// The comparison is against the ORIGINAL request (via[0]), so a chain that
+// preserves the method once and changes it later is still refused: a POST
+// through a 307 (method kept) followed by a 302 (method downgraded to GET) is
+// refused at the second hop. A same-method hop (a GET chain, or a POST through
+// a 307/308) is unaffected and still subject to the hop cap, the target
+// allowlist, and the scheme-downgrade rule, which all take precedence — a
+// cross-host or downgrading hop is refused as a hard error even when the
+// method also changes. When via is empty (net/http never does this; a
+// hand-built chain can) the original method is unknowable, so the hop is
+// refused too: the option fails closed.
+//
+// It only ever narrows what a policy follows, so it grants nothing on its own:
+// [RedirectPolicyFunc] with WithPreserveMethod and no allowlist and no
+// [WithSameHost] still refuses every redirect.
+func WithPreserveMethod() RedirectOption {
+	return func(c *redirectCfg) { c.preserveMethod = true }
+}
+
 // asciiLower lowercases only ASCII letters A-Z, leaving every other byte
 // unchanged. Host comparison in RFC 3986 §6.2.2.1 is ASCII case-insensitive;
 // strings.ToLower must NOT be used here because it folds each invalid UTF-8
@@ -500,7 +552,9 @@ func hostMatchesSuffix(host, suffix string) bool {
 // WithSameHost) the original request's own host — and, unless
 // WithAllowSchemeDowngrade is set, the redirect does not downgrade https->http.
 // With no allowlist and no WithSameHost, all redirects are refused. The hop cap
-// is WithMaxHops (default 5).
+// is WithMaxHops (default 5). WithPreserveMethod additionally refuses (via
+// http.ErrUseLastResponse, so the 3xx surfaces to the caller) a hop that would
+// change the request method.
 func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Request) error {
 	cfg := redirectCfg{}
 	for _, o := range opts {
@@ -525,6 +579,7 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 		maxHops:        maxHops,
 		sameHost:       cfg.sameHost,
 		allowDowngrade: cfg.allowSchemeDowngrade,
+		preserveMethod: cfg.preserveMethod,
 	}
 	return rp.check
 }
@@ -538,11 +593,13 @@ type resolvedRedirect struct {
 	maxHops        int
 	sameHost       bool
 	allowDowngrade bool
+	preserveMethod bool
 }
 
 // check implements the CheckRedirect contract for a resolved policy: it caps
 // hops, refuses a target that is neither allowlisted nor (with sameHost) the
-// origin's own host, and refuses a scheme downgrade unless allowed.
+// origin's own host, refuses a scheme downgrade unless allowed, and (with
+// preserveMethod) refuses a method-changing hop.
 func (rp *resolvedRedirect) check(req *http.Request, via []*http.Request) error {
 	if len(via) >= rp.maxHops {
 		return errors.New("too many redirects")
@@ -561,7 +618,39 @@ func (rp *resolvedRedirect) check(req *http.Request, via []*http.Request) error 
 	if !rp.allowDowngrade && origURL != nil && isSchemeDowngrade(origURL.Scheme, req.URL.Scheme) {
 		return fmt.Errorf("refusing scheme downgrade to %s", host)
 	}
+	// Ordered last on purpose: the refusals above are the stronger security
+	// decisions and must keep precedence, because they fail the request with a
+	// hard error while this one returns ErrUseLastResponse (a nil-error 3xx the
+	// caller must classify). A hop that both leaves the allowlist and changes
+	// the method is refused as the allowlist violation it is.
+	if rp.preserveMethod && methodChanged(req, via) {
+		return http.ErrUseLastResponse
+	}
 	return nil
+}
+
+// methodChanged reports whether req's method differs from the ORIGINAL
+// request's (via[0]) — the comparison that also catches a chain whose method
+// survives an early 307 and is downgraded by a later 302. An empty Method is
+// normalized to GET, which is how net/http itself reads it (redirectBehavior
+// rewrites a "" method to "GET" on a 301/302/303 hop), so a hand-built
+// zero-value origin request is not a spurious mismatch. An empty via chain has
+// no original method to compare against and reports true: the caller of this
+// helper fails closed rather than vouching for a hop it cannot verify.
+func methodChanged(req *http.Request, via []*http.Request) bool {
+	if len(via) == 0 {
+		return true
+	}
+	return effectiveMethod(req.Method) != effectiveMethod(via[0].Method)
+}
+
+// effectiveMethod returns the method net/http would use for a request carrying
+// method: an empty Request.Method means GET.
+func effectiveMethod(method string) string {
+	if method == "" {
+		return http.MethodGet
+	}
+	return method
 }
 
 // targetAllowed reports whether host is an allowed redirect target: an exact or
@@ -687,7 +776,9 @@ func DockerGitHubRedirectPolicy(req *http.Request, via []*http.Request) error {
 // 302 (MITM, DNS poisoning) would exfiltrate the credential to an
 // attacker-chosen origin. With the hop refused, the credential never leaves
 // the configured host and the unexpected 3xx surfaces to the caller's own
-// status handling.
+// status handling — which is [CheckHTTPStatus]: since v4 it classifies a 3xx
+// as an error (*HTTPStatusError), so a surfaced redirect stub is reported as
+// the failure it is instead of passing as success.
 func RefuseAllRedirects(*http.Request, []*http.Request) error {
 	return http.ErrUseLastResponse
 }
