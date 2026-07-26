@@ -21,10 +21,19 @@ func TestRedactURL(t *testing.T) {
 			present: []string{"apikey=REDACTED", "cmd=REDACTED", "tautulli.example", "/api/v2"},
 		},
 		{
-			name:    "userinfo password masked, username kept",
+			name:    "userinfo dropped entirely, not just the password",
 			in:      "https://user:hunter2@example.com/path",
-			absent:  []string{"hunter2"},
-			present: []string{"user:xxxxx@", "example.com", "/path"},
+			absent:  []string{"hunter2", "user:"},
+			present: []string{"REDACTED@", "example.com", "/path"},
+		},
+		{
+			// url.Redacted() masks only the password, so a username-only token
+			// (a real credential shape for API endpoints) used to survive
+			// verbatim in every log line this helper is meant to make safe.
+			name:    "username-only token dropped",
+			in:      "https://sk_live_abc123@prowlarr.example/1/api",
+			absent:  []string{"sk_live_abc123"},
+			present: []string{"REDACTED@", "prowlarr.example", "/1/api"},
 		},
 		{
 			name:    "fragment dropped",
