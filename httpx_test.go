@@ -911,3 +911,60 @@ func TestLogSlowUpstream_warns_and_redacts_on_slow_response(t *testing.T) {
 		t.Errorf("slow-upstream log did not redact the query value:\n%s", logged)
 	}
 }
+
+// TestDo_WithExhaustedLevel_demotes_the_terminal_line pins the option for the
+// caller that publishes its own terminal verdict: the per-attempt retry
+// diagnostics stay, and only the exhaustion verdict moves off Warn. Both halves
+// matter, because the alternative a caller reaches for otherwise is silencing the
+// whole logger, which throws the diagnostics away to stop the duplicate line.
+func TestDo_WithExhaustedLevel_demotes_the_terminal_line(t *testing.T) {
+	var buf bytes.Buffer
+	_, err := Do(context.Background(),
+		func(_ context.Context) (string, error) {
+			return "", &HTTPStatusError{Code: 503}
+		},
+		WithMaxAttempts(3), WithBaseDelay(time.Microsecond), WithLabel("lbl"),
+		WithLogger(bufLogger(&buf)), WithExhaustedLevel(slog.LevelDebug))
+	if err == nil {
+		t.Fatal("Do = nil, want exhaustion error")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "failed, retrying") {
+		t.Errorf("per-attempt retry diagnostics lost:\n%s", out)
+	}
+	if !strings.Contains(out, "lbl retries exhausted") {
+		t.Errorf("terminal line missing entirely; it should be demoted, not suppressed:\n%s", out)
+	}
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("terminal line still at WARN despite WithExhaustedLevel(Debug):\n%s", out)
+	}
+}
+
+// TestDo_WithExhaustedLevel_overrides_both_default_rules pins that the option
+// beats BOTH halves of the default rule, in both directions: a multi-attempt
+// budget can be demoted below Warn, and a single-attempt budget (which defaults
+// to Debug so a one-attempt door does not double-report) can be raised to Warn
+// by a caller that wants the verdict there.
+func TestDo_WithExhaustedLevel_overrides_both_default_rules(t *testing.T) {
+	fail := func(_ context.Context) (string, error) { return "", &HTTPStatusError{Code: 503} }
+
+	var multi bytes.Buffer
+	if _, err := Do(context.Background(), fail,
+		WithMaxAttempts(2), WithBaseDelay(time.Microsecond), WithLogger(bufLogger(&multi)),
+		WithExhaustedLevel(slog.LevelInfo)); err == nil {
+		t.Fatal("Do = nil, want exhaustion error")
+	}
+	if strings.Contains(multi.String(), "level=WARN") {
+		t.Errorf("multi-attempt terminal line stayed WARN:\n%s", multi.String())
+	}
+
+	var single bytes.Buffer
+	if _, err := Do(context.Background(), fail,
+		WithMaxAttempts(1), WithLogger(bufLogger(&single)),
+		WithExhaustedLevel(slog.LevelWarn)); err == nil {
+		t.Fatal("Do = nil, want exhaustion error")
+	}
+	if !strings.Contains(single.String(), "level=WARN") {
+		t.Errorf("single-attempt terminal line was not raised to WARN:\n%s", single.String())
+	}
+}

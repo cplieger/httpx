@@ -869,6 +869,17 @@ func redactURL(rawURL string) string {
 	}
 	u.Fragment = ""
 	u.RawFragment = ""
+	// Drop userinfo entirely rather than leaning on url.Redacted(), which masks
+	// only the PASSWORD and preserves the username verbatim. A username-only
+	// token is a real credential shape for API endpoints
+	// (https://token@prowlarr/1/api), so Redacted() alone leaks it into every
+	// log line this helper is supposed to make safe (CWE-532) - and callers
+	// cannot tell, because the function's whole promise is log-safety. Consumers
+	// that pre-scrubbed userinfo before constructing a StatusError can delete
+	// that workaround.
+	if u.User != nil {
+		u.User = url.User("REDACTED")
+	}
 	return u.Redacted()
 }
 

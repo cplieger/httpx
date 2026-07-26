@@ -159,12 +159,12 @@ One option vocabulary replaces v2's three config dialects; two loop doors replac
 ### Retry doors
 
 - `Do[T]`: generic retry with jittered exponential backoff. When a transient error implements `RetryAfterHint`, its pre-capped duration replaces the backoff for the next wait (the exponential base keeps advancing). Rate-limit handling is opt-in per call: `WithRateLimitRetry(maxWait)` adds `*RateLimitError` to the retryable set; `WithRateLimitOnly(maxWait)` retries nothing else. Counts **total** attempts (a non-positive count clamps to 1).
-- `GetBytes`: HTTP GET with exponential backoff on 429/5xx **and transient transport errors** (timeouts, connection resets, DNS failures; see `IsTransient`); 4xx (non-429) and non-transient transport errors return immediately. Honors Retry-After (capped at `RetryAfterCap`). Counts **total** attempts.
+- `GetBytes`: HTTP GET with exponential backoff on 408/429/5xx **and transient transport errors** (timeouts, connection resets, DNS failures; see `IsTransient`); other 4xx and non-transient transport errors return immediately. Honors Retry-After (capped at `RetryAfterCap`). Counts **total** attempts.
 - `NewRetryRoundTripper(base, TransportConfig{...})`: create a retrying `http.RoundTripper`. `TransportConfig{}` is ready to use (3 attempts, 1s base delay, default policy); `MaxAttempts: -1` means exactly one attempt.
 
 ### Loop options
 
-Shared by both loop doors (`Option`): `WithMaxAttempts`, `WithBaseDelay`, `WithLogger`. `Do`-only (`DoOption`): `WithLabel`, `WithRateLimitRetry`, `WithRateLimitOnly`. `GetBytes`-only (`GetOption`): `WithHeaders`, `WithMaxBodyBytes`. Passing an option to the wrong door is a compile error. A non-positive rate-limit `maxWait` falls back to `RetryAfterCap` (60s), so the inter-attempt wait is always positive (never a hot spin); supplying both rate-limit modes is a configuration error.
+Shared by both loop doors (`Option`): `WithMaxAttempts`, `WithBaseDelay`, `WithLogger`, `WithExhaustedLevel`. `Do`-only (`DoOption`): `WithLabel`, `WithRateLimitRetry`, `WithRateLimitOnly`. `GetBytes`-only (`GetOption`): `WithHeaders`, `WithMaxBodyBytes`. Passing an option to the wrong door is a compile error. A non-positive rate-limit `maxWait` falls back to `RetryAfterCap` (60s), so the inter-attempt wait is always positive (never a hot spin); supplying both rate-limit modes is a configuration error.
 
 ### Clients
 
@@ -187,7 +187,7 @@ The `github.com/cplieger/httpx/v4/certtest` subpackage supplies throwaway self-s
 
 ### Transport hooks & policies (`TransportConfig` fields)
 
-- `CheckRetry`: pluggable retry policy, `func(ctx, resp, err) (bool, error)`. The default retries transient transport errors and 429/502/503/504 (deliberately narrower than `GetBytes`, which retries every 5xx).
+- `CheckRetry`: pluggable retry policy, `func(ctx, resp, err) (bool, error)`. The default retries transient transport errors and 429/502/503/504 (deliberately narrower than `GetBytes`, which retries 408 and every 5xx).
 - `OnRetry`: per-attempt callback for observability/metrics (the transport's only seam; it logs nothing itself)
 - `PrepareRetry`: mutate the request before a retry (e.g., re-sign tokens)
 - `MaxElapsedTime`: hard total-time ceiling across retries, including honored Retry-After (checked between attempts)
@@ -263,13 +263,13 @@ A 3xx is deliberately an `*HTTPStatusError` rather than a new type, so it flows 
 
 ## Logging
 
-`Do` and `GetBytes` log via `log/slog` and accept `WithLogger` to override the default logger per call. Per-attempt "retrying" lines are logged at **Debug**; a retry that recovers is normal operation, not a degraded state. Only the terminal "retries exhausted" / "rate limit retries exhausted" lines are at **Warn**. `GetBytes` also emits a **Warn** "slow upstream response" when a single attempt's response takes longer than 10s (timed per attempt, so backoff sleeps are not counted as upstream latency). The `RetryRoundTripper` logs nothing itself; observe its retries through the `OnRetry` hook, where redaction is the caller's responsibility.
+`Do` and `GetBytes` log via `log/slog` and accept `WithLogger` to override the default logger per call. Per-attempt "retrying" lines are logged at **Debug**; a retry that recovers is normal operation, not a degraded state. The terminal "retries exhausted" / "rate limit retries exhausted" lines are at **Warn** — except under `WithMaxAttempts(1)`, where they drop to **Debug**: a one-attempt budget retried nothing, so the door is a single attempt inside the caller's own retry loop, and that loop owns both the retry policy and the warning. `WithExhaustedLevel(level)` overrides that line's level outright, for callers whose own failure log carries strictly more context than the library's can (the tracker, the item, an onset latch): demoting the library's copy keeps one report of one event without discarding the per-attempt Debug diagnostics a discard logger would also throw away. It applies to a multi-attempt budget too, and is the only way to raise the line above Warn. `GetBytes` also emits a **Warn** "slow upstream response" when a single attempt's response takes longer than 10s (timed per attempt, so backoff sleeps are not counted as upstream latency). The `RetryRoundTripper` logs nothing itself; observe its retries through the `OnRetry` hook, where redaction is the caller's responsibility.
 
 ### URL redaction in logs and errors
 
 To avoid leaking credentials into logs (CWE-532, the class of [go-retryablehttp CVE-2024-6104](https://discuss.hashicorp.com/t/hcsec-2024-12-go-retryablehttp-can-leak-basic-auth-credentials-to-log-files/68027)), `GetBytes` never logs or returns a raw request URL:
 
-- Every logged `url` attribute is redacted: the userinfo password is masked (like `url.URL.Redacted`) and query values are replaced with `REDACTED` (query values commonly carry API keys and tokens). Query keys, scheme, host, and path are kept for debugging.
+- Every logged `url` attribute is redacted: the whole userinfo component is replaced with `REDACTED` (stronger than `url.URL.Redacted`, which masks only the password and would leave a username-only API token in the clear) and query values are replaced with `REDACTED` (query values commonly carry API keys and tokens). Query keys, scheme, host, and path are kept for debugging.
 - `StatusError.Error()` renders that same redacted URL, so the secret stays out of returned errors too; the raw `StatusError.URL` field remains available for programmatic use.
 - Transport errors (`*url.Error`, which embed the full URL) are reduced to their underlying cause before logging. The reduction is exported as `LogSafeError` so callers wrapping transport errors into their own messages can apply the same one.
 
@@ -277,7 +277,7 @@ To avoid leaking credentials into logs (CWE-532, the class of [go-retryablehttp 
 
 `GetBytes` and the `RetryRoundTripper` report exhaustion differently; match your error handling to the one you use:
 
-- **`GetBytes`** returns `nil` body and a wrapped error: `retries exhausted after <elapsed>: <lastErr>` (unwrap with `errors.Is`/`errors.As`). A response that overflows `WithMaxBodyBytes` returns `*ResponseTooLargeError` (no body).
+- **`GetBytes`** returns `nil` body and a wrapped error: `retries exhausted after <elapsed>: <lastErr>` (unwrap with `errors.Is`/`errors.As`). A response that overflows `WithMaxBodyBytes` returns `*ResponseTooLargeError` (no body). When the last attempt carried a `Retry-After`, the exhaustion error also implements `RetryAfterHint` with that capped wait, so a caller running `GetBytes` with `WithMaxAttempts(1)` inside its own `Do` loop (the pattern that avoids multiplying the two attempt budgets) still honors the upstream-requested delay instead of falling back to jittered backoff. It deliberately does **not** implement `Transient`: whether an exhausted GET is worth another outer attempt stays the caller's policy.
 - **`RetryRoundTripper`** returns the **last response with a nil error**, even when that response is a retryable 5xx (e.g. a 503), mirroring how a non-retried request behaves. A caller that checks only `err != nil` will treat an exhausted 503 as success, so **inspect `resp.StatusCode` and close the body**. (A budget abort via `MaxElapsedTime` does return an error.)
 
 ## Timeouts and deadlines

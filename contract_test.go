@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -335,4 +336,175 @@ func TestV3_NewRetryClient_wiring(t *testing.T) {
 	if !strings.Contains(errHop.Error(), "refusing redirect") {
 		t.Errorf("redirect error = %v, want the DefaultRedirectPolicy refusal", errHop)
 	}
+}
+
+// TestGetBytesRetriesRequestTimeout pins 408 as a retryable status on the
+// httpx.GetBytes door, beside 429 and 5xx. A 408 is the server reporting that it gave
+// up waiting, which is self-healing, and this door only issues idempotent GETs -
+// so excluding it forced consumers to lose the retry or re-classify the status
+// themselves.
+func TestGetBytesRetriesRequestTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status     int
+		wantCalls  int32
+		wantErrSub string
+	}{
+		"408 retries to exhaustion": {status: http.StatusRequestTimeout, wantCalls: 3, wantErrSub: "retries exhausted"},
+		"429 retries to exhaustion": {status: http.StatusTooManyRequests, wantCalls: 3, wantErrSub: "retries exhausted"},
+		"503 retries to exhaustion": {status: http.StatusServiceUnavailable, wantCalls: 3, wantErrSub: "retries exhausted"},
+		"400 is permanent":          {status: http.StatusBadRequest, wantCalls: 1, wantErrSub: "HTTP 400"},
+		"404 is permanent":          {status: http.StatusNotFound, wantCalls: 1, wantErrSub: "HTTP 404"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+
+			_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
+				httpx.WithMaxAttempts(3), httpx.WithBaseDelay(time.Millisecond),
+				httpx.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+
+			if err == nil {
+				t.Fatalf("httpx.GetBytes() on %d = nil error, want an error", tc.status)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Errorf("error = %q, want substring %q", err, tc.wantErrSub)
+			}
+			if got := calls.Load(); got != tc.wantCalls {
+				t.Errorf("upstream calls = %d, want %d", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
+// TestGetBytesSurfacesRetryAfterHint pins the hint's escape from the loop. A
+// caller running httpx.GetBytes with httpx.WithMaxAttempts(1) inside its own outer retry
+// loop - the sanctioned way to avoid 3x3 attempt amplification - needs the
+// upstream-requested wait, which previously died in the loop's internal
+// overrideWait and left the outer loop on jittered backoff. The exhaustion
+// error now implements httpx.RetryAfterHint, the same interface Do already honors, so
+// the two doors compose. It deliberately does NOT implement Transient: whether
+// to make another outer attempt stays the caller's policy.
+func TestGetBytesSurfacesRetryAfterHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
+		httpx.WithMaxAttempts(1),
+		httpx.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err == nil {
+		t.Fatal("httpx.GetBytes() = nil error, want an error")
+	}
+
+	var hint httpx.RetryAfterHint
+	if !errors.As(err, &hint) {
+		t.Fatalf("error %v does not implement httpx.RetryAfterHint; an outer loop cannot honor the upstream wait", err)
+	}
+	if got := hint.RetryAfterHint(); got != 7*time.Second {
+		t.Errorf("httpx.RetryAfterHint() = %v, want 7s", got)
+	}
+	var statusErr *httpx.StatusError
+	if !errors.As(err, &statusErr) || statusErr.Code != http.StatusTooManyRequests {
+		t.Errorf("error = %v, want it to still unwrap to a 429 *httpx.StatusError", err)
+	}
+	if httpx.IsTransient(err) {
+		t.Error("httpx.IsTransient(exhausted httpx.GetBytes error) = true, want false: outer-retry policy is the caller's")
+	}
+}
+
+// TestGetBytesNoHintWithoutRetryAfter pins the negative: an exhausted httpx.GetBytes
+// with no Retry-After header carries no hint, so an enclosing loop keeps its own
+// backoff progression instead of receiving a zero-valued wait.
+func TestGetBytesNoHintWithoutRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
+		httpx.WithMaxAttempts(1),
+		httpx.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err == nil {
+		t.Fatal("httpx.GetBytes() = nil error, want an error")
+	}
+	var hint httpx.RetryAfterHint
+	if errors.As(err, &hint) && hint.RetryAfterHint() > 0 {
+		t.Errorf("httpx.RetryAfterHint() = %v, want no hint when the upstream sent no Retry-After", hint.RetryAfterHint())
+	}
+}
+
+// TestSingleAttemptTerminalLineIsDebug pins the level of the terminal
+// "retries exhausted" line against the attempt budget, on BOTH doors. A
+// multi-attempt budget that ran out really did exhaust a retry tree the door
+// owns, so it Warns; a one-attempt budget retried nothing, so the door is a
+// single attempt inside the caller's own loop (the sanctioned
+// no-3x3-amplification pattern) and that loop owns the warning. Without the
+// split, every failed attempt of every such consumer emits a library Warn its
+// operator cannot act on - and, on a non-final outer attempt, one that names a
+// degradation which self-heals on the next try.
+func TestSingleAttemptTerminalLineIsDebug(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	// Debug-level handler: the line must be PRESENT either way, so a missing
+	// Warn is distinguishable from a swallowed line.
+	newLog := func(buf *bytes.Buffer) *slog.Logger {
+		return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
+	for name, tc := range map[string]struct {
+		attempts  int
+		wantLevel string
+	}{
+		"one attempt logs Debug":         {attempts: 1, wantLevel: "level=DEBUG"},
+		"multi-attempt budget logs Warn": {attempts: 2, wantLevel: "level=WARN"},
+	} {
+		t.Run("GetBytes/"+name, func(t *testing.T) {
+			var buf bytes.Buffer
+			_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
+				httpx.WithMaxAttempts(tc.attempts),
+				httpx.WithBaseDelay(time.Millisecond),
+				httpx.WithLogger(newLog(&buf)))
+			if err == nil {
+				t.Fatal("httpx.GetBytes() = nil error, want an error")
+			}
+			assertTerminalLine(t, buf.String(), "http retries exhausted", tc.wantLevel)
+		})
+		t.Run("Do/"+name, func(t *testing.T) {
+			var buf bytes.Buffer
+			_, err := httpx.Do(context.Background(),
+				func(context.Context) (struct{}, error) {
+					return struct{}{}, &httpx.HTTPStatusError{Code: http.StatusServiceUnavailable}
+				},
+				httpx.WithMaxAttempts(tc.attempts),
+				httpx.WithBaseDelay(time.Millisecond),
+				httpx.WithLogger(newLog(&buf)))
+			if err == nil {
+				t.Fatal("httpx.Do() = nil error, want an error")
+			}
+			assertTerminalLine(t, buf.String(), "retries exhausted", tc.wantLevel)
+		})
+	}
+}
+
+// assertTerminalLine finds the logged line carrying msg and asserts its level.
+func assertTerminalLine(t *testing.T, logged, msg, wantLevel string) {
+	t.Helper()
+	for line := range strings.SplitSeq(logged, "\n") {
+		if !strings.Contains(line, msg) {
+			continue
+		}
+		if !strings.Contains(line, wantLevel) {
+			t.Errorf("terminal line = %q, want %s", line, wantLevel)
+		}
+		return
+	}
+	t.Errorf("no %q line logged; got:\n%s", msg, logged)
 }

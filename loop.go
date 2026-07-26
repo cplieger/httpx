@@ -51,13 +51,15 @@ const (
 // loopConfig holds the retry-loop settings shared by Do and GetBytes, plus
 // the Do-only fields.
 type loopConfig struct {
-	logger      *slog.Logger
-	label       string
-	baseDelay   time.Duration
-	rlMaxWait   time.Duration
-	maxAttempts int
-	rlMode      rlMode
-	rlConflict  bool
+	logger         *slog.Logger
+	label          string
+	baseDelay      time.Duration
+	rlMaxWait      time.Duration
+	maxAttempts    int
+	exhaustedLvl   slog.Level
+	exhaustedLvlOn bool
+	rlMode         rlMode
+	rlConflict     bool
 }
 
 // getConfig holds GetBytes settings: the shared loop settings plus the
@@ -98,6 +100,29 @@ func (o loggerOption) applyGet(c *getConfig) { o.applyDo(&c.loopConfig) }
 // WithLogger sets the logger for retry diagnostics. Default: slog.Default().
 // A nil logger falls back to the default.
 func WithLogger(l *slog.Logger) Option { return loggerOption{l: l} }
+
+// exhaustedLevelOption implements Option for WithExhaustedLevel.
+type exhaustedLevelOption slog.Level
+
+func (o exhaustedLevelOption) applyDo(c *loopConfig) {
+	c.exhaustedLvl, c.exhaustedLvlOn = slog.Level(o), true
+}
+func (o exhaustedLevelOption) applyGet(c *getConfig) { o.applyDo(&c.loopConfig) }
+
+// WithExhaustedLevel overrides the level of the terminal "retries exhausted"
+// line (see exhaustedLevel for the default rule).
+//
+// It exists for the caller that reports the same terminal failure itself, with
+// more context than this door can have. Such a caller wants the per-attempt
+// retry diagnostics and NOT the verdict: leaving both produces two log lines
+// for one failure, and silencing the whole logger to stop the second throws the
+// diagnostics away with it. Pass slog.LevelDebug to keep the line for diagnosis
+// while the caller's own line carries the alarm.
+//
+// It does not change what is returned, and it does not suppress the line: a
+// level below the logger's threshold simply is not emitted, which is the
+// caller's decision to make.
+func WithExhaustedLevel(l slog.Level) Option { return exhaustedLevelOption(l) }
 
 // labelOption implements DoOption for WithLabel.
 type labelOption string
@@ -280,12 +305,38 @@ func (c *loopConfig) classify(err error) (retryable bool, explicitWait time.Dura
 	return true, retryAfterHintWait(err)
 }
 
-// exhaustedMsg is the terminal Warn message for the configured mode.
+// exhaustedMsg is the terminal message for the configured mode.
 func (c *loopConfig) exhaustedMsg() string {
 	if c.rlMode == rlOnly {
 		return "rate limit retries exhausted"
 	}
 	return c.label + " retries exhausted"
+}
+
+// exhaustedLevel picks the level for a door's terminal failure line. A
+// multi-attempt budget that ran out genuinely exhausted a retry tree this door
+// owns, which is an operator-visible degradation: Warn.
+//
+// A single-attempt budget retried nothing, so there is nothing exhausted to
+// report. WithMaxAttempts(1) is how a caller runs a door as ONE attempt inside
+// its own retry loop (the sanctioned no-3x3-amplification pattern - the same
+// reason the Retry-After hint escapes on the returned error), and that loop owns
+// both the retry policy and the terminal Warn. Warning here too would
+// double-report every such failure and, on the enclosing loop's non-final
+// attempts, announce a degradation that self-healed on the next attempt. Debug
+// keeps the line for diagnosis without the alarm; the error is returned either
+// way, and a non-retryable failure already logs nothing at all - so this also
+// makes a one-attempt door's two failure classes log alike.
+// A caller that publishes its own terminal verdict overrides both rules with
+// WithExhaustedLevel.
+func (c *loopConfig) exhaustedLevel() slog.Level {
+	if c.exhaustedLvlOn {
+		return c.exhaustedLvl
+	}
+	if c.maxAttempts > 1 {
+		return slog.LevelWarn
+	}
+	return slog.LevelDebug
 }
 
 // --- Door 1: Do ---
@@ -303,7 +354,9 @@ func (c *loopConfig) exhaustedMsg() string {
 // failed attempt returns ctx.Err(); under WithRateLimitOnly the final
 // attempt's error wins (the v2 RetryOnRateLimit contract). Logging goes to
 // WithLogger (default slog.Default()): per-attempt lines at Debug, the
-// terminal exhaustion at Warn.
+// terminal exhaustion at Warn - or at Debug when the budget is a single
+// attempt, since nothing was retried and the caller's own loop owns the
+// warning (see exhaustedLevel).
 func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opts ...DoOption) (T, error) {
 	var zero T
 	cfg := newLoopConfig(opts)
@@ -339,7 +392,7 @@ func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opt
 		backoff = SafeDouble(backoff)
 	}
 	if lastErr != nil {
-		cfg.logger.Warn(cfg.exhaustedMsg(),
+		cfg.logger.Log(ctx, cfg.exhaustedLevel(), cfg.exhaustedMsg(),
 			"attempts", cfg.maxAttempts, "error", LogSafeError(lastErr))
 	}
 	return zero, lastErr
@@ -413,10 +466,38 @@ func GetBytes(ctx context.Context, client *http.Client, reqURL string, opts ...G
 			"url", redactURL(reqURL), "attempt", attempt+1, "max", cfg.maxAttempts, "error", LogSafeError(err))
 	}
 	elapsed := time.Since(start)
-	log.Warn("http retries exhausted",
+	log.Log(ctx, cfg.exhaustedLevel(), "http retries exhausted",
 		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", LogSafeError(lastErr))
-	return nil, fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), LogSafeError(lastErr))
+	exhausted := fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), LogSafeError(lastErr))
+	// Carry the last attempt's capped Retry-After out on the returned error.
+	// Without this the hint dies in overrideWait, which only the NEXT iteration
+	// of this loop reads - so a caller running GetBytes with WithMaxAttempts(1)
+	// inside its own outer retry loop (the sanctioned no-3x3-amplification
+	// pattern) silently lost the upstream-requested wait and fell back to
+	// jittered backoff. Do already honors RetryAfterHint on a transient error,
+	// so the two doors now compose: the hint is already capped by
+	// ParseRetryAfter, satisfying the interface's pre-capped contract.
+	if overrideWait > 0 {
+		return nil, &retryAfterError{err: exhausted, hint: overrideWait}
+	}
+	return nil, exhausted
 }
+
+// retryAfterError carries a capped Retry-After hint on GetBytes's exhaustion
+// error so an enclosing retry loop can honor it. It deliberately does NOT
+// implement Transient: whether an exhausted GetBytes is worth another outer
+// attempt is the caller's policy, and claiming transience here would silently
+// widen every existing consumer's retryable set.
+type retryAfterError struct {
+	err  error
+	hint time.Duration
+}
+
+func (e *retryAfterError) Error() string { return e.err.Error() }
+
+func (e *retryAfterError) Unwrap() error { return e.err }
+
+func (e *retryAfterError) RetryAfterHint() time.Duration { return e.hint }
 
 // logSlowUpstream warns when a successful attempt took longer than 10s. Timed
 // per-attempt so the library's own backoff sleeps are not mislabeled as
@@ -445,9 +526,14 @@ func getAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *ge
 		}
 		return nil, 0, &retryableError{err: err}
 	}
-	// 429 and 5xx are both retryable and handled identically (both honor a
-	// capped Retry-After); one guard avoids two byte-identical copies.
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+	// 408, 429 and 5xx are all retryable and handled identically (each honors a
+	// capped Retry-After); one guard avoids three byte-identical copies. A 408
+	// Request Timeout is the server reporting that IT gave up waiting, which is
+	// self-healing and safe to repeat on this door (GET is idempotent), so
+	// excluding it forced consumers to either lose the retry or re-classify the
+	// status themselves.
+	if resp.StatusCode == http.StatusRequestTimeout ||
+		resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		ra := ParseRetryAfter(resp.Header.Get("Retry-After"))
 		DrainClose(resp.Body)
 		return nil, ra, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}
