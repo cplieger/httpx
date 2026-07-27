@@ -805,14 +805,15 @@ func NewClient(timeout time.Duration) *http.Client {
 // --- Secret redaction ---
 
 // RedactTransportError unwraps *url.Error and redacts the secret from the
-// error message. Returns nil for nil input.
+// error message. Returns nil for nil input, and never nil for a non-nil one
+// (see urlErrorCause for the *url.Error that carries no cause of its own).
 func RedactTransportError(err error, prefix, secret string) error {
 	if err == nil {
 		return nil
 	}
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
-		err = urlErr.Err
+		err = urlErrorCause(urlErr)
 	}
 	var wrapped error
 	if prefix == "" {
@@ -885,9 +886,10 @@ func redactURL(rawURL string) string {
 
 // LogSafeError returns an error whose message is safe to log. A transport
 // *url.Error embeds the full request URL (with any userinfo/query secrets), so
-// it is reduced to its underlying cause. Nil returns nil; *StatusError already
-// renders a redacted URL via Error(), so it (and everything else) passes
-// through unchanged — preserving errors.Is/As chains for callers.
+// it is reduced to its underlying cause. Nil returns nil, and a non-nil error
+// NEVER reduces to nil (see urlErrorCause); *StatusError already renders a
+// redacted URL via Error(), so it (and everything else) passes through
+// unchanged — preserving errors.Is/As chains for callers.
 //
 // httpx applies this reduction to every transport error it logs or wraps; it
 // is exported so a caller wrapping transport errors into its own messages can
@@ -899,7 +901,36 @@ func LogSafeError(err error) error {
 	}
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
-		return urlErr.Err
+		return urlErrorCause(urlErr)
 	}
 	return err
+}
+
+// errRequestFailed stands in for the cause of a *url.Error that has none. It
+// is deliberately contentless: an error with no cause has nothing else to
+// report, and the one field such a *url.Error does carry is the URL this
+// package exists to keep out of logs.
+var errRequestFailed = errors.New("request failed")
+
+// urlErrorCause returns the cause the redaction helpers reduce a *url.Error
+// to. That is urlErr.Err for every error net/http builds — it always populates
+// the field. A *url.Error whose Err is nil, or a typed-nil *url.Error (which
+// errors.As binds just as happily, and whose field access would panic), has no
+// cause to hand back, and both answers a reader might expect are wrong there:
+//
+//   - nil would turn a non-nil failure into "no error". Do logs every attempt
+//     error as "error", LogSafeError(err), so the diagnostic would vanish from
+//     the retry and exhaustion lines at exactly the moment it is needed, and a
+//     consumer that returns the reduced value as its own error (the reduction
+//     is exported for that) would report a failure as a success.
+//   - the original *url.Error would render its raw URL — the CWE-532 leak the
+//     reduction exists to prevent, and no less a leak for the cause being nil.
+//
+// So this path substitutes a fixed, URL-free stand-in: non-nil, log-safe, and
+// as informative as an error carrying no cause can be.
+func urlErrorCause(urlErr *url.Error) error {
+	if urlErr == nil || urlErr.Err == nil {
+		return errRequestFailed
+	}
+	return urlErr.Err
 }

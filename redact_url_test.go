@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -121,6 +122,54 @@ func TestRedactTransportError_unwraps_url_error_and_drops_url(t *testing.T) {
 	}
 	if !strings.Contains(msg, "connection refused") {
 		t.Errorf("RedactTransportError = %q, want cause preserved", msg)
+	}
+}
+
+// TestReductionNeverNilsAFailure pins the floor under both *url.Error
+// reductions: a NON-nil error never comes back nil. A *url.Error whose Err is
+// nil (net/http never builds one, but errors.As matches whatever a caller
+// hands in) used to reduce to that nil field — so Do logged a failed attempt
+// with an empty "error" value, and a consumer returning the reduced error as
+// its own reported the failure as a success. A typed-nil *url.Error panicked
+// on the same path, and RedactTransportError panicked calling Error() on the
+// nil it had just produced. The stand-in must also carry no part of the URL.
+func TestReductionNeverNilsAFailure(t *testing.T) {
+	t.Parallel()
+	const rawURL = "https://t0ken@webhook.example/api/webhooks/1/s3cr3t?apikey=k3y"
+	leaks := []string{"t0ken", "s3cr3t", "k3y", "webhook.example"}
+
+	var typedNil *url.Error
+	inputs := map[string]error{
+		"nil cause":            &url.Error{Op: "Post", URL: rawURL},
+		"nil cause wrapped":    fmt.Errorf("delivering notification: %w", &url.Error{Op: "Post", URL: rawURL}),
+		"typed-nil *url.Error": typedNil,
+	}
+	// prefix/secret combinations matter: an empty prefix with a non-empty
+	// secret is the shape that panicked (Error() on the nil cause), and an
+	// empty prefix with an empty secret is the LogSafeError-equivalent path.
+	reductions := map[string]func(error) error{
+		"LogSafeError":                    LogSafeError,
+		"RedactTransportError(no prefix)": func(e error) error { return RedactTransportError(e, "", "") },
+		"RedactTransportError(prefix)":    func(e error) error { return RedactTransportError(e, "fetch", "") },
+		"RedactTransportError(secret)":    func(e error) error { return RedactTransportError(e, "", "s3cr3t") },
+		"RedactTransportError(both)":      func(e error) error { return RedactTransportError(e, "fetch", "s3cr3t") },
+		"RedactSecret":                    func(e error) error { return RedactSecret(e, "s3cr3t") },
+	}
+	for inName, in := range inputs {
+		for redName, reduce := range reductions {
+			t.Run(inName+"/"+redName, func(t *testing.T) {
+				t.Parallel()
+				got := reduce(in)
+				if got == nil {
+					t.Fatalf("%s(%s) = nil, want a non-nil error (a nil erases the diagnostic and reads as success)", redName, inName)
+				}
+				for _, leak := range leaks {
+					if strings.Contains(got.Error(), leak) {
+						t.Errorf("%s(%s) leaked %q: %q", redName, inName, leak, got.Error())
+					}
+				}
+			})
+		}
 	}
 }
 
