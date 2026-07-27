@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -42,6 +43,9 @@ func TestIsTransient(t *testing.T) {
 		{"rate limit error", &RateLimitError{Msg: "slow down"}, false},
 		{"deadline exceeded", context.DeadlineExceeded, false},
 		{"canceled", context.Canceled, false},
+		{"attempt timeout", AttemptTimeout(context.DeadlineExceeded), true},
+		{"attempt timeout wrapped by the caller", fmt.Errorf("delivering: %w", AttemptTimeout(context.DeadlineExceeded)), true},
+		{"permanent attempt timeout", Permanent(AttemptTimeout(context.DeadlineExceeded)), false},
 		{"permanent", Permanent(errors.New("nope")), false},
 		{"permanent transient", Permanent(&HTTPStatusError{Code: 503}), false},
 		{"http 502", &HTTPStatusError{Code: 502}, true},

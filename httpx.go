@@ -157,6 +157,70 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &pe)
 }
 
+// --- AttemptTimeout ---
+
+// attemptTimeoutError marks a timeout as the expiry of a bound that governed
+// ONE attempt. It WRAPS the error rather than replacing it, so both things a
+// caller needs survive the mark: the cause that says which phase stalled (a
+// dial, the TLS handshake, the response headers) and the
+// errors.Is(err, context.DeadlineExceeded) match the caller's own callers test
+// for. That match is exactly why IsTransient has to consult this mark before
+// its context-error rejection.
+type attemptTimeoutError struct{ Err error }
+
+func (e *attemptTimeoutError) Error() string { return "attempt timeout: " + e.Err.Error() }
+func (e *attemptTimeoutError) Unwrap() error { return e.Err }
+
+// IsTransient implements Transient: a bound that governed a single attempt
+// expired, which is a retryable failure by construction.
+func (e *attemptTimeoutError) IsTransient() bool { return true }
+
+// AttemptTimeout wraps err to declare that the timeout it reports bounded ONE
+// ATTEMPT rather than the caller's total budget, making it retryable:
+// [IsTransient] reports true for it (checked ahead of the context-error
+// rejection), and the retry doors retry it. Returns nil for nil input. It is
+// the mirror of [Permanent], which forces the opposite verdict.
+//
+// It exists because a context deadline alone cannot express the difference. A
+// caller's expired deadline means "the budget is gone, stop"; the expiry of a
+// per-attempt bound means "this attempt failed, try another" — opposite
+// instructions from the same [context.DeadlineExceeded]. Only the code that
+// installed the bound knows which one it is, so httpx cannot infer it and
+// defaults to the safe reading (terminal). This mark is how the installer says
+// otherwise, and the wrapper deliberately keeps the deadline visible to
+// errors.Is instead of hiding it, which was the only way to opt in before.
+//
+// Reach for it when the per-attempt bound is NOT the retry door's own:
+//
+//   - an [http.Client.Timeout] or a [net/http.Transport] ResponseHeaderTimeout.
+//     net/http's timeout errors match [context.DeadlineExceeded] by design
+//     (net/http.timeoutError.Is), so IsTransient reads them as caller budget
+//     and classifies them terminal — including under the
+//     [RetryRoundTripper]'s default policy. Wrap in a
+//     [TransportConfig].CheckRetry to opt them back in.
+//   - a [context.WithTimeout] a caller derives itself inside a [Do] callback.
+//     [WithAttemptTimeout] does this for you, mark included; hand-roll it only
+//     when the bound must cover something other than one whole attempt.
+//
+// The caller owns the judgment: mark ONLY a bound you installed over a single
+// attempt. Marking a deadline that came from your own caller makes an
+// exhausted budget look retryable, which is the failure mode the default
+// classification prevents. [WithAttemptTimeout] avoids the judgment entirely by
+// deciding from the two contexts it owns.
+func AttemptTimeout(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &attemptTimeoutError{Err: err}
+}
+
+// IsAttemptTimeout reports whether err (or any wrapped error) was marked by
+// [AttemptTimeout] as a per-attempt timeout.
+func IsAttemptTimeout(err error) bool {
+	var ate *attemptTimeoutError
+	return errors.As(err, &ate)
+}
+
 // --- Constants ---
 
 const (
@@ -334,7 +398,10 @@ func ContextWithDefaultTimeout(ctx context.Context, def time.Duration) (context.
 
 // IsTransient returns true for errors likely caused by temporary server or
 // network issues worth retrying. Auth, rate-limit, permanent, and context
-// errors are never transient.
+// errors are never transient — with one exception: a timeout marked by
+// [AttemptTimeout] as the expiry of a bound over ONE attempt (which
+// [WithAttemptTimeout] applies for you) is retryable, because that is the
+// opposite instruction from the same [context.DeadlineExceeded] value.
 func IsTransient(err error) bool {
 	if err == nil {
 		return false
@@ -350,6 +417,18 @@ func IsTransient(err error) bool {
 	if errors.As(err, &rlErr) {
 		return false
 	}
+	// Ordered ahead of the context-error rejection on purpose: the mark exists
+	// on errors that DO match context.DeadlineExceeded (the wrapper keeps the
+	// deadline visible to a caller's errors.Is), so the rejection below would
+	// otherwise decide first and no mark could ever be seen. Permanent still
+	// outranks it above — Permanent(AttemptTimeout(err)) is not retried.
+	if IsAttemptTimeout(err) {
+		return true
+	}
+	// A context error means the CALLER's budget is gone. The mark above is the
+	// only way to say the deadline was an attempt's own, and only code holding
+	// both contexts can tell the difference, which is why nothing here tries to
+	// infer it from the error.
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return false
 	}
