@@ -20,7 +20,7 @@
 //
 //   - [Do]: retry a typed operation fn; you build requests, you keep the
 //     typed result. Options: [Option] and [DoOption] ([WithLabel],
-//     [WithRateLimitRetry], [WithRateLimitOnly]).
+//     [WithAttemptTimeout], [WithRateLimitRetry], [WithRateLimitOnly]).
 //   - [GetBytes]: bounded-bytes GET with redacted diagnostics; the door owns
 //     the request, the body cap, and the close. Options: [Option] and
 //     [GetOption] ([WithHeaders], [WithMaxBodyBytes]).
@@ -42,7 +42,10 @@
 //
 // [IsTransient] decides retryability; extend it for your own error types via
 // the [Transient] and [RetryAfterHint] interfaces. [Permanent] (and
-// [PermanentError], [IsPermanent]) marks an error non-retryable.
+// [PermanentError], [IsPermanent]) marks an error non-retryable;
+// [AttemptTimeout] (and [IsAttemptTimeout]) marks a timeout as the expiry of a
+// bound over ONE attempt, which IS retryable — the only way a context deadline
+// becomes so, applied for you by [WithAttemptTimeout].
 // [CheckHTTPStatus] maps response codes to typed errors: [AuthError],
 // [RateLimitError], [StatusError], [HTTPStatusError],
 // [ResponseTooLargeError], and the [ErrRateLimited] and [ErrServerError]

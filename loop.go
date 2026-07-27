@@ -55,6 +55,7 @@ type loopConfig struct {
 	label          string
 	baseDelay      time.Duration
 	rlMaxWait      time.Duration
+	attemptTimeout time.Duration
 	maxAttempts    int
 	exhaustedLvl   slog.Level
 	exhaustedLvlOn bool
@@ -132,6 +133,40 @@ func (o labelOption) applyDo(c *loopConfig) { c.label = string(o) }
 // WithLabel sets the operation label used in Do's log lines ("<label> failed,
 // retrying", "<label> retries exhausted"). Default: "operation".
 func WithLabel(s string) DoOption { return labelOption(s) }
+
+// attemptTimeoutOption implements DoOption for WithAttemptTimeout.
+type attemptTimeoutOption time.Duration
+
+func (o attemptTimeoutOption) applyDo(c *loopConfig) { c.attemptTimeout = time.Duration(o) }
+
+// WithAttemptTimeout bounds EACH attempt by d and makes that bound's expiry
+// RETRYABLE: the per-attempt (per-try) timeout, as distinct from the caller's
+// total budget. It is the piece that joins a per-attempt deadline to the retry
+// loop; without it a deadline inside fn is classified terminal (see
+// [AttemptTimeout] for why an error alone cannot say otherwise). A
+// non-positive d means no per-attempt bound, which is the option's absence.
+//
+// fn receives a context derived from the caller's with d applied. Context
+// keeps the EARLIER deadline, so a caller deadline nearer than d still governs
+// and the total budget is never extended — d caps one attempt, never the call.
+//
+// The expiry is marked as the attempt's ONLY when the caller's own context is
+// still live, so retrying a caller that is out of budget stays impossible: an
+// expired or canceled caller context is never marked, [Do] returns ctx.Err()
+// before it classifies anything, and [SleepCtx] refuses to wait on a dead
+// context. The decision is made from the two contexts rather than from the
+// error, because a [context.DeadlineExceeded] value is identical either way.
+//
+// The attempt context is canceled as soon as fn returns, so fn must not return
+// a value that still depends on it — read, decode, or drain a response body
+// inside fn (the same rule a caller-derived per-attempt context already
+// imposes).
+//
+// It is a DoOption: [GetBytes] owns its own request and has no callback to
+// bound. Bound that door by running it as one attempt inside Do —
+// GetBytes(ctx, ...) with WithMaxAttempts(1) inside a Do callback carrying this
+// option — the same composition that avoids multiplying two attempt budgets.
+func WithAttemptTimeout(d time.Duration) DoOption { return attemptTimeoutOption(d) }
 
 // rateLimitOption implements DoOption for WithRateLimitRetry and
 // WithRateLimitOnly.
@@ -283,6 +318,45 @@ func resolveWait(explicit, backoff time.Duration) time.Duration {
 	return JitteredBackoff(backoff)
 }
 
+// runAttempt runs one attempt of fn under the configured per-attempt bound
+// (WithAttemptTimeout). With no bound configured fn sees the caller's context
+// unchanged, so the option-absent path is exactly a direct call.
+func runAttempt[T any](ctx context.Context, cfg *loopConfig, fn func(ctx context.Context) (T, error)) (T, error) {
+	if cfg.attemptTimeout <= 0 {
+		return fn(ctx)
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, cfg.attemptTimeout)
+	defer cancel()
+	result, err := fn(attemptCtx)
+	return result, markAttemptTimeout(ctx, attemptCtx, err)
+}
+
+// markAttemptTimeout marks err retryable when THIS attempt's bound is what
+// expired. The three guards are what make the mark safe:
+//
+//   - ctx.Err() == nil: the caller still has budget. If the caller's context is
+//     the one that ended, the deadline is the caller's and stays terminal —
+//     which also covers the case where the caller's deadline is the earlier of
+//     the two and therefore the one the attempt context inherited.
+//   - attemptCtx.Err() != nil: the bound this loop installed actually expired,
+//     rather than some deadline fn holds internally.
+//   - the error reports a deadline: fn may translate its own failure, and the
+//     mark must not claim a deadline for an error that is not one. A timeout
+//     that does NOT match context.DeadlineExceeded (a net.Error i/o timeout,
+//     say) is already transient without any mark.
+//
+// Every ambiguous case therefore resolves to "leave it alone": the mark is
+// applied only when the attempt's own bound is provably the failing one.
+func markAttemptTimeout(ctx, attemptCtx context.Context, err error) error {
+	if err == nil || ctx.Err() != nil || attemptCtx.Err() == nil {
+		return err
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return AttemptTimeout(err)
+}
+
 // classify reports whether err is retryable under the configured mode and the
 // explicit wait to honor (zero means jittered backoff).
 func (c *loopConfig) classify(err error) (retryable bool, explicitWait time.Duration) {
@@ -352,11 +426,12 @@ func (c *loopConfig) exhaustedLevel() slog.Level {
 //
 // Under the default and WithRateLimitRetry modes a context canceled after a
 // failed attempt returns ctx.Err(); under WithRateLimitOnly the final
-// attempt's error wins (the v2 RetryOnRateLimit contract). Logging goes to
-// WithLogger (default slog.Default()): per-attempt lines at Debug, the
-// terminal exhaustion at Warn - or at Debug when the budget is a single
-// attempt, since nothing was retried and the caller's own loop owns the
-// warning (see exhaustedLevel).
+// attempt's error wins (the v2 RetryOnRateLimit contract). WithAttemptTimeout
+// bounds each attempt and makes that bound's expiry retryable, the caller's own
+// deadline staying terminal. Logging goes to WithLogger (default
+// slog.Default()): per-attempt lines at Debug, the terminal exhaustion at Warn
+// - or at Debug when the budget is a single attempt, since nothing was retried
+// and the caller's own loop owns the warning (see exhaustedLevel).
 func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opts ...DoOption) (T, error) {
 	var zero T
 	cfg := newLoopConfig(opts)
@@ -366,7 +441,7 @@ func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opt
 	var lastErr error
 	backoff := cfg.baseDelay
 	for attempt := range cfg.maxAttempts {
-		result, err := fn(ctx)
+		result, err := runAttempt(ctx, &cfg, fn)
 		if err == nil {
 			cfg.logRetrySuccess(attempt)
 			return result, nil
