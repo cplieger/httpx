@@ -165,7 +165,8 @@ func IsPermanent(err error) bool {
 // dial, the TLS handshake, the response headers) and the
 // errors.Is(err, context.DeadlineExceeded) match the caller's own callers test
 // for. That match is exactly why IsTransient has to consult this mark before
-// its context-error rejection.
+// its caller-context rejection — the marked cause typically CARRIES the
+// sentinel, which the rejection reads as terminal.
 type attemptTimeoutError struct{ Err error }
 
 func (e *attemptTimeoutError) Error() string { return "attempt timeout: " + e.Err.Error() }
@@ -190,17 +191,25 @@ func (e *attemptTimeoutError) IsTransient() bool { return true }
 // otherwise, and the wrapper deliberately keeps the deadline visible to
 // errors.Is instead of hiding it, which was the only way to opt in before.
 //
-// Reach for it when the per-attempt bound is NOT the retry door's own:
+// Reach for it when the per-attempt bound is NOT the retry door's own and
+// httpx cannot see whose bound it was:
 //
-//   - an [http.Client.Timeout] or a [net/http.Transport] ResponseHeaderTimeout.
-//     net/http's timeout errors match [context.DeadlineExceeded] by design
-//     (net/http.timeoutError.Is), so IsTransient reads them as caller budget
-//     and classifies them terminal — including under the
-//     [RetryRoundTripper]'s default policy. Wrap in a
-//     [TransportConfig].CheckRetry to opt them back in.
 //   - a [context.WithTimeout] a caller derives itself inside a [Do] callback.
-//     [WithAttemptTimeout] does this for you, mark included; hand-roll it only
-//     when the bound must cover something other than one whole attempt.
+//     Its expiry carries the deadline sentinel, indistinguishable from the
+//     caller's own. [WithAttemptTimeout] does this for you, mark included;
+//     hand-roll it only when the bound must cover something other than one
+//     whole attempt.
+//   - a net-level bound such as a [net.Dialer] Timeout. The net package maps
+//     every expired context onto one shared "i/o timeout" value, so a
+//     *net.OpError or *net.DNSError reporting a deadline cannot say whose it
+//     was and stays terminal (see IsTransient).
+//
+// An [http.Client.Timeout] and a [net/http.Transport] ResponseHeaderTimeout do
+// NOT need the mark: net/http reports those through its own timeout error,
+// which never carries the sentinel, so [IsTransient] already reads them as
+// per-attempt and retries them — including under the [RetryRoundTripper]'s
+// default policy. Use [Permanent] (or a [TransportConfig].CheckRetry) if you
+// want one of them to stop the loop instead.
 //
 // The caller owns the judgment: mark ONLY a bound you installed over a single
 // attempt. Marking a deadline that came from your own caller makes an
@@ -397,11 +406,16 @@ func ContextWithDefaultTimeout(ctx context.Context, def time.Duration) (context.
 // --- Transient classification ---
 
 // IsTransient returns true for errors likely caused by temporary server or
-// network issues worth retrying. Auth, rate-limit, permanent, and context
-// errors are never transient — with one exception: a timeout marked by
-// [AttemptTimeout] as the expiry of a bound over ONE attempt (which
-// [WithAttemptTimeout] applies for you) is retryable, because that is the
-// opposite instruction from the same [context.DeadlineExceeded] value.
+// network issues worth retrying. Auth, rate-limit, permanent, and
+// caller-context errors are never transient.
+//
+// "Caller-context error" is decided by the sentinel actually being in the
+// error's unwrap chain, not by [errors.Is] — net/http's timeout errors match
+// [context.DeadlineExceeded] without carrying it, so an [http.Client.Timeout]
+// and a transport ResponseHeaderTimeout are per-ATTEMPT bounds and ARE
+// transient (see isCallerContextError). A caller's own expired deadline stays
+// terminal; [AttemptTimeout] marks a bound whose expiry this package cannot
+// otherwise tell apart from one.
 func IsTransient(err error) bool {
 	if err == nil {
 		return false
@@ -418,18 +432,18 @@ func IsTransient(err error) bool {
 		return false
 	}
 	// Ordered ahead of the context-error rejection on purpose: the mark exists
-	// on errors that DO match context.DeadlineExceeded (the wrapper keeps the
+	// on errors that DO carry context.DeadlineExceeded (the wrapper keeps the
 	// deadline visible to a caller's errors.Is), so the rejection below would
 	// otherwise decide first and no mark could ever be seen. Permanent still
 	// outranks it above — Permanent(AttemptTimeout(err)) is not retried.
 	if IsAttemptTimeout(err) {
 		return true
 	}
-	// A context error means the CALLER's budget is gone. The mark above is the
-	// only way to say the deadline was an attempt's own, and only code holding
-	// both contexts can tell the difference, which is why nothing here tries to
-	// infer it from the error.
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	// A context error means the CALLER's budget is gone: terminal. Only code
+	// holding both contexts can tell a caller's deadline from a per-attempt
+	// one, which is why nothing here tries to infer it — AttemptTimeout above
+	// is how the code that installed the bound says so.
+	if isCallerContextError(err) {
 		return false
 	}
 	var t Transient
@@ -448,6 +462,75 @@ func IsTransient(err error) bool {
 	}
 	var dnsErr *net.DNSError
 	return errors.As(err, &dnsErr)
+}
+
+// isCallerContextError reports whether err says the CALLER's context expired
+// or was canceled, which is terminal: the budget that authorized the work is
+// gone, so another attempt has nothing to spend.
+//
+// The deadline test is Unwrap-chain IDENTITY, not [errors.Is], because
+// errors.Is is unsound for this question. An error can declare
+// Is(context.DeadlineExceeded) == true without the sentinel ever appearing in
+// its chain, and net/http's own timeout error does exactly that
+// (net/http.timeoutError.Is compares the target to context.DeadlineExceeded
+// and returns true; the value it reports is built from a message string and
+// unwraps to nothing). errors.Is therefore folded the two bounds net/http
+// installs ITSELF — an [http.Client.Timeout] and a [net/http.Transport]
+// ResponseHeaderTimeout, each of which governs ONE attempt — in with caller
+// budget expiry and classified them terminal, so neither was ever retried
+// despite being the per-attempt bound this package tells callers to use.
+// Identity separates them: a real context expiry carries the sentinel VALUE,
+// net/http's timeout only claims to match it.
+//
+// Two carriers keep the old errors.Is verdict deliberately:
+//
+//   - Cancellation. [context.Canceled] is tested with errors.Is because the one
+//     stdlib type that matches it without being it (net.canceledError, "operation
+//     was canceled") is produced ONLY by mapping a genuinely canceled context, so
+//     the match is faithful and identity would lose it.
+//   - A net-package error reporting a deadline. The net package maps EVERY
+//     expired context onto one shared value ("i/o timeout") that likewise
+//     matches the deadline without carrying it, so a *net.OpError or
+//     *net.DNSError reporting a deadline cannot say whose deadline it was: the
+//     caller's, or a net.Dialer.Timeout the transport installed. Unknowable
+//     stays terminal — mark it with [AttemptTimeout] to opt a bound you own
+//     back in. (Through an *http.Client this case does not arise for a caller
+//     deadline: net/http prefers the request context's own error over the dial
+//     error whenever that context is done, so the sentinel is present.)
+func isCallerContextError(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if unwrapsTo(err, context.DeadlineExceeded) {
+		return true
+	}
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	return errors.As(err, &opErr) || errors.As(err, &dnsErr)
+}
+
+// unwrapsTo reports whether target appears in err's unwrap tree BY IDENTITY,
+// consulting no Is method. It is the "is this actually that value" test
+// [errors.Is] cannot express once any error in the chain answers Is for a
+// value it does not hold (see isCallerContextError).
+func unwrapsTo(err, target error) bool {
+	for err != nil {
+		if err == target { //nolint:errorlint // identity is the whole point: errors.Is would consult Is methods.
+			return true
+		}
+		switch x := err.(type) {
+		case interface{ Unwrap() error }:
+			err = x.Unwrap()
+		case interface{ Unwrap() []error }:
+			return slices.ContainsFunc(x.Unwrap(), func(e error) bool { return unwrapsTo(e, target) })
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // --- Body helpers ---
