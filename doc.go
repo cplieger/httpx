@@ -44,8 +44,8 @@
 // the [Transient] and [RetryAfterHint] interfaces. [Permanent] (and
 // [PermanentError], [IsPermanent]) marks an error non-retryable;
 // [AttemptTimeout] (and [IsAttemptTimeout]) marks a timeout as the expiry of a
-// bound over ONE attempt, which IS retryable — the only way a context deadline
-// becomes so, applied for you by [WithAttemptTimeout].
+// bound over ONE attempt, which IS retryable — the only way an error CARRYING
+// a context deadline becomes so, applied for you by [WithAttemptTimeout].
 // [CheckHTTPStatus] maps response codes to typed errors: [AuthError],
 // [RateLimitError], [StatusError], [HTTPStatusError],
 // [ResponseTooLargeError], and the [ErrRateLimited] and [ErrServerError]
