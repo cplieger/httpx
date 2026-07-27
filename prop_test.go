@@ -47,6 +47,60 @@ func TestSafeDouble_property(t *testing.T) {
 	})
 }
 
+// TestReduction_non_nil_input_never_yields_nil_property is the invariant net
+// under the *url.Error reductions across the whole shape space a caller can
+// hand them: any non-nil input yields a non-nil, URL-free error. The unit
+// table (redact_url_test.go) pins the specific shapes that used to return nil
+// or panic; this generates the cause, the wrapping, and the prefix/secret
+// combinations around them. A fuzz target is deliberately not used here — the
+// inputs are error SHAPES, not the byte strings testing.F generates, and
+// FuzzRedactTransportError already fuzzes the text-and-secret half (its
+// signature must stay stable to keep its committed corpus).
+func TestReduction_non_nil_input_never_yields_nil_property(t *testing.T) {
+	t.Parallel()
+	// Distinctive so a coincidental re-formation is impossible; the fuzz
+	// target's rationale for the same sentinel style applies.
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+	rapid.Check(t, func(t *rapid.T) {
+		causes := []error{nil, errRequestFailed, &testError{msg: "dial tcp: connection refused"}}
+		cause := causes[rapid.IntRange(0, len(causes)-1).Draw(t, "cause")]
+		ue := &url.Error{
+			Op:  rapid.SampledFrom([]string{"", "Get", "Post"}).Draw(t, "op"),
+			URL: "https://" + secret + "@host.example/p?token=" + secret,
+			Err: cause,
+		}
+		in := error(ue)
+		if rapid.Bool().Draw(t, "wrapped") {
+			in = &wrapError{msg: rapid.String().Draw(t, "wrapMsg"), err: ue}
+		}
+		prefix := rapid.SampledFrom([]string{"", "fetch"}).Draw(t, "prefix")
+		sec := rapid.SampledFrom([]string{"", secret, "absent"}).Draw(t, "secret")
+
+		results := map[string]error{
+			"LogSafeError":         LogSafeError(in),
+			"RedactTransportError": RedactTransportError(in, prefix, sec),
+		}
+		for name, got := range results {
+			if got == nil {
+				t.Fatalf("%s(non-nil error) = nil (cause=%v prefix=%q secret=%q)", name, cause, prefix, sec)
+			}
+			if strings.Contains(got.Error(), secret) {
+				t.Fatalf("%s leaked the URL secret: %q", name, got.Error())
+			}
+		}
+	})
+}
+
+// wrapError is a minimal %w-style wrapper: the reductions must find a
+// *url.Error through an application's own error, not just at the top.
+type wrapError struct {
+	err error
+	msg string
+}
+
+func (e *wrapError) Error() string { return e.msg + ": " + e.err.Error() }
+func (e *wrapError) Unwrap() error { return e.err }
+
 func FuzzParseRetryAfter(f *testing.F) {
 	f.Add("")
 	f.Add("60")
