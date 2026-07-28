@@ -536,14 +536,49 @@ func unwrapsTo(err, target error) bool {
 // --- Body helpers ---
 
 // Drain reads and discards up to 64 KB of a response body to enable
-// HTTP connection reuse.
+// HTTP connection reuse. A failed drain forfeits only that reuse, and is
+// reported as a bare Debug line on slog.Default(). The read error itself is
+// deliberately NOT logged.
+//
+// That omission is a CWE-532 fix, not an oversight. A body-read error's text is
+// written by the FAR END: net/http renders a malformed chunked trailer as
+//
+//	malformed MIME header: missing colon: "<remote bytes>"
+//
+// and for a consumer whose request URL carries its credential in the PATH (a
+// webhook token is the canonical shape) an edge that echoes the request URI
+// puts that credential in those bytes. Logging it needs only the consumer to be
+// running at Debug — the level an operator raises precisely while diagnosing
+// failing deliveries. Three properties make the site uncloseable from anywhere
+// else, which is why the value is dropped HERE rather than by the caller:
+//
+//   - Nobody can route it. Drain takes no logger (it is called from defer at
+//     consumer call sites and from four sites inside this package, one of them
+//     a RoundTripper that has no logger at all), and the retry doors'
+//     [WithLogger] governs their own loop lines, not slog.Default().
+//   - [LogSafeError] does not reduce it. That boundary is TYPE-based: it strips
+//     the *url.Error envelope this package's own machinery adds. A body-read
+//     error is not a *url.Error — a malformed trailer surfaces as
+//     textproto.ProtocolError, whose entire value IS the message — so the
+//     reduction returns it byte-identically.
+//   - Redaction needs a secret to redact, and Drain is handed none.
+//
+// No diagnosis a caller can act on is lost. Drain runs only where the body is
+// being thrown away, so the response's own outcome is already reported by the
+// path that discarded it (CheckHTTPStatus's typed error, the retry lines,
+// ReadLimitedBody's error); a drain error is never the only signal of a
+// failure, and no caller can repair a drain. This is the same call the package
+// makes in urlErrorCause, which substitutes a contentless stand-in rather than
+// log the one field it holds.
 func Drain(body io.ReadCloser) {
 	if _, err := io.CopyN(io.Discard, body, drainLimit); err != nil && !errors.Is(err, io.EOF) {
-		slog.Debug("failed to drain response body", "error", err)
+		slog.Debug("failed to drain response body")
 	}
 }
 
 // DrainClose reads remaining bytes (up to drainLimit) from rc before closing it.
+// It inherits [Drain]'s logging contract: a failed drain logs a bare Debug line
+// carrying no remote-authored text.
 func DrainClose(rc io.ReadCloser) {
 	Drain(rc)
 	rc.Close()
