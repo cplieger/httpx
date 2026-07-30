@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -154,6 +157,81 @@ func TestCheckHTTPStatus_3xx_classification(t *testing.T) {
 		}
 		if got, want := err.Error(), fmt.Sprintf("HTTP %d", code); got != want {
 			t.Errorf("Error() = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestIsRetryableStatus pins the exported predicate's verdicts: the three
+// self-healing classes the retry loop repeats (408 Request Timeout, 429 Too
+// Many Requests, any 5xx) against the settled answers it does not (2xx, 3xx,
+// and every other 4xx).
+func TestIsRetryableStatus(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		code int
+		want bool
+	}{
+		{"408 Request Timeout", http.StatusRequestTimeout, true},
+		{"429 Too Many Requests", http.StatusTooManyRequests, true},
+		{"500 Internal Server Error", http.StatusInternalServerError, true},
+		{"502 Bad Gateway", http.StatusBadGateway, true},
+		{"503 Service Unavailable", http.StatusServiceUnavailable, true},
+		{"504 Gateway Timeout", http.StatusGatewayTimeout, true},
+		{"599 top of 5xx", 599, true},
+		{"200 OK", http.StatusOK, false},
+		{"204 No Content", http.StatusNoContent, false},
+		{"301 Moved Permanently", http.StatusMovedPermanently, false},
+		{"304 Not Modified", http.StatusNotModified, false},
+		{"400 Bad Request", http.StatusBadRequest, false},
+		{"401 Unauthorized", http.StatusUnauthorized, false},
+		{"403 Forbidden", http.StatusForbidden, false},
+		{"404 Not Found", http.StatusNotFound, false},
+		{"409 Conflict", http.StatusConflict, false},
+		{"499 top of 4xx", 499, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := httpx.IsRetryableStatus(tt.code); got != tt.want {
+				t.Errorf("IsRetryableStatus(%d) = %v, want %v", tt.code, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsRetryableStatus_agrees_with_the_GetBytes_loop is the delegation pin:
+// the exported predicate is the SAME decision the built-in retry makes, so for
+// every status code on the wire the door must retry exactly when the predicate
+// says retryable. It sweeps the whole observable band (100-599) against the
+// door's real behavior — a second attempt is made or it is not — rather than
+// against a second copy of the table, so re-inlining a divergent guard in
+// getAttempt fails here even though the predicate alone would still look right.
+// The >= 500 tail past 599 is shared by construction (one expression, one
+// caller) and is not reachable through a status line net/http will parse.
+func TestIsRetryableStatus_agrees_with_the_GetBytes_loop(t *testing.T) {
+	t.Parallel()
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for code := 100; code <= 599; code++ {
+		var calls atomic.Int32
+		client := &http.Client{
+			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return &http.Response{
+					StatusCode: code,
+					Body:       io.NopCloser(strings.NewReader("body")),
+					Header:     http.Header{},
+				}, nil
+			}),
+		}
+		// Two attempts: a retryable status spends both, a settled one returns
+		// after the first, so the observed call count IS the door's verdict.
+		_, _ = httpx.GetBytes(t.Context(), client, "http://example.com/sweep",
+			httpx.WithMaxAttempts(2), httpx.WithBaseDelay(time.Microsecond), httpx.WithLogger(quiet))
+		retried := calls.Load() == 2
+		if want := httpx.IsRetryableStatus(code); retried != want {
+			t.Errorf("HTTP %d: GetBytes retried = %v, IsRetryableStatus = %v (the door and the predicate must agree)",
+				code, retried, want)
 		}
 	}
 }

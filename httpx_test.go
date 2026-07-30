@@ -485,6 +485,117 @@ func TestPermanentError(t *testing.T) {
 	})
 }
 
+// TestMarkTransient covers the mirror of Permanent: the mark satisfies the
+// Transient interface with a true verdict, keeps the cause visible to
+// errors.Is/errors.As, overrides a non-transient verdict already carried by the
+// wrapped error, and yields to every rejection IsTransient makes on a question
+// the caller is not the authority on.
+func TestMarkTransient(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wraps and unwraps", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New("upstream hiccup")
+		te := MarkTransient(inner)
+		if te == nil {
+			t.Fatal("MarkTransient(non-nil) returned nil")
+		}
+		if te.Error() != "upstream hiccup" {
+			t.Errorf("Error() = %q, want %q", te.Error(), "upstream hiccup")
+		}
+		if !errors.Is(te, inner) {
+			t.Error("errors.Is(te, inner) = false, want true (the cause must stay visible)")
+		}
+	})
+
+	t.Run("nil returns nil", func(t *testing.T) {
+		t.Parallel()
+		if MarkTransient(nil) != nil {
+			t.Error("MarkTransient(nil) should return nil")
+		}
+	})
+
+	t.Run("satisfies the Transient interface", func(t *testing.T) {
+		t.Parallel()
+		var target Transient
+		if !errors.As(MarkTransient(errors.New("x")), &target) {
+			t.Fatal("errors.As(Transient) = false, want true")
+		}
+		if !target.IsTransient() {
+			t.Error("IsTransient() = false, want true")
+		}
+	})
+
+	t.Run("IsTransient reports true, including through a caller wrap", func(t *testing.T) {
+		t.Parallel()
+		if !IsTransient(MarkTransient(errors.New("plain"))) {
+			t.Error("IsTransient(MarkTransient(plain)) = false, want true")
+		}
+		wrapped := fmt.Errorf("fetching titles: %w", MarkTransient(errors.New("plain")))
+		if !IsTransient(wrapped) {
+			t.Error("IsTransient(wrapped mark) = false, want true")
+		}
+	})
+
+	t.Run("overrides a non-transient verdict on the wrapped error", func(t *testing.T) {
+		t.Parallel()
+		// A plain 500 is not transient under the shared policy (only 502/503/504
+		// are). The mark is the outermost verdict, so the caller's knowledge that
+		// this upstream's 500 self-heals wins.
+		plain500 := &HTTPStatusError{Code: 500}
+		if IsTransient(plain500) {
+			t.Fatal("setup: IsTransient(HTTP 500) = true, want false")
+		}
+		if !IsTransient(MarkTransient(plain500)) {
+			t.Error("IsTransient(MarkTransient(HTTP 500)) = false, want true")
+		}
+		var hse *HTTPStatusError
+		if !errors.As(MarkTransient(plain500), &hse) || hse.Code != 500 {
+			t.Error("errors.As(*HTTPStatusError) through the mark failed, want the wrapped status error")
+		}
+	})
+
+	t.Run("IsTransient rejections outrank the mark", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name string
+			err  error
+		}{
+			{"permanent wins", Permanent(MarkTransient(errors.New("stop")))},
+			{"auth error stays terminal", MarkTransient(&AuthError{Msg: "invalid API key (401)"})},
+			{"rate limit stays terminal", MarkTransient(&RateLimitError{Msg: "rate limited (429)"})},
+			{"caller deadline stays terminal", MarkTransient(context.DeadlineExceeded)},
+			{"caller cancellation stays terminal", MarkTransient(context.Canceled)},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				if IsTransient(tc.err) {
+					t.Errorf("IsTransient(%v) = true, want false", tc.err)
+				}
+			})
+		}
+	})
+
+	t.Run("Do retries a marked error", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		_, err := Do(context.Background(), func(_ context.Context) (string, error) {
+			calls++
+			if calls == 1 {
+				return "", MarkTransient(&HTTPStatusError{Code: 500})
+			}
+			return "ok", nil
+		}, WithMaxAttempts(3), WithBaseDelay(time.Millisecond), WithLabel("test"))
+		if err != nil {
+			t.Fatalf("Do = %v, want nil", err)
+		}
+		if calls != 2 {
+			t.Errorf("calls = %d, want 2 (a marked error is retried)", calls)
+		}
+	})
+}
+
 func TestDo_context_deadline_during_backoff_sleep(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)

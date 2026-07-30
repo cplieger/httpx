@@ -199,6 +199,7 @@ The `github.com/cplieger/httpx/v4/certtest` subpackage supplies throwaway self-s
 - `AttemptTimeout(err)` / `IsAttemptTimeout(err)`: mark a timeout as the expiry of a bound over ONE attempt, making it retryable, and test for that mark. The mirror of `Permanent`, and the only way an error that CARRIES `context.DeadlineExceeded` becomes retryable — the mark keeps the deadline visible to `errors.Is(err, context.DeadlineExceeded)` for the caller's own callers. `WithAttemptTimeout` applies it for you (see [Timeouts and deadlines](#timeouts-and-deadlines)).
 - `RetryAfterHint`: an interface (`RetryAfterHint() time.Duration`) an error implements to supply the next retry wait. `Do` honors it when the error is transient and the duration is positive; the implementer must cap the value, since httpx applies no ceiling of its own here.
 - `CheckHTTPStatus`: map an HTTP status to a typed error; success is 2xx only (see [Status checking](#status-checking))
+- `IsRetryableStatus(code)`: does the retry loop treat this status as transient? True for 408, 429, and any 5xx. It is the same rule the built-in retry uses, not a copy of it — `GetBytes`'s attempt function calls this function, so the two cannot drift. For the caller that runs `GetBytes` with `WithMaxAttempts(1)` inside its own retry budget and therefore classifies the returned `*StatusError` itself (see [Nesting a door in your own retry loop](#nesting-a-door-in-your-own-retry-loop)). The `RetryRoundTripper`'s default policy is narrower (429/502/503/504); pass this predicate through `TransportConfig.CheckRetry` to widen it.
 - `ParseRetryAfter` / `ParseRetryAfterResponse`: parse a Retry-After header (capped at `RetryAfterCap` / raw)
 
 ### Status checking
@@ -223,6 +224,27 @@ A 3xx is deliberately an `*HTTPStatusError` rather than a new type, so it flows 
 - `Permanent(err)`: wrap an error to signal "do not retry" (mirrors cenkalti/backoff)
 - `IsPermanent(err)`: check whether an error is wrapped as permanent
 - `PermanentError`: the wrapper type (supports `errors.Is`/`errors.As`/`Unwrap`)
+- `MarkTransient(err)`: wrap an error to signal "retry this" — the mirror of `Permanent`, for a failure your operation knows is self-healing where the shared policy cannot know (a server-side fault delivered inside a 200 envelope, an upstream whose plain 500 always clears). It saves you declaring a one-method `Transient` wrapper, and cannot forget `Unwrap` the way a hand-rolled one does. The mark is the outermost verdict, so it overrides a non-transient verdict already on the error, but `IsTransient`'s standing rejections still win: `Permanent`, an `*AuthError`, a `*RateLimitError` (retry a rate limit by naming a wait budget instead — `WithRateLimitRetry`), and a caller-context error stay terminal. For a per-attempt timeout carrying a deadline, use `AttemptTimeout`.
+
+### Nesting a door in your own retry loop
+
+Running a door with `WithMaxAttempts(1)` inside your own retry loop is the sanctioned way to avoid multiplying the two attempt counts (a 3-attempt door inside a 3-attempt loop is 9 requests). The door then makes no retry decision, so you make it — and the two exported predicates are the door's own rule, so your loop and the built-in one classify identically:
+
+```go
+// One attempt per outer attempt; this loop owns the budget.
+body, err := httpx.GetBytes(ctx, client, url, httpx.WithMaxAttempts(1))
+if err != nil {
+    // A self-healing status is worth another of MY attempts. GetBytes
+    // deliberately does NOT mark its exhaustion error transient: after
+    // WithMaxAttempts(1) that decision is the caller's policy.
+    if se, ok := errors.AsType[*httpx.StatusError](err); ok && httpx.IsRetryableStatus(se.Code) {
+        return httpx.MarkTransient(err)
+    }
+    return err // auth/config failure: terminal, fail on the first attempt
+}
+```
+
+The exhaustion error still implements `RetryAfterHint`, so the upstream's already-capped `Retry-After` survives into the enclosing `Do` and is waited instead of the jittered backoff.
 
 ### Backoff Primitives
 
