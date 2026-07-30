@@ -41,15 +41,18 @@
 // # Classification and error control
 //
 // [IsTransient] decides retryability; extend it for your own error types via
-// the [Transient] and [RetryAfterHint] interfaces. [Permanent] (and
-// [PermanentError], [IsPermanent]) marks an error non-retryable;
+// the [Transient] and [RetryAfterHint] interfaces, or mark one error at a time
+// with [MarkTransient]. [Permanent] (and [PermanentError], [IsPermanent])
+// marks an error non-retryable;
 // [AttemptTimeout] (and [IsAttemptTimeout]) marks a timeout as the expiry of a
 // bound over ONE attempt, which IS retryable — the only way an error CARRYING
 // a context deadline becomes so, applied for you by [WithAttemptTimeout].
 // [CheckHTTPStatus] maps response codes to typed errors: [AuthError],
 // [RateLimitError], [StatusError], [HTTPStatusError],
 // [ResponseTooLargeError], and the [ErrRateLimited] and [ErrServerError]
-// sentinels.
+// sentinels. [IsRetryableStatus] answers the status-code half — the same rule
+// the [GetBytes] loop applies — for a caller running one attempt inside its own
+// retry budget.
 //
 // Success is EXACTLY 2xx. [CheckHTTPStatus] returns nil only for [200, 300)
 // and an error for every other status, a 3xx included — the v4 breaking change

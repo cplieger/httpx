@@ -602,13 +602,11 @@ func getAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *ge
 		return nil, 0, &retryableError{err: err}
 	}
 	// 408, 429 and 5xx are all retryable and handled identically (each honors a
-	// capped Retry-After); one guard avoids three byte-identical copies. A 408
-	// Request Timeout is the server reporting that IT gave up waiting, which is
-	// self-healing and safe to repeat on this door (GET is idempotent), so
-	// excluding it forced consumers to either lose the retry or re-classify the
-	// status themselves.
-	if resp.StatusCode == http.StatusRequestTimeout ||
-		resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+	// capped Retry-After); one guard avoids three byte-identical copies. The set
+	// itself lives in IsRetryableStatus, which is exported so a caller running
+	// this door under WithMaxAttempts(1) inside its own retry budget can ask the
+	// same question rather than restating the table.
+	if IsRetryableStatus(resp.StatusCode) {
 		ra := ParseRetryAfter(resp.Header.Get("Retry-After"))
 		DrainClose(resp.Body)
 		return nil, ra, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}

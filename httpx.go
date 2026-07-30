@@ -157,6 +157,66 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &pe)
 }
 
+// --- Transient marking ---
+
+// transientError wraps an error to declare it retryable. It is unexported
+// because the mark is read through the [Transient] interface (and so through
+// [IsTransient]) rather than by type: a consumer asking "is this retryable"
+// must get the same answer for a marked error and for its own Transient
+// implementation.
+type transientError struct{ Err error }
+
+var _ Transient = (*transientError)(nil)
+
+func (e *transientError) Error() string { return e.Err.Error() }
+func (e *transientError) Unwrap() error { return e.Err }
+
+// IsTransient implements Transient: the caller marked this error retryable.
+func (e *transientError) IsTransient() bool { return true }
+
+// MarkTransient wraps err in a value satisfying the [Transient] interface with
+// a true verdict, so the retry doors treat it as a transient failure. Returns
+// nil for nil input. It is the mirror of [Permanent], which forces the opposite
+// verdict; the name is not the bare adjective only because [Transient] is the
+// interface it satisfies.
+//
+// It exists so a caller widening the retryable set for its own operation does
+// not have to declare a one-method wrapper type to do it. That wrapper is
+// pure boilerplate — an Error, an Unwrap and an IsTransient returning true —
+// and hand-rolling it invites the two mistakes this function cannot make:
+// forgetting Unwrap (which hides the cause from every errors.Is and errors.As
+// the caller's own callers run) and marking a nil error.
+//
+// The mark is the OUTERMOST verdict, so it overrides a non-transient verdict
+// already on the error: MarkTransient(&HTTPStatusError{Code: 500}) is
+// retryable even though a plain 500 is not. Use it for a failure your
+// operation knows is self-healing where the shared policy cannot know — a
+// server-side fault delivered inside a 200 envelope, for example, which no
+// status-based classification can see:
+//
+//	if env := serverFault(body); env != nil {
+//		return httpx.MarkTransient(env) // this clears; spend another attempt
+//	}
+//
+// [IsTransient]'s standing rejections still outrank the mark, because they
+// answer questions the caller is not the authority on:
+//
+//   - [Permanent] wins. Permanent(MarkTransient(err)) is not retried.
+//   - An *[AuthError] and a *[RateLimitError] stay terminal. Credentials do not
+//     fix themselves, and a rate limit is retried by naming a wait budget
+//     ([WithRateLimitRetry], [WithRateLimitOnly]), not by claiming transience.
+//   - A caller-context error stays terminal: the budget that authorized the
+//     work is gone, so another attempt has nothing to spend. For a timeout that
+//     bounded ONE attempt and therefore carries a deadline that is not the
+//     caller's, use [AttemptTimeout] — [IsTransient] consults that mark ahead of
+//     the context rejection, which is the whole reason it is a separate mark.
+func MarkTransient(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &transientError{Err: err}
+}
+
 // --- AttemptTimeout ---
 
 // attemptTimeoutError marks a timeout as the expiry of a bound that governed
@@ -339,6 +399,46 @@ func CheckHTTPStatus(resp *http.Response) error {
 		return &RateLimitError{Msg: "rate limited (429)", RetryAfter: ParseRetryAfterResponse(resp)}
 	}
 	return &HTTPStatusError{Code: resp.StatusCode}
+}
+
+// IsRetryableStatus reports whether a response status is one the retry loop
+// treats as a transient failure worth another attempt: 408 Request Timeout,
+// 429 Too Many Requests, and any 5xx (a code >= 500). Everything else — every
+// 2xx, every 3xx, an informational 1xx, and every other 4xx — is a settled
+// answer this package does not repeat.
+//
+// It is the SAME rule the built-in retry uses, not a restatement of it:
+// [GetBytes]'s own attempt function calls this function to classify a
+// response, so a caller's verdict and the door's verdict cannot disagree.
+//
+// It exists for the caller that runs [GetBytes] under WithMaxAttempts(1)
+// inside its own outer retry budget (the sanctioned way to avoid multiplying
+// the two attempt counts). That caller receives the door's *[StatusError] and
+// owns the retry decision — GetBytes deliberately does not mark its exhaustion
+// error [Transient], because whether an exhausted GET is worth another outer
+// attempt is the caller's policy — so it needs to ask the question the door
+// would have asked:
+//
+//	if se, ok := errors.AsType[*httpx.StatusError](err); ok && httpx.IsRetryableStatus(se.Code) {
+//		return httpx.MarkTransient(err) // spend another of MY attempts
+//	}
+//
+// 408 is included because it is the server reporting that IT gave up waiting,
+// which self-heals and is safe to repeat on an idempotent GET. 429 is here
+// because this door retries a rate limit by default; [Do] does not (its
+// *[RateLimitError] is retryable only under [WithRateLimitRetry] or
+// [WithRateLimitOnly]), so pair this predicate with the door whose policy it
+// describes.
+//
+// The [RetryRoundTripper] is the one deliberate divergence: its default policy
+// retries 429/502/503/504 only, a narrower set than this, so a plain 500 that
+// this predicate calls retryable is not retried by the transport. Widen the
+// transport with [TransportConfig].CheckRetry (this predicate is a ready-made
+// one) rather than assuming the two agree.
+func IsRetryableStatus(code int) bool {
+	return code == http.StatusRequestTimeout ||
+		code == http.StatusTooManyRequests ||
+		code >= 500
 }
 
 // --- Backoff helpers ---
