@@ -41,7 +41,7 @@ func blockUntilDone(attempts *int) func(context.Context) (struct{}, error) {
 func TestWithAttemptTimeout_retries_the_attempt_bound(t *testing.T) {
 	t.Parallel()
 	attempts := 0
-	_, err := httpx.Do(context.Background(), blockUntilDone(&attempts),
+	_, err := httpx.Do(t.Context(), blockUntilDone(&attempts),
 		httpx.WithAttemptTimeout(20*time.Millisecond),
 		httpx.WithMaxAttempts(3),
 		httpx.WithBaseDelay(time.Millisecond),
@@ -76,7 +76,7 @@ func TestWithAttemptTimeout_retries_the_attempt_bound(t *testing.T) {
 // attempt's own by the error value alone.
 func TestWithAttemptTimeout_caller_deadline_stays_terminal(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
 	attempts := 0
 	_, err := httpx.Do(ctx, blockUntilDone(&attempts),
@@ -99,7 +99,7 @@ func TestWithAttemptTimeout_caller_deadline_stays_terminal(t *testing.T) {
 // explicit cancellation, which the attempt context also inherits.
 func TestWithAttemptTimeout_caller_cancel_stays_terminal(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	attempts := 0
 	go func() {
 		time.Sleep(20 * time.Millisecond)
@@ -126,7 +126,7 @@ func TestWithAttemptTimeout_caller_cancel_stays_terminal(t *testing.T) {
 // caller deadline nearer than d still governs the attempt.
 func TestWithAttemptTimeout_never_extends_the_caller_budget(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 	want, _ := ctx.Deadline()
 	_, err := httpx.Do(ctx, func(attemptCtx context.Context) (struct{}, error) {
@@ -148,7 +148,7 @@ func TestWithAttemptTimeout_bounds_each_attempt_independently(t *testing.T) {
 	t.Parallel()
 	var deadlines []time.Time
 	attempts := 0
-	_, _ = httpx.Do(context.Background(), func(attemptCtx context.Context) (struct{}, error) {
+	_, _ = httpx.Do(t.Context(), func(attemptCtx context.Context) (struct{}, error) {
 		attempts++
 		dl, ok := attemptCtx.Deadline()
 		if !ok {
@@ -174,7 +174,7 @@ func TestWithAttemptTimeout_bounds_each_attempt_independently(t *testing.T) {
 func TestWithAttemptTimeout_non_positive_is_no_bound(t *testing.T) {
 	t.Parallel()
 	for _, d := range []time.Duration{0, -time.Second} {
-		_, err := httpx.Do(context.Background(), func(attemptCtx context.Context) (struct{}, error) {
+		_, err := httpx.Do(t.Context(), func(attemptCtx context.Context) (struct{}, error) {
 			if _, ok := attemptCtx.Deadline(); ok {
 				t.Errorf("d=%v: attempt context carries a deadline, want none", d)
 			}
@@ -204,7 +204,7 @@ func TestWithAttemptTimeout_over_a_real_request(t *testing.T) {
 
 	attempts := 0
 	client := srv.Client()
-	_, err := httpx.Do(context.Background(), func(ctx context.Context) (struct{}, error) {
+	_, err := httpx.Do(t.Context(), func(ctx context.Context) (struct{}, error) {
 		attempts++
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 		if reqErr != nil {

@@ -84,7 +84,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 	t.Run("success on first call", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := doRateLimited(context.Background(), 3, 5*time.Second, func(_ context.Context) error {
+		err := doRateLimited(t.Context(), 3, 5*time.Second, func(_ context.Context) error {
 			calls++
 			return nil
 		})
@@ -100,7 +100,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 		t.Parallel()
 		calls := 0
 		wantErr := errors.New("permanent failure")
-		err := doRateLimited(context.Background(), 3, 5*time.Second, func(_ context.Context) error {
+		err := doRateLimited(t.Context(), 3, 5*time.Second, func(_ context.Context) error {
 			calls++
 			return wantErr
 		})
@@ -115,7 +115,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 	t.Run("transient error returns immediately under rate-limit-only mode", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := doRateLimited(context.Background(), 3, 5*time.Second, func(_ context.Context) error {
+		err := doRateLimited(t.Context(), 3, 5*time.Second, func(_ context.Context) error {
 			calls++
 			return &HTTPStatusError{Code: 503}
 		})
@@ -131,7 +131,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 	t.Run("rate-limit error retries", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := doRateLimited(context.Background(), 3, 5*time.Second, func(_ context.Context) error {
+		err := doRateLimited(t.Context(), 3, 5*time.Second, func(_ context.Context) error {
 			calls++
 			if calls < 3 {
 				return &RateLimitError{Msg: "slow", RetryAfter: time.Millisecond}
@@ -149,7 +149,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 	t.Run("exhausts attempts returns last error", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := doRateLimited(context.Background(), 2, 5*time.Second, func(_ context.Context) error {
+		err := doRateLimited(t.Context(), 2, 5*time.Second, func(_ context.Context) error {
 			calls++
 			return &RateLimitError{Msg: "slow", RetryAfter: time.Millisecond}
 		})
@@ -167,7 +167,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 
 	t.Run("context cancellation stops retry", func(t *testing.T) {
 		t.Parallel()
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		calls := 0
 		err := doRateLimited(ctx, 5, 5*time.Second, func(_ context.Context) error {
 			calls++
@@ -186,7 +186,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 
 	t.Run("context is passed to fn", func(t *testing.T) {
 		t.Parallel()
-		ctx := context.WithValue(context.Background(), ctxKey{}, "test-value")
+		ctx := context.WithValue(t.Context(), ctxKey{}, "test-value")
 		err := doRateLimited(ctx, 1, time.Second, func(fnCtx context.Context) error {
 			if fnCtx.Value(ctxKey{}) != "test-value" {
 				t.Error("context not propagated to fn")
@@ -207,7 +207,7 @@ func TestDo(t *testing.T) {
 	t.Run("success on first call", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		result, err := Do(context.Background(), func(_ context.Context) (string, error) {
+		result, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			return "ok", nil
 		}, WithMaxAttempts(3), WithBaseDelay(time.Millisecond), WithLabel("test"))
@@ -225,7 +225,7 @@ func TestDo(t *testing.T) {
 	t.Run("retries on error then succeeds", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		result, err := Do(context.Background(), func(_ context.Context) (int, error) {
+		result, err := Do(t.Context(), func(_ context.Context) (int, error) {
 			calls++
 			if calls < 3 {
 				return 0, &HTTPStatusError{Code: 503}
@@ -246,7 +246,7 @@ func TestDo(t *testing.T) {
 	t.Run("exhausts retries returns last error", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		_, err := Do(context.Background(), func(_ context.Context) (string, error) {
+		_, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			return "", &HTTPStatusError{Code: 502}
 		}, WithMaxAttempts(3), WithBaseDelay(time.Millisecond), WithLabel("test"))
@@ -261,7 +261,7 @@ func TestDo(t *testing.T) {
 	t.Run("non-transient error not retried", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		_, err := Do(context.Background(), func(_ context.Context) (string, error) {
+		_, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			return "", errors.New("permanent failure")
 		}, WithMaxAttempts(3), WithBaseDelay(time.Millisecond), WithLabel("test"))
@@ -275,7 +275,7 @@ func TestDo(t *testing.T) {
 
 	t.Run("context cancellation stops retry", func(t *testing.T) {
 		t.Parallel()
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		calls := 0
 		_, err := Do(ctx, func(_ context.Context) (string, error) {
 			calls++
@@ -292,7 +292,7 @@ func TestDo(t *testing.T) {
 	t.Run("rate limit not retried by default", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		_, err := Do(context.Background(), func(_ context.Context) (string, error) {
+		_, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			return "", &RateLimitError{Msg: "429", RetryAfter: time.Millisecond}
 		}, WithMaxAttempts(3), WithBaseDelay(time.Millisecond))
@@ -314,7 +314,7 @@ func TestDo_WithRateLimitRetry(t *testing.T) {
 	t.Run("retries rate limits alongside transients", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		result, err := Do(context.Background(), func(_ context.Context) (string, error) {
+		result, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			switch calls {
 			case 1:
@@ -338,7 +338,7 @@ func TestDo_WithRateLimitRetry(t *testing.T) {
 	t.Run("non-transient still returns immediately", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		_, err := Do(context.Background(), func(_ context.Context) (string, error) {
+		_, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			return "", errors.New("permanent")
 		}, WithMaxAttempts(3), WithRateLimitRetry(time.Second))
@@ -354,7 +354,7 @@ func TestDo_WithRateLimitRetry(t *testing.T) {
 		t.Parallel()
 		// A 10s hint under a 10ms maxWait must wait only ~10ms; completing
 		// well inside the 5s deadline proves the cap applied.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 		calls := 0
 		_, err := Do(ctx, func(_ context.Context) (string, error) {
@@ -390,7 +390,7 @@ func TestDo_WithRateLimitRetry(t *testing.T) {
 func TestDo_rate_limit_modes_mutually_exclusive(t *testing.T) {
 	t.Parallel()
 	calls := 0
-	_, err := Do(context.Background(), func(_ context.Context) (string, error) {
+	_, err := Do(t.Context(), func(_ context.Context) (string, error) {
 		calls++
 		return "ok", nil
 	}, WithRateLimitRetry(time.Second), WithRateLimitOnly(time.Second))
@@ -472,7 +472,7 @@ func TestPermanentError(t *testing.T) {
 	t.Run("Do does not retry PermanentError", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		_, err := Do(context.Background(), func(_ context.Context) (string, error) {
+		_, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			return "", Permanent(errors.New("stop"))
 		}, WithMaxAttempts(5), WithBaseDelay(time.Millisecond), WithLabel("test"))
@@ -580,7 +580,7 @@ func TestMarkTransient(t *testing.T) {
 	t.Run("Do retries a marked error", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		_, err := Do(context.Background(), func(_ context.Context) (string, error) {
+		_, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			if calls == 1 {
 				return "", MarkTransient(&HTTPStatusError{Code: 500})
@@ -598,7 +598,7 @@ func TestMarkTransient(t *testing.T) {
 
 func TestDo_context_deadline_during_backoff_sleep(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
 	defer cancel()
 	calls := 0
 	_, err := Do(ctx, func(_ context.Context) (string, error) {
@@ -701,7 +701,7 @@ func TestSleepCtx_nonpositive_returns_nil_without_consulting_context(t *testing.
 func TestSleepCtx_negative_returns_immediately(t *testing.T) {
 	t.Parallel()
 	start := time.Now()
-	if err := SleepCtx(context.Background(), -time.Second); err != nil {
+	if err := SleepCtx(t.Context(), -time.Second); err != nil {
 		t.Errorf("SleepCtx(-1s) = %v, want nil", err)
 	}
 	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
@@ -729,7 +729,7 @@ func TestDoRateLimitOnly_zero_attempts_clamps_to_one(t *testing.T) {
 	t.Parallel()
 	calls := 0
 	sentinel := &RateLimitError{Msg: "rl"}
-	err := doRateLimited(context.Background(), 0, time.Second, func(_ context.Context) error {
+	err := doRateLimited(t.Context(), 0, time.Second, func(_ context.Context) error {
 		calls++
 		return sentinel
 	})
@@ -776,7 +776,7 @@ func TestDoRateLimitOnly_zero_retry_after_uses_max_wait(t *testing.T) {
 
 func TestDoRateLimitOnly_positive_retry_after_caps_below_max_wait(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
 	defer cancel()
 	// A positive RetryAfter must shrink the wait to 10ms so the retry completes
 	// well within the 150ms deadline and returns the rate-limit error.
@@ -797,7 +797,7 @@ func TestDoRateLimitOnly_positive_retry_after_caps_below_max_wait(t *testing.T) 
 // through every attempt in microseconds returning the rate-limit error instead.
 func TestDoRateLimitOnly_non_positive_max_wait_clamps_to_cap(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
 	defer cancel()
 	calls := 0
 	err := doRateLimited(ctx, 3, 0, func(_ context.Context) error {
@@ -818,7 +818,7 @@ func TestDo_zero_base_delay_defaults_to_base(t *testing.T) {
 	t.Parallel()
 	// A zero base delay must be coerced to DefaultBaseDelay (1s), so the pre-retry
 	// sleep blows the 100ms deadline and surfaces the context error.
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	_, err := Do(ctx, func(_ context.Context) (string, error) {
 		return "", &HTTPStatusError{Code: 503}
@@ -836,7 +836,7 @@ func TestDo_first_try_success_omits_succeeded_log(t *testing.T) {
 	slog.SetDefault(bufLogger(&buf))
 	defer slog.SetDefault(prev)
 
-	_, err := Do(context.Background(),
+	_, err := Do(t.Context(),
 		func(_ context.Context) (string, error) { return "ok", nil },
 		WithMaxAttempts(3), WithBaseDelay(time.Microsecond), WithLabel("lbl"))
 	if err != nil {
@@ -854,7 +854,7 @@ func TestDo_success_after_one_retry_logs_attempt_counts(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	calls := 0
-	_, err := Do(context.Background(),
+	_, err := Do(t.Context(),
 		func(_ context.Context) (int, error) {
 			calls++
 			if calls == 1 {
@@ -885,7 +885,7 @@ func TestDo_no_retry_log_after_final_attempt(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	calls := 0
-	_, err := Do(context.Background(),
+	_, err := Do(t.Context(),
 		func(_ context.Context) (string, error) {
 			calls++
 			return "", &HTTPStatusError{Code: 503}
@@ -913,7 +913,7 @@ func TestDo_WithLogger_routes_all_lines(t *testing.T) {
 	slog.SetDefault(bufLogger(&defBuf))
 	defer slog.SetDefault(prev)
 
-	_, err := Do(context.Background(),
+	_, err := Do(t.Context(),
 		func(_ context.Context) (string, error) {
 			return "", &HTTPStatusError{Code: 503}
 		},
@@ -940,7 +940,7 @@ func TestDoRateLimitOnly_retry_debug_log_reports_one_indexed_attempt(t *testing.
 	defer slog.SetDefault(prev)
 
 	calls := 0
-	err := doRateLimited(context.Background(), 3, time.Millisecond, func(_ context.Context) error {
+	err := doRateLimited(t.Context(), 3, time.Millisecond, func(_ context.Context) error {
 		calls++
 		if calls == 1 {
 			return &RateLimitError{Msg: "429"}
@@ -972,7 +972,7 @@ func TestDoRateLimitOnly_zero_max_wait_still_honors_hint(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	calls := 0
-	err := doRateLimited(context.Background(), 2, 0, func(_ context.Context) error {
+	err := doRateLimited(t.Context(), 2, 0, func(_ context.Context) error {
 		calls++
 		if calls == 1 {
 			return &RateLimitError{Msg: "rl", RetryAfter: 5 * time.Millisecond}
@@ -998,7 +998,7 @@ func TestDoRateLimitOnly_exhaustion_warn_message(t *testing.T) {
 	slog.SetDefault(bufLogger(&buf))
 	defer slog.SetDefault(prev)
 
-	err := doRateLimited(context.Background(), 2, time.Millisecond, func(_ context.Context) error {
+	err := doRateLimited(t.Context(), 2, time.Millisecond, func(_ context.Context) error {
 		return &RateLimitError{Msg: "rl", RetryAfter: time.Millisecond}
 	})
 	if err == nil {
@@ -1034,7 +1034,7 @@ func TestLogSlowUpstream_warns_and_redacts_on_slow_response(t *testing.T) {
 // whole logger, which throws the diagnostics away to stop the duplicate line.
 func TestDo_WithExhaustedLevel_demotes_the_terminal_line(t *testing.T) {
 	var buf bytes.Buffer
-	_, err := Do(context.Background(),
+	_, err := Do(t.Context(),
 		func(_ context.Context) (string, error) {
 			return "", &HTTPStatusError{Code: 503}
 		},
@@ -1064,7 +1064,7 @@ func TestDo_WithExhaustedLevel_overrides_both_default_rules(t *testing.T) {
 	fail := func(_ context.Context) (string, error) { return "", &HTTPStatusError{Code: 503} }
 
 	var multi bytes.Buffer
-	if _, err := Do(context.Background(), fail,
+	if _, err := Do(t.Context(), fail,
 		WithMaxAttempts(2), WithBaseDelay(time.Microsecond), WithLogger(bufLogger(&multi)),
 		WithExhaustedLevel(slog.LevelInfo)); err == nil {
 		t.Fatal("Do = nil, want exhaustion error")
@@ -1074,7 +1074,7 @@ func TestDo_WithExhaustedLevel_overrides_both_default_rules(t *testing.T) {
 	}
 
 	var single bytes.Buffer
-	if _, err := Do(context.Background(), fail,
+	if _, err := Do(t.Context(), fail,
 		WithMaxAttempts(1), WithLogger(bufLogger(&single)),
 		WithExhaustedLevel(slog.LevelWarn)); err == nil {
 		t.Fatal("Do = nil, want exhaustion error")

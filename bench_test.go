@@ -1,7 +1,6 @@
 package httpx
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -54,7 +53,7 @@ func BenchmarkRetryRoundTripper_Success(b *testing.B) {
 		Header:     http.Header{},
 	}
 	rt := NewRetryRoundTripper(&stubRT{resp: okResp}, TransportConfig{MaxAttempts: 3})
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com", http.NoBody)
+	req, _ := http.NewRequestWithContext(b.Context(), http.MethodGet, "http://example.com", http.NoBody)
 
 	b.ResetTimer()
 	for range b.N {
@@ -79,7 +78,7 @@ func BenchmarkRetryRoundTripper_RetryThenSuccess(b *testing.B) {
 	// A 1ns base delay keeps the benchmark measuring the retry machinery, not
 	// sleep (the jittered wait from a 1ns base is at most 1ns).
 	rt := NewRetryRoundTripper(inner, TransportConfig{MaxAttempts: 4, BaseDelay: time.Nanosecond})
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com", http.NoBody)
+	req, _ := http.NewRequestWithContext(b.Context(), http.MethodGet, "http://example.com", http.NoBody)
 
 	b.ResetTimer()
 	for range b.N {

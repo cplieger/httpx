@@ -89,7 +89,7 @@ func TestIsTransient_netHTTPTimeoutIsPerAttempt(t *testing.T) {
 func TestIsTransient_callerDeadlineStaysTerminal(t *testing.T) {
 	t.Parallel()
 	srv := stallServer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Millisecond)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 	if err != nil {
@@ -211,7 +211,7 @@ func TestDo_retriesClientTimeoutAwaitingHeaders(t *testing.T) {
 	srv := stallServer(t)
 	client := &http.Client{Timeout: 30 * time.Millisecond}
 	attempts := 0
-	_, err := httpx.Do(context.Background(), func(ctx context.Context) (struct{}, error) {
+	_, err := httpx.Do(t.Context(), func(ctx context.Context) (struct{}, error) {
 		attempts++
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 		if reqErr != nil {
@@ -245,7 +245,7 @@ func TestDo_retriesResponseHeaderTimeout(t *testing.T) {
 	base.ResponseHeaderTimeout = 30 * time.Millisecond
 	client := &http.Client{Transport: base}
 	attempts := 0
-	_, err = httpx.Do(context.Background(), func(ctx context.Context) (struct{}, error) {
+	_, err = httpx.Do(t.Context(), func(ctx context.Context) (struct{}, error) {
 		attempts++
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 		if reqErr != nil {
@@ -352,7 +352,7 @@ func TestRetryRoundTripper_retriesResponseHeaderTimeout(t *testing.T) {
 		BaseDelay:   time.Millisecond,
 		OnRetry:     func(int, *http.Request, *http.Response, error) { attempts++ },
 	})
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, http.NoBody)
 	if err != nil {
 		t.Fatalf("NewRequestWithContext: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestRetryRoundTripper_callerDeadlineIsNotRetried(t *testing.T) {
 		BaseDelay:   time.Millisecond,
 		OnRetry:     func(int, *http.Request, *http.Response, error) { retries++ },
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Millisecond)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 	if err != nil {
@@ -409,7 +409,7 @@ func TestRetryRoundTripper_callerDeadlineIsNotRetried(t *testing.T) {
 func TestGetBytes_callerDeadlineIsNotRetried(t *testing.T) {
 	t.Parallel()
 	srv := stallServer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Millisecond)
 	defer cancel()
 	start := time.Now()
 	_, err := httpx.GetBytes(ctx, srv.Client(), srv.URL,
@@ -448,7 +448,7 @@ func TestGetBytes_retriesClientTimeout(t *testing.T) {
 	defer srv.Close()
 
 	client := &http.Client{Timeout: 30 * time.Millisecond}
-	_, err := httpx.GetBytes(context.Background(), client, srv.URL,
+	_, err := httpx.GetBytes(t.Context(), client, srv.URL,
 		httpx.WithMaxAttempts(3), httpx.WithBaseDelay(time.Millisecond), httpx.WithLogger(discardLogger()))
 	if err == nil {
 		t.Fatal("GetBytes = nil error, want the exhausted timeout")
