@@ -2,7 +2,6 @@ package httpx_test
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -40,7 +39,7 @@ func TestGetBytes_doesNotLeakSecretInLogsOrError(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL+"?apikey=supersecret",
+	_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL+"?apikey=supersecret",
 		httpx.WithMaxAttempts(2),
 		httpx.WithBaseDelay(time.Microsecond),
 		httpx.WithLogger(logger),

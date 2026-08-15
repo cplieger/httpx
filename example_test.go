@@ -16,6 +16,7 @@ func ExampleGetBytes() {
 	}))
 	defer srv.Close()
 
+	// context.Background() (not t.Context()): an Example has no *testing.T.
 	body, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
 		httpx.WithMaxAttempts(3),
 		httpx.WithBaseDelay(100*time.Millisecond),
@@ -30,6 +31,7 @@ func ExampleGetBytes() {
 
 func ExampleDo() {
 	attempts := 0
+	// context.Background() (not t.Context()): an Example has no *testing.T.
 	result, err := httpx.Do(context.Background(), func(_ context.Context) (string, error) {
 		attempts++
 		if attempts < 2 {

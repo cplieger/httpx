@@ -273,7 +273,7 @@ func TestRetryRoundTripper_cancel_during_backoff_no_goroutine_leak(t *testing.T)
 
 	before := runtime.NumGoroutine()
 	for range 20 {
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{BaseDelay: time.Hour, MaxAttempts: 11})
 		go func() {
 			time.Sleep(time.Millisecond)

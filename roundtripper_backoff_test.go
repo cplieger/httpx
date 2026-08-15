@@ -85,7 +85,7 @@ func TestRetryRoundTripper_zero_base_delay_defaults_to_base(t *testing.T) {
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 0, MaxAttempts: 2})
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 
@@ -110,7 +110,7 @@ func TestRetryRoundTripper_default_backoff_doubles_between_retries(t *testing.T)
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 120 * time.Millisecond, MaxAttempts: 4})
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 
@@ -189,7 +189,7 @@ func TestRetryRoundTripper_429_without_retry_after_uses_backoff(t *testing.T) {
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 10 * time.Second, MaxAttempts: 2})
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 
@@ -213,7 +213,7 @@ func TestRetryRoundTripper_sleep_error_aborts_with_bare_context_error(t *testing
 	defer srv.Close()
 
 	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: 10 * time.Second, MaxAttempts: 2})
-	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 80*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 

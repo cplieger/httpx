@@ -721,7 +721,7 @@ func TestGetBytes_zero_base_delay_defaults_to_base(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 
 	// A zero base delay must be coerced to DefaultBaseDelay (1s), so the pre-retry
@@ -757,7 +757,7 @@ func TestGetBytes_does_not_sleep_before_first_attempt(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 
 	// The first attempt must NOT sleep, so a fast response returns before the
@@ -928,7 +928,7 @@ func (e *retryAfterHintErr) RetryAfterHint() time.Duration { return e.d }
 func TestDo_honorsRetryAfterHint(t *testing.T) {
 	var calls int
 	start := time.Now()
-	got, err := httpx.Do(context.Background(),
+	got, err := httpx.Do(t.Context(),
 		func(context.Context) (int, error) {
 			calls++
 			if calls == 1 {
@@ -954,7 +954,7 @@ func TestDo_honorsRetryAfterHint(t *testing.T) {
 func TestDo_hintOverridesLargerBackoff(t *testing.T) {
 	var calls int
 	start := time.Now()
-	got, err := httpx.Do(context.Background(),
+	got, err := httpx.Do(t.Context(),
 		func(context.Context) (int, error) {
 			calls++
 			if calls == 1 {
@@ -981,7 +981,7 @@ func TestDo_hintOverridesLargerBackoff(t *testing.T) {
 // exponential backoff in charge (no override, no panic).
 func TestDo_ignoresNonPositiveHint(t *testing.T) {
 	var calls int
-	got, err := httpx.Do(context.Background(),
+	got, err := httpx.Do(t.Context(),
 		func(context.Context) (int, error) {
 			calls++
 			if calls == 1 {

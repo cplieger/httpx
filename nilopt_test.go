@@ -25,20 +25,20 @@ func TestGetBytes_nil_option_is_skipped(t *testing.T) {
 	})
 	client := &http.Client{Transport: transport}
 	var nilOpt httpx.GetOption
-	if _, err := httpx.GetBytes(context.Background(), client, "http://example.com/nilopt", nilOpt); err != nil {
+	if _, err := httpx.GetBytes(t.Context(), client, "http://example.com/nilopt", nilOpt); err != nil {
 		t.Fatalf("nil GetOption caused error: %v", err)
 	}
 	// A shared Option (interface superset) is accepted by both doors; nil is
 	// skipped there too.
 	var nilShared httpx.Option
-	if _, err := httpx.GetBytes(context.Background(), client, "http://example.com/nilopt2", nilShared); err != nil {
+	if _, err := httpx.GetBytes(t.Context(), client, "http://example.com/nilopt2", nilShared); err != nil {
 		t.Fatalf("nil shared Option caused error: %v", err)
 	}
 }
 
 func TestDo_nil_option_is_skipped(t *testing.T) {
 	var nilOpt httpx.DoOption
-	got, err := httpx.Do(context.Background(), func(_ context.Context) (string, error) {
+	got, err := httpx.Do(t.Context(), func(_ context.Context) (string, error) {
 		return "ok", nil
 	}, nilOpt)
 	if err != nil {

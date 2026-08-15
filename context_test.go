@@ -15,7 +15,7 @@ func TestContextWithDefaultTimeout(t *testing.T) {
 	t.Run("no deadline applies default", func(t *testing.T) {
 		t.Parallel()
 		before := time.Now()
-		ctx, cancel := ContextWithDefaultTimeout(context.Background(), time.Minute)
+		ctx, cancel := ContextWithDefaultTimeout(t.Context(), time.Minute)
 		defer cancel()
 		dl, ok := ctx.Deadline()
 		if !ok {
@@ -32,7 +32,7 @@ func TestContextWithDefaultTimeout(t *testing.T) {
 
 	t.Run("caller deadline never undercut by smaller default", func(t *testing.T) {
 		t.Parallel()
-		parent, parentCancel := context.WithTimeout(context.Background(), time.Hour)
+		parent, parentCancel := context.WithTimeout(t.Context(), time.Hour)
 		defer parentCancel()
 		want, _ := parent.Deadline()
 
@@ -49,7 +49,7 @@ func TestContextWithDefaultTimeout(t *testing.T) {
 
 	t.Run("caller deadline never extended by larger default", func(t *testing.T) {
 		t.Parallel()
-		parent, parentCancel := context.WithTimeout(context.Background(), time.Millisecond)
+		parent, parentCancel := context.WithTimeout(t.Context(), time.Millisecond)
 		defer parentCancel()
 		want, _ := parent.Deadline()
 
@@ -64,7 +64,7 @@ func TestContextWithDefaultTimeout(t *testing.T) {
 	t.Run("non-positive default leaves ctx unbounded", func(t *testing.T) {
 		t.Parallel()
 		for _, def := range []time.Duration{0, -time.Second} {
-			ctx, cancel := ContextWithDefaultTimeout(context.Background(), def)
+			ctx, cancel := ContextWithDefaultTimeout(t.Context(), def)
 			if _, ok := ctx.Deadline(); ok {
 				t.Errorf("def=%v: expected no deadline", def)
 			}
@@ -77,7 +77,7 @@ func TestContextWithDefaultTimeout(t *testing.T) {
 
 	t.Run("passthrough cancel does not cancel the parent", func(t *testing.T) {
 		t.Parallel()
-		parent, parentCancel := context.WithTimeout(context.Background(), time.Hour)
+		parent, parentCancel := context.WithTimeout(t.Context(), time.Hour)
 		defer parentCancel()
 		_, cancel := ContextWithDefaultTimeout(parent, time.Minute)
 		cancel()
@@ -88,7 +88,7 @@ func TestContextWithDefaultTimeout(t *testing.T) {
 
 	t.Run("applied cancel releases the derived context", func(t *testing.T) {
 		t.Parallel()
-		ctx, cancel := ContextWithDefaultTimeout(context.Background(), time.Hour)
+		ctx, cancel := ContextWithDefaultTimeout(t.Context(), time.Hour)
 		cancel()
 		if ctx.Err() == nil {
 			t.Error("expected the derived context to be cancelled")

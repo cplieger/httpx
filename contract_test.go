@@ -363,7 +363,7 @@ func TestGetBytesRetriesRequestTimeout(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
+			_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
 				httpx.WithMaxAttempts(3), httpx.WithBaseDelay(time.Millisecond),
 				httpx.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 
@@ -395,7 +395,7 @@ func TestGetBytesSurfacesRetryAfterHint(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
+	_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
 		httpx.WithMaxAttempts(1),
 		httpx.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err == nil {
@@ -427,7 +427,7 @@ func TestGetBytesNoHintWithoutRetryAfter(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
+	_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
 		httpx.WithMaxAttempts(1),
 		httpx.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err == nil {
@@ -468,7 +468,7 @@ func TestSingleAttemptTerminalLineIsDebug(t *testing.T) {
 	} {
 		t.Run("GetBytes/"+name, func(t *testing.T) {
 			var buf bytes.Buffer
-			_, err := httpx.GetBytes(context.Background(), srv.Client(), srv.URL,
+			_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
 				httpx.WithMaxAttempts(tc.attempts),
 				httpx.WithBaseDelay(time.Millisecond),
 				httpx.WithLogger(newLog(&buf)))
@@ -479,7 +479,7 @@ func TestSingleAttemptTerminalLineIsDebug(t *testing.T) {
 		})
 		t.Run("Do/"+name, func(t *testing.T) {
 			var buf bytes.Buffer
-			_, err := httpx.Do(context.Background(),
+			_, err := httpx.Do(t.Context(),
 				func(context.Context) (struct{}, error) {
 					return struct{}{}, &httpx.HTTPStatusError{Code: http.StatusServiceUnavailable}
 				},
