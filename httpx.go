@@ -1104,6 +1104,9 @@ func NewClient(timeout time.Duration) *http.Client {
 // RedactTransportError unwraps *url.Error and redacts the secret from the
 // error message. Returns nil for nil input, and never nil for a non-nil one
 // (see urlErrorCause for the *url.Error that carries no cause of its own).
+// The replacement runs through RedactSecretString, whose doc comment carries the
+// ordering and representation rules for composing redaction with a normalizing
+// transform or a byte cap.
 func RedactTransportError(err error, prefix, secret string) error {
 	if err == nil {
 		return nil
@@ -1129,6 +1132,8 @@ func RedactTransportError(err error, prefix, secret string) error {
 }
 
 // RedactSecret replaces occurrences of secret in err's message with "REDACTED".
+// It funnels into RedactSecretString, whose doc comment carries the ordering and
+// representation rules the caller owns.
 func RedactSecret(err error, secret string) error {
 	return RedactTransportError(err, "", secret)
 }
@@ -1139,6 +1144,25 @@ func RedactSecret(err error, secret string) error {
 // secret from a plain string — a captured HTTP response body destined for an
 // error field or a log line — rather than from an error value. An empty secret
 // is a no-op (s is returned unchanged), matching the error-shaped variants.
+//
+// The replacement is literal and byte-exact, which puts three obligations on the
+// caller:
+//
+//  1. Hold the needle in the SAME representation the haystack carries. A decoded
+//     token does not match a JSON-escaped or percent-encoded haystack, and the
+//     mismatch is silent: nothing is replaced and no error is reported.
+//  2. Call this on BOTH sides of any normalizing transform (runesafe
+//     Sanitize/SanitizeSingleLine, unicode/norm NFC/NFKC, strconv.Unquote,
+//     JSON/URL/HTML unescape, case folding, whitespace collapse), passing the
+//     needle in the representation each side carries. A call placed only before
+//     the transform misses a secret the transform CONSTRUCTS out of text the
+//     needle never matched; a call placed only after it misses a secret the
+//     transform REWRITES, leaving a near-complete fragment of the value.
+//  3. Put any byte cap (ReadLimitedBody, a bounded sanitizer preset, a plain
+//     truncation) LAST. A cut that splits the value leaves a surviving prefix
+//     this function can no longer match.
+//
+// Composed, that order is: redact, normalize, redact, cap.
 func RedactSecretString(s, secret string) string {
 	if secret == "" {
 		return s

@@ -93,7 +93,11 @@
 //
 // [RedactSecret], [RedactSecretString], [RedactTransportError], and
 // [LogSafeError] keep credentials out of logs and returned errors. GetBytes
-// never logs or returns a raw URL.
+// never logs or returns a raw URL. The redactors match a literal value in the
+// exact representation the text carries, so a needle held in one encoding never
+// matches a haystack carrying another. A caller composing them with a
+// normalizing transform or a byte cap follows the order documented on
+// [RedactSecretString]: redact, normalize, redact, cap.
 //
 // # Body helpers
 //
