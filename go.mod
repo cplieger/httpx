@@ -1,4 +1,4 @@
-module github.com/cplieger/httpx/v4
+module github.com/cplieger/httpx/v5
 
 go 1.26.7
 

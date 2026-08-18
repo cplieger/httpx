@@ -16,7 +16,7 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/cplieger/httpx/v4"
+	"github.com/cplieger/httpx/v5"
 )
 
 // bufLogger returns a debug-level text logger writing into buf.

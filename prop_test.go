@@ -78,7 +78,7 @@ func TestReduction_non_nil_input_never_yields_nil_property(t *testing.T) {
 
 		results := map[string]error{
 			"LogSafeError":         LogSafeError(in),
-			"RedactTransportError": RedactTransportError(in, prefix, sec),
+			"RedactTransportError": RedactTransportError(in, prefix, Secret(sec)),
 		}
 		for name, got := range results {
 			if got == nil {
@@ -175,7 +175,7 @@ func FuzzRedactTransportError(f *testing.F) {
 			err = &testError{msg: errMsg}
 		}
 		// Panic-safety: exercise redaction with the arbitrary fuzzed secret.
-		result := RedactTransportError(err, prefix, secret)
+		result := RedactTransportError(err, prefix, Secret(secret))
 		if err == nil {
 			if result != nil {
 				t.Fatal("expected nil for nil input")
@@ -406,13 +406,13 @@ func FuzzSameOriginRedirect(f *testing.F) {
 		downgrade := isSchemeDowngrade(orig.Scheme, tgt.Scheme)
 
 		// Default: downgrades refused.
-		gotErr := RedirectPolicyFunc(WithSameHost())(&http.Request{URL: tgt}, via)
+		gotErr := RedirectPolicyFunc(WithSameHost(true))(&http.Request{URL: tgt}, via)
 		if want := sameHost && !downgrade; want != (gotErr == nil) {
 			t.Fatalf("WithSameHost %s->%s: err=%v (sameHost=%v downgrade=%v, wantAllowed=%v)", orig, tgt, gotErr, sameHost, downgrade, want)
 		}
 
 		// Downgrades allowed: only the host gates acceptance.
-		gotAllow := RedirectPolicyFunc(WithSameHost(), WithAllowSchemeDowngrade(true))(&http.Request{URL: tgt}, via)
+		gotAllow := RedirectPolicyFunc(WithSameHost(true), WithAllowSchemeDowngrade(true))(&http.Request{URL: tgt}, via)
 		if sameHost != (gotAllow == nil) {
 			t.Fatalf("WithSameHost+AllowDowngrade %s->%s: err=%v (sameHost=%v)", orig, tgt, gotAllow, sameHost)
 		}

@@ -1,6 +1,6 @@
 # httpx
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx/v4.svg)](https://pkg.go.dev/github.com/cplieger/httpx/v4)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx/v5.svg)](https://pkg.go.dev/github.com/cplieger/httpx/v5)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/httpx)](https://github.com/cplieger/httpx/blob/main/go.mod)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/coverage.json)](https://github.com/cplieger/httpx/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/mutation.json)](https://github.com/cplieger/httpx/issues?q=label%3Agremlins-tracker)
@@ -19,11 +19,11 @@ The toolkit presents three retry doors sharing one option vocabulary:
 
 `NewRetryClient` assembles the retrying client (transport + an explicit, required redirect policy) in one call.
 
-v4 tightens what counts as success: `CheckHTTPStatus` returns nil for **2xx only**, so a 3xx surfaced by a non-following redirect policy is now an error (see [Status checking](#status-checking) and [Migrating from v3](#migrating-from-v3)).
+v4 tightens what counts as success: `CheckHTTPStatus` returns nil for **2xx only**, so a 3xx surfaced by a non-following redirect policy is now an error (see [Status checking](#status-checking) and [Migrating from v3](#migrating-from-v3)). v5 hardens signatures with no behavior change: the redaction helpers take the secret as the named `Secret` type, and `WithSameHost` / `WithPreserveMethod` take a `bool` (see [Migrating from v4](#migrating-from-v4)).
 
 ## Install
 
-`go get github.com/cplieger/httpx/v4@latest`
+`go get github.com/cplieger/httpx/v5@latest`
 
 ## Usage
 
@@ -100,7 +100,7 @@ policy := httpx.RedirectPolicyFunc(
 // Refuse a redirect that would change the method (POST -> GET across a
 // 301/302/303) instead of silently re-issuing it as a GET. The refused hop
 // surfaces the 3xx response itself, which CheckHTTPStatus reports as an error.
-policy = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+policy = httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(true))
 
 // Status checking: nil for 2xx only. A 3xx (surfaced by a non-following
 // policy) is an error.
@@ -122,6 +122,20 @@ rc := httpx.LimitedBody(resp, 1<<20) // 1 MB cap
 defer rc.Close()
 ```
 
+## Migrating from v4
+
+v5 is signature hardening only — no behavior changes. The redaction helpers take the secret as a named type, `Secret`, so the value-to-hide and the text-to-scan cannot be transposed at a call site (a reversed call turns the redactor into a leak), and the two presence-style redirect options take the `bool` their neighbour `WithAllowSchemeDowngrade` always did.
+
+| v4 | v5 |
+| --- | --- |
+| `RedactSecretString(s, secret)` — both plain `string` | `secret` is the named type `Secret`: `RedactSecretString(s, httpx.Secret(token))` |
+| `RedactTransportError(err, prefix, secret)` — `prefix` and `secret` both plain `string` | `RedactTransportError(err, prefix, httpx.Secret(token))` |
+| `WithSameHost()` | `WithSameHost(true)`; `false` is the no-option default (only allowlisted targets are followed) |
+| `WithPreserveMethod()` | `WithPreserveMethod(true)`; `false` is the no-option default (a method-changing hop is followed as net/http rewrites it) |
+| module path suffix `/v4` | `github.com/cplieger/httpx/v5` in `go.mod` and every import |
+
+A call passing an untyped string constant (`RedactSecretString(s, "token")`) compiles unchanged; only a `string` variable in the secret position needs the `httpx.Secret(...)` conversion. A transposed call — the secret where the text belongs — is now a compile error, which is the point. `RedactSecret(err, secret)` is unchanged: its parameters already differ in type, so a swap never compiled.
+
 ## Migrating from v3
 
 Two changes, one of them breaking.
@@ -129,8 +143,8 @@ Two changes, one of them breaking.
 | v3 | v4 |
 | --- | --- |
 | `CheckHTTPStatus` returns nil for 200-399 | **BREAKING**: nil for **2xx only**; every other status errors, a 3xx included (`*HTTPStatusError`) |
-| a method-changing redirect hop is followed as a GET | opt in to refusing it with `RedirectPolicyFunc(..., WithPreserveMethod())` (additive, off by default) |
-| `github.com/cplieger/httpx/v3` | `github.com/cplieger/httpx/v4` in `go.mod` and every import |
+| a method-changing redirect hop is followed as a GET | opt in to refusing it with `RedirectPolicyFunc(..., WithPreserveMethod(true))` (additive, off by default) |
+| `github.com/cplieger/httpx/v3` | `github.com/cplieger/httpx/v5` in `go.mod` and every import — coming from v3 you cross the v5 signature changes in the same bump, so apply [Migrating from v4](#migrating-from-v4) too |
 
 **What changes:** a 3xx that reaches your code now returns `*HTTPStatusError{Code}` instead of nil.
 
@@ -180,7 +194,7 @@ Shared by both loop doors (`Option`): `WithMaxAttempts`, `WithBaseDelay`, `WithL
 
 ### Test helpers (`certtest` subpackage)
 
-The `github.com/cplieger/httpx/v4/certtest` subpackage supplies throwaway self-signed CA material for tests, the companion to `CATransport`. Only `_test.go` files import it, so its certificate-generation code never links into a production binary.
+The `github.com/cplieger/httpx/v5/certtest` subpackage supplies throwaway self-signed CA material for tests, the companion to `CATransport`. Only `_test.go` files import it, so its certificate-generation code never links into a production binary.
 
 - `certtest.SelfSignedCA(tb)`: a fresh self-signed CA certificate, PEM-encoded. Each call generates a new key, so two certs are mutually untrusted (handy for asserting a pin is enforced).
 - `certtest.WriteSelfSignedCA(tb)`: the same certificate written to a `ca.pem` file under `tb.TempDir()`, returning the path.
@@ -261,20 +275,20 @@ The exhaustion error still implements `RetryAfterHint`, so the upstream's alread
 
 - `Validators{ETag, LastModified}`: the cache validators captured from a previous 200, replayed on the next request
 - `ConditionalResult{Validators, Body, NotModified}`: one conditional-request outcome
-- `DoConditional(client, req, v, maxBodyBytes)`: one conditional attempt; `v` alone decides what is replayed (pre-existing conditional headers are cleared, empty fields unsent). A 304 returns `NotModified` with zero `Validators` (keep the ones you sent); a 200 returns the bounded body plus fresh validators; anything else is an error, with transport errors reduced via `LogSafeError` so no raw URL reaches caller error text. Single-shot by design: wrap it in `Do` for retry, rebuild the request per attempt, persist body and validators together, and send zero `Validators` when the cached body is unusable. Validators are checked in both directions (header field-value grammar, 1 KiB cap): an invalid upstream value is captured as empty and an invalid replayed field is unsent, so a poisoned validator degrades to an unconditional GET and self-heals on the next clean 200. Full semantics in the [godoc](https://pkg.go.dev/github.com/cplieger/httpx/v4#DoConditional).
+- `DoConditional(client, req, v, maxBodyBytes)`: one conditional attempt; `v` alone decides what is replayed (pre-existing conditional headers are cleared, empty fields unsent). A 304 returns `NotModified` with zero `Validators` (keep the ones you sent); a 200 returns the bounded body plus fresh validators; anything else is an error, with transport errors reduced via `LogSafeError` so no raw URL reaches caller error text. Single-shot by design: wrap it in `Do` for retry, rebuild the request per attempt, persist body and validators together, and send zero `Validators` when the cached body is unusable. Validators are checked in both directions (header field-value grammar, 1 KiB cap): an invalid upstream value is captured as empty and an invalid replayed field is unsent, so a poisoned validator degrades to an unconditional GET and self-heals on the next clean 200. Full semantics in the [godoc](https://pkg.go.dev/github.com/cplieger/httpx/v5#DoConditional).
 
 ### Redirect Policies
 
 - `DefaultRedirectPolicy`: same-host-only (used by `NewClient`); refuses a same-host `https`->`http` downgrade, allows an `http`->`https` upgrade.
 - `RefuseAllRedirects`: follows **no** redirect; returns `http.ErrUseLastResponse`, so the client surfaces the 3xx response itself (nil error) and `CheckHTTPStatus` reports it as an error. The policy for a token-bearing client of an API that issues no redirects: Go forwards custom headers (`X-Plex-Token`, `X-Api-Key`) across redirects, so a hostile 302 would exfiltrate the credential.
 - `DockerGitHubRedirectPolicy`: example allowlist policy for docker.com/github.com.
-- `RedirectPolicyFunc`: build a custom redirect allowlist from functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithSameHost` (also allow the original request's host; the same-origin building block), `WithMaxHops`, `WithAllowSchemeDowngrade`, and `WithPreserveMethod`. Every policy refuses an `https`->`http` downgrade by default, even to an allowlisted or same-host target, so an auth header is never forwarded onto a cleartext hop; an `http`->`https` upgrade is always allowed, and `WithAllowSchemeDowngrade(true)` opts out of the refusal.
-- `WithPreserveMethod`: **refuses** a hop that would change the request method instead of rewriting the method back. net/http downgrades a POST/PUT/PATCH/DELETE to a GET across a 301/302/303 and drops the body (RFC 9110 §15.4, Go issue 18570); only 307/308 carry the method forward. The refusal returns `http.ErrUseLastResponse`, so the 3xx surfaces to the caller (nil error) and errors under `CheckHTTPStatus` — the same pairing `RefuseAllRedirects` relies on. The comparison is against the **original** request, so a POST kept by a 307 and then downgraded by a 302 is refused at the second hop; an empty `via` chain fails closed. The hop cap, allowlist, and scheme-downgrade refusals (hard errors) keep precedence, and the option grants nothing on its own — with no allowlist and no `WithSameHost` the policy still refuses everything.
+- `RedirectPolicyFunc`: build a custom redirect allowlist from functional options: `WithAllowedHosts`, `WithAllowedSuffixes`, `WithSameHost(true)` (also allow the original request's host; the same-origin building block — `false` is the no-option default), `WithMaxHops`, `WithAllowSchemeDowngrade`, and `WithPreserveMethod`. Every policy refuses an `https`->`http` downgrade by default, even to an allowlisted or same-host target, so an auth header is never forwarded onto a cleartext hop; an `http`->`https` upgrade is always allowed, and `WithAllowSchemeDowngrade(true)` opts out of the refusal.
+- `WithPreserveMethod(true)`: **refuses** a hop that would change the request method instead of rewriting the method back (`false` is the no-option default: the hop is followed as net/http rewrites it). net/http downgrades a POST/PUT/PATCH/DELETE to a GET across a 301/302/303 and drops the body (RFC 9110 §15.4, Go issue 18570); only 307/308 carry the method forward. The refusal returns `http.ErrUseLastResponse`, so the 3xx surfaces to the caller (nil error) and errors under `CheckHTTPStatus` — the same pairing `RefuseAllRedirects` relies on. The comparison is against the **original** request, so a POST kept by a 307 and then downgraded by a 302 is refused at the second hop; an empty `via` chain fails closed. The hop cap, allowlist, and scheme-downgrade refusals (hard errors) keep precedence, and the option grants nothing on its own — with no allowlist and no `WithSameHost(true)` the policy still refuses everything.
 - `CheckRedirect`: the `http.Client.CheckRedirect` function shape as a type alias; every shipped policy is one.
 
 ### Secret Redaction
 
-- `RedactTransportError` / `RedactSecret` / `RedactSecretString`: secret redaction (error- and string-level)
+- `RedactTransportError` / `RedactSecret` / `RedactSecretString`: secret redaction (error- and string-level). `RedactSecretString` and `RedactTransportError` take the secret as the named `Secret` type, so the value-to-hide and the text-to-scan cannot be transposed — a reversed call would turn the redactor into a leak, and it no longer compiles.
 - `LogSafeError`: reduce a URL-embedding transport `*url.Error` to its underlying cause (everything else passes through, `errors.Is`/`As` preserved). The same reduction httpx applies to every transport error it logs; equivalent to `RedactTransportError(err, "", "")`.
 
 ### Error Types

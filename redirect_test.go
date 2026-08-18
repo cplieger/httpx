@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v4"
+	"github.com/cplieger/httpx/v5"
 )
 
 func redirectReq(host string) *http.Request {
@@ -272,13 +272,22 @@ func viaWithOrigin(t *testing.T, rawURL string) []*http.Request {
 	return []*http.Request{{URL: u}}
 }
 
+// viaWithOriginMethod is viaWithOrigin with the origin's method set, so
+// WithPreserveMethod checks have a method to compare against.
+func viaWithOriginMethod(t *testing.T, rawURL, method string) []*http.Request {
+	t.Helper()
+	via := viaWithOrigin(t, rawURL)
+	via[0].Method = method
+	return via
+}
+
 // TestRedirectPolicyFunc_sameHost pins the WithSameHost behavior: same-host
 // redirects (including an http->https upgrade) are followed, a cross-host hop
 // and a same-host https->http downgrade are refused, host matching is
 // ASCII-case-insensitive, and a differing port on the same host is still same
 // host.
 func TestRedirectPolicyFunc_sameHost(t *testing.T) {
-	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithMaxHops(10))
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithMaxHops(10))
 	tests := []struct {
 		name    string
 		orig    string
@@ -307,7 +316,7 @@ func TestRedirectPolicyFunc_sameHost(t *testing.T) {
 // against, so the policy must refuse gracefully rather than panic. Every other
 // same-host test supplies a non-nil origin, leaving this branch undriven.
 func TestRedirectPolicyFunc_sameHost_nil_via_refuses(t *testing.T) {
-	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost())
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(true))
 	if err := policy(reqTo(t, "https://arr.example/b"), nil); err == nil {
 		t.Error("WithSameHost policy with nil via = nil, want refusal (no origin to match against)")
 	}
@@ -316,7 +325,7 @@ func TestRedirectPolicyFunc_sameHost_nil_via_refuses(t *testing.T) {
 // TestRedirectPolicyFunc_allowSchemeDowngrade confirms WithAllowSchemeDowngrade
 // opts back into following a same-host https->http downgrade.
 func TestRedirectPolicyFunc_allowSchemeDowngrade(t *testing.T) {
-	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithAllowSchemeDowngrade(true))
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithAllowSchemeDowngrade(true))
 	if err := policy(reqTo(t, "http://arr.example/b"), viaWithOrigin(t, "https://arr.example/a")); err != nil {
 		t.Errorf("WithAllowSchemeDowngrade(true): same-host https->http should be allowed, got %v", err)
 	}
@@ -457,7 +466,7 @@ func methodVia(t *testing.T, rawURL string, methods ...string) []*http.Request {
 // reading), the comparison is against the ORIGINAL request so a 307-then-302
 // chain is caught, and an empty via chain fails closed.
 func TestRedirectPolicyFunc_preserveMethod(t *testing.T) {
-	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+	policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(true))
 	const origin = "https://api.example/start"
 	const target = "https://api.example/next"
 	tests := []struct {
@@ -515,7 +524,7 @@ func TestRedirectPolicyFunc_preserveMethod(t *testing.T) {
 // the hop is not followed (net/http never calls CheckRedirect this way; a
 // hand-built chain can).
 func TestRedirectPolicyFunc_preserveMethod_empty_via_fails_closed(t *testing.T) {
-	policy := httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("api.example"), httpx.WithPreserveMethod())
+	policy := httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("api.example"), httpx.WithPreserveMethod(true))
 	for _, via := range [][]*http.Request{nil, {}} {
 		err := policy(methodReq(t, http.MethodGet, "https://api.example/next"), via)
 		if err == nil {
@@ -544,21 +553,21 @@ func TestRedirectPolicyFunc_preserveMethod_precedence(t *testing.T) {
 	}{
 		{
 			name:    "cross-host refusal wins",
-			policy:  httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("api.example"), httpx.WithPreserveMethod()),
+			policy:  httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("api.example"), httpx.WithPreserveMethod(true)),
 			target:  "https://evil.example/x",
 			via:     []string{http.MethodPost},
 			wantMsg: "refusing redirect to evil.example",
 		},
 		{
 			name:    "scheme-downgrade refusal wins",
-			policy:  httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod()),
+			policy:  httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(true)),
 			target:  "http://api.example/x",
 			via:     []string{http.MethodPost},
 			wantMsg: "refusing scheme downgrade to api.example",
 		},
 		{
 			name:    "hop cap wins",
-			policy:  httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithMaxHops(2), httpx.WithPreserveMethod()),
+			policy:  httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithMaxHops(2), httpx.WithPreserveMethod(true)),
 			target:  "https://api.example/x",
 			via:     []string{http.MethodPost, http.MethodPost},
 			wantMsg: "too many redirects",
@@ -584,7 +593,7 @@ func TestRedirectPolicyFunc_preserveMethod_precedence(t *testing.T) {
 // ever narrows: on its own (no allowlist, no WithSameHost) the policy still
 // refuses every redirect via the fail-closed no-target branch.
 func TestRedirectPolicyFunc_preserveMethod_grants_nothing(t *testing.T) {
-	policy := httpx.RedirectPolicyFunc(httpx.WithPreserveMethod())
+	policy := httpx.RedirectPolicyFunc(httpx.WithPreserveMethod(true))
 	err := policy(methodReq(t, http.MethodGet, "https://api.example/next"),
 		methodVia(t, "https://api.example/start", http.MethodGet))
 	if err == nil {
@@ -641,7 +650,7 @@ func TestWithPreserveMethod_end_to_end(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv, hopMethod := preserveMethodChain(t, tt.status)
 			client := srv.Client()
-			client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+			client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(true))
 
 			var body io.Reader = http.NoBody
 			if tt.method == http.MethodPost {
@@ -702,7 +711,7 @@ func TestWithPreserveMethod_end_to_end_307_then_302(t *testing.T) {
 	defer srv.Close()
 
 	client := srv.Client()
-	client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(), httpx.WithPreserveMethod())
+	client.CheckRedirect = httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(true))
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+"/start", strings.NewReader("payload"))
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
@@ -758,4 +767,33 @@ func TestRefuseAllRedirects_surfaces_3xx_and_never_follows(t *testing.T) {
 	if targetHit.Load() {
 		t.Error("redirect target was contacted; the hop must never be followed")
 	}
+}
+
+// The false arm of each parameterised option is the no-option default and the
+// last value wins — both pinned here because nothing else passes false: a
+// mutant that hard-wires either config field to true survives every other
+// redirect test.
+func TestRedirectPolicyFunc_false_equals_absent_and_last_wins(t *testing.T) {
+	t.Run("WithSameHost(false) refuses like no option", func(t *testing.T) {
+		policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(false), httpx.WithMaxHops(10))
+		err := policy(reqTo(t, "https://arr.example/b"), viaWithOrigin(t, "https://arr.example/a"))
+		if err == nil {
+			t.Error("policy(same-host hop) with WithSameHost(false) = nil err, want refusal (false must equal leaving the option out)")
+		}
+	})
+	t.Run("later WithSameHost(false) overrides earlier true", func(t *testing.T) {
+		policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithSameHost(false), httpx.WithMaxHops(10))
+		err := policy(reqTo(t, "https://arr.example/b"), viaWithOrigin(t, "https://arr.example/a"))
+		if err == nil {
+			t.Error("policy(same-host hop) with WithSameHost(true) then (false) = nil err, want refusal (last value wins)")
+		}
+	})
+	t.Run("WithPreserveMethod(false) follows a method-rewriting hop like no option", func(t *testing.T) {
+		policy := httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(false), httpx.WithMaxHops(10))
+		req := reqTo(t, "https://arr.example/b")
+		via := viaWithOriginMethod(t, "https://arr.example/a", "POST")
+		if err := policy(req, via); err != nil {
+			t.Errorf("policy(POST 302 hop) with WithPreserveMethod(false) = %v, want nil (false must equal leaving the option out)", err)
+		}
+	})
 }
