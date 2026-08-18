@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v4"
+	"github.com/cplieger/httpx/v5"
 )
 
 // discardLogger keeps the retry diagnostics these tests provoke out of the

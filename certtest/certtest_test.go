@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cplieger/httpx/v4/certtest"
+	"github.com/cplieger/httpx/v5/certtest"
 )
 
 func TestSelfSignedCA(t *testing.T) {

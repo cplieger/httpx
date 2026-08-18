@@ -194,7 +194,7 @@ func TestRedactSecretString(t *testing.T) {
 	tests := []struct {
 		name   string
 		s      string
-		secret string
+		secret Secret
 		want   string
 	}{
 		{"single occurrence", "body key=abc123 end", "abc123", "body key=REDACTED end"},

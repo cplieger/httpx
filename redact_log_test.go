@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v4"
+	"github.com/cplieger/httpx/v5"
 )
 
 func TestStatusError_ErrorRedactsURL(t *testing.T) {
@@ -98,7 +98,7 @@ func TestRedactSecretStringOrderingContract(t *testing.T) {
 	// (a) Shape A: redaction before the transform and none after. The transform
 	// builds the secret's normalized form out of text the needle never matched,
 	// so the value shows up after the mask already ran.
-	beforeOnly := normalizeForTest(httpx.RedactSecretString(haystack, secret))
+	beforeOnly := normalizeForTest(httpx.RedactSecretString(haystack, httpx.Secret(secret)))
 	if !strings.Contains(beforeOnly, normalized) {
 		t.Errorf("shape A no longer reproduces, fixture is stale: %q", beforeOnly)
 	}
@@ -106,18 +106,18 @@ func TestRedactSecretStringOrderingContract(t *testing.T) {
 	// (b) Shape D: redaction only after the transform, with the needle in the raw
 	// representation. The transform rewrote the byte inside the value, so the
 	// byte-exact needle matches nothing and the normalized value survives.
-	afterOnly := httpx.RedactSecretString(normalizeForTest(haystack), secret)
+	afterOnly := httpx.RedactSecretString(normalizeForTest(haystack), httpx.Secret(secret))
 	if !strings.Contains(afterOnly, normalized) {
 		t.Errorf("shape D no longer reproduces, fixture is stale: %q", afterOnly)
 	}
 
 	// (c) The canonical composition: redact, normalize, redact. Each side passes
 	// the needle in the representation that side carries.
-	redacted := httpx.RedactSecretString(haystack, secret)
+	redacted := httpx.RedactSecretString(haystack, httpx.Secret(secret))
 	if strings.Contains(redacted, secret) {
 		t.Errorf("redaction before the transform left the raw value in place: %q", redacted)
 	}
-	safe := httpx.RedactSecretString(normalizeForTest(redacted), normalized)
+	safe := httpx.RedactSecretString(normalizeForTest(redacted), httpx.Secret(normalized))
 	if strings.Contains(safe, secret) || strings.Contains(safe, normalized) {
 		t.Errorf("canonical composition leaked the secret: %q", safe)
 	}

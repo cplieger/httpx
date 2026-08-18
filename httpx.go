@@ -756,17 +756,22 @@ func WithMaxHops(n int) RedirectOption {
 	return func(c *redirectCfg) { c.maxHops = n }
 }
 
-// WithSameHost additionally allows a redirect whose target host equals the
-// original request's host (ASCII case-insensitive, RFC 3986 §6.2.2.1), in
-// addition to any WithAllowedHosts / WithAllowedSuffixes entries. It is the
-// building block for a same-origin policy: combined with the default
-// scheme-downgrade refusal (see WithAllowSchemeDowngrade), it follows a
-// service's own same-host redirects (including an http->https upgrade) while
-// refusing a cross-host hop that would forward a custom auth header to another
-// origin. A policy built with only WithSameHost (no allowlisted hosts) permits
-// exactly the same-host set.
-func WithSameHost() RedirectOption {
-	return func(c *redirectCfg) { c.sameHost = true }
+// WithSameHost permits a redirect whose target host equals the original
+// request's host (ASCII case-insensitive, RFC 3986 §6.2.2.1), in addition to
+// any WithAllowedHosts / WithAllowedSuffixes entries. The default (false)
+// matches leaving the option out: only allowlisted targets are followed.
+// WithSameHost(true) is the building block for a same-origin policy: combined
+// with the default scheme-downgrade refusal (see WithAllowSchemeDowngrade),
+// it follows a service's own same-host redirects (including an http->https
+// upgrade) while refusing a cross-host hop that would forward a custom auth
+// header to another origin. A policy built with only WithSameHost(true) (no
+// allowlisted hosts) permits exactly the same-host set.
+//
+// Like every RedirectOption, later values overwrite earlier ones: appending
+// WithSameHost(false) to an option slice that already carries
+// WithSameHost(true) turns the permission back off.
+func WithSameHost(same bool) RedirectOption {
+	return func(c *redirectCfg) { c.sameHost = same }
 }
 
 // WithAllowSchemeDowngrade permits a redirect that downgrades the scheme
@@ -781,12 +786,14 @@ func WithAllowSchemeDowngrade(allow bool) RedirectOption {
 }
 
 // WithPreserveMethod REFUSES a redirect hop that would change the request
-// method, rather than rewriting the method back. net/http downgrades a POST
-// (or PUT/PATCH/DELETE) to a GET across a 301, 302, or 303 and drops the body,
-// per RFC 9110 §15.4 and Go's issue 18570 compatibility rule; only a 307 or 308
-// carries the method and body forward. For an API call whose meaning IS its
-// method, that silent downgrade turns a write into a read against a URL the
-// caller never named, so this option makes the client stop instead.
+// method, rather than rewriting the method back. The default (false) matches
+// leaving the option out: a method-changing hop is followed as net/http
+// rewrites it. net/http downgrades a POST (or PUT/PATCH/DELETE) to a GET
+// across a 301, 302, or 303 and drops the body, per RFC 9110 §15.4 and Go's
+// issue 18570 compatibility rule; only a 307 or 308 carries the method and
+// body forward. For an API call whose meaning IS its method, that silent
+// downgrade turns a write into a read against a URL the caller never named,
+// so WithPreserveMethod(true) makes the client stop instead.
 //
 // A refused hop returns [http.ErrUseLastResponse], not an error: net/http then
 // hands the caller the 3xx response itself (status, Location header, body open,
@@ -806,10 +813,10 @@ func WithAllowSchemeDowngrade(allow bool) RedirectOption {
 // refused too: the option fails closed.
 //
 // It only ever narrows what a policy follows, so it grants nothing on its own:
-// [RedirectPolicyFunc] with WithPreserveMethod and no allowlist and no
-// [WithSameHost] still refuses every redirect.
-func WithPreserveMethod() RedirectOption {
-	return func(c *redirectCfg) { c.preserveMethod = true }
+// [RedirectPolicyFunc] with WithPreserveMethod(true) and no allowlist and no
+// [WithSameHost] entry still refuses every redirect.
+func WithPreserveMethod(preserve bool) RedirectOption {
+	return func(c *redirectCfg) { c.preserveMethod = preserve }
 }
 
 // asciiLower lowercases only ASCII letters A-Z, leaving every other byte
@@ -846,12 +853,12 @@ func hostMatchesSuffix(host, suffix string) bool {
 // RedirectPolicyFunc returns a CheckRedirect function configured with the given
 // options. A redirect is followed only when its target host is allowed — an
 // exact WithAllowedHosts entry, a WithAllowedSuffixes match, or (with
-// WithSameHost) the original request's own host — and, unless
+// WithSameHost(true)) the original request's own host — and, unless
 // WithAllowSchemeDowngrade is set, the redirect does not downgrade https->http.
-// With no allowlist and no WithSameHost, all redirects are refused. The hop cap
-// is WithMaxHops (default 5). WithPreserveMethod additionally refuses (via
-// http.ErrUseLastResponse, so the 3xx surfaces to the caller) a hop that would
-// change the request method.
+// With no allowlist and no WithSameHost(true), all redirects are refused. The
+// hop cap is WithMaxHops (default 5). WithPreserveMethod(true) additionally
+// refuses (via http.ErrUseLastResponse, so the 3xx surfaces to the caller) a
+// hop that would change the request method.
 func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Request) error {
 	cfg := redirectCfg{}
 	for _, o := range opts {
@@ -1015,17 +1022,17 @@ func redirectAllowed(host string, allowedHosts, normalizedSuffixes []string) boo
 // defaultRedirectPolicy is the compiled same-host policy DefaultRedirectPolicy
 // delegates to, so the same-host + downgrade logic lives in exactly one place
 // (resolvedRedirect.check) and cannot drift from
-// RedirectPolicyFunc(WithSameHost()).
-var defaultRedirectPolicy = RedirectPolicyFunc(WithSameHost())
+// RedirectPolicyFunc(WithSameHost(true)).
+var defaultRedirectPolicy = RedirectPolicyFunc(WithSameHost(true))
 
 // DefaultRedirectPolicy is the default redirect policy: it allows a redirect
 // only to the same host as the original request, and refuses a same-host
 // https->http scheme downgrade (which would forward a custom auth header onto a
 // cleartext hop). A cross-host redirect is refused (Go forwards a custom header
 // across a redirect, so it would leak) and an http->https upgrade is allowed.
-// It delegates to RedirectPolicyFunc(WithSameHost()), with one addition: a call
-// with an empty via chain (which net/http never produces — via always carries
-// at least the original request) is allowed rather than refused. Use
+// It delegates to RedirectPolicyFunc(WithSameHost(true)), with one addition: a
+// call with an empty via chain (which net/http never produces — via always
+// carries at least the original request) is allowed rather than refused. Use
 // RedirectPolicyFunc for a custom allowlist, a higher hop cap (WithMaxHops), or
 // to permit downgrades (WithAllowSchemeDowngrade).
 func DefaultRedirectPolicy(req *http.Request, via []*http.Request) error {
@@ -1101,13 +1108,33 @@ func NewClient(timeout time.Duration) *http.Client {
 
 // --- Secret redaction ---
 
+// Secret is a credential value being redacted: the needle the redaction
+// helpers scan FOR, never the text they scan. It is a distinct type so the
+// value-to-hide and the text-to-scan cannot be transposed at a call site — a
+// reversed call turns the redactor into a leak, scanning the credential for
+// occurrences of the log text and returning the credential untouched. With
+// the positions typed apart, a plain string variable in the secret position
+// is a compile error; the caller converts exactly the value that is the
+// credential (httpx.Secret(token)) and nothing else fits there.
+//
+// Convert at the call boundary, never store one: Secret carries no logging
+// protection of its own — formatting a Secret with %v/%s or logging it via
+// slog prints the credential verbatim. The zero value ("") disables
+// redaction: every helper returns its input unredacted when the secret is
+// empty, because there is nothing to scan for. Callers redacting a
+// possibly-absent credential must treat empty as "no redaction happened",
+// not as "redaction succeeded".
+type Secret string
+
 // RedactTransportError unwraps *url.Error and redacts the secret from the
 // error message. Returns nil for nil input, and never nil for a non-nil one
 // (see urlErrorCause for the *url.Error that carries no cause of its own).
 // The replacement runs through RedactSecretString, whose doc comment carries the
 // ordering and representation rules for composing redaction with a normalizing
-// transform or a byte cap.
-func RedactTransportError(err error, prefix, secret string) error {
+// transform or a byte cap. An empty secret disables redaction: the (possibly
+// prefixed) error is returned with its message untouched, since there is
+// nothing to scan for.
+func RedactTransportError(err error, prefix string, secret Secret) error {
 	if err == nil {
 		return nil
 	}
@@ -1125,7 +1152,7 @@ func RedactTransportError(err error, prefix, secret string) error {
 		return wrapped
 	}
 	msg := wrapped.Error()
-	if !strings.Contains(msg, secret) {
+	if !strings.Contains(msg, string(secret)) {
 		return wrapped
 	}
 	return errors.New(RedactSecretString(msg, secret))
@@ -1135,7 +1162,7 @@ func RedactTransportError(err error, prefix, secret string) error {
 // It funnels into RedactSecretString, whose doc comment carries the ordering and
 // representation rules the caller owns.
 func RedactSecret(err error, secret string) error {
-	return RedactTransportError(err, "", secret)
+	return RedactTransportError(err, "", Secret(secret))
 }
 
 // RedactSecretString replaces every occurrence of secret in s with "REDACTED"
@@ -1163,11 +1190,11 @@ func RedactSecret(err error, secret string) error {
 //     this function can no longer match.
 //
 // Composed, that order is: redact, normalize, redact, cap.
-func RedactSecretString(s, secret string) string {
+func RedactSecretString(s string, secret Secret) string {
 	if secret == "" {
 		return s
 	}
-	return strings.ReplaceAll(s, secret, "REDACTED")
+	return strings.ReplaceAll(s, string(secret), "REDACTED")
 }
 
 // redactURL returns a log-safe rendering of rawURL. It masks the userinfo

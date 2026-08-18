@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"time"
 
-	"github.com/cplieger/httpx/v4"
+	"github.com/cplieger/httpx/v5"
 )
 
 func ExampleGetBytes() {

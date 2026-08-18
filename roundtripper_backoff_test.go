@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/httpx/v4"
+	"github.com/cplieger/httpx/v5"
 )
 
 // Backoff/wait behavior of the RetryRoundTripper: the default jittered
