@@ -135,6 +135,7 @@ v5 is signature hardening only — no behavior changes. The redaction helpers ta
 | `Transient` = `IsTransient() bool` | `Transient` = `error` + `IsTransient() bool` |
 | `RetryAfterHint` = `RetryAfterHint() time.Duration` | `RetryAfterHint` = `error` + `RetryAfterHint() time.Duration` |
 | module path suffix `/v4` | `github.com/cplieger/httpx/v5` in `go.mod` and every import |
+| Go 1.26 toolchain (`go 1.26.6`) | Go 1.27 toolchain (`go 1.27.0`); an older toolchain refuses to build the module |
 
 A call passing an untyped string constant (`RedactSecretString(s, "token")`) compiles unchanged; only a `string` variable in the secret position needs the `httpx.Secret(...)` conversion. A transposed call — the secret where the text belongs — is now a compile error, which is the point. `RedactSecret(err, secret)` is unchanged: its parameters already differ in type, so a swap never compiled.
 
@@ -155,22 +156,6 @@ Two changes, one of them breaking.
 **Who is affected:** only callers that pair a non-following redirect policy (`RefuseAllRedirects`, or any `CheckRedirect` returning `http.ErrUseLastResponse`) with `CheckHTTPStatus` — a followed redirect never surfaces a 3xx, so a client on `DefaultRedirectPolicy` or an allowlist policy sees no difference. `GetBytes` and the `RetryRoundTripper` are untouched: `GetBytes` already returned a `*StatusError` for a 3xx (it now derives that from the classifier instead of restating the band), and the transport never classified statuses through it. `DoConditional` still errors on a 3xx, but the error is now `*HTTPStatusError{Code}` instead of the plain `unexpected status %d` fallback — a caller matching on that message must switch to `errors.As`.
 
 **What to do:** delete the hand-rolled band check next to the call — a guard like `if resp.StatusCode < 200 || resp.StatusCode >= 300 { ... }` sitting after `CheckHTTPStatus` (written precisely because the classifier accepted 3xx) is now redundant. If a 3xx must stay non-fatal for one call site, check `resp.StatusCode` there instead of widening the classifier back.
-
-## Migrating from v2
-
-One option vocabulary replaces v2's three config dialects; two loop doors replace three retry functions; the retrying client gains a required redirect policy. Mechanical mapping:
-
-| v2 | v3 |
-| --- | --- |
-| `Retry(ctx, client, url, opts...)` | `GetBytes(ctx, client, url, opts...)` (identical contract and option names) |
-| `RetryWithBackoff[T](ctx, n, d, label, fn)` | `Do[T](ctx, fn, WithMaxAttempts(n), WithBaseDelay(d), WithLabel(label))` |
-| `RetryOnRateLimit(ctx, n, maxWait, fn)` | `Do[struct{}](ctx, wrap(fn), WithRateLimitOnly(maxWait), WithMaxAttempts(n))`; `wrap` adapts `func(ctx) error` to `(struct{}, error)` |
-| `NewRetryRoundTripper(base, WithRTMaxAttempts(4), ...)` | `NewRetryRoundTripper(base, TransportConfig{MaxAttempts: 4, ...})` |
-| `WithRTMaxAttempts(0)` (try once) | `TransportConfig{MaxAttempts: -1}`; zero now means unset (default 3), NEGATIVE means exactly one attempt |
-| `rt.StandardClient()` + manual `CheckRedirect` | `NewRetryClient(base, policy, cfg)`; policy is a required argument |
-| `WithBackoffFunc` / `Backoff` / `BackoffStop` / `NewExponentialBackoff` | removed; the equal-jitter progression configured by `BaseDelay` is the strategy, `MaxElapsedTime` is the hard ceiling |
-
-`Do` keeps v2's generic-loop semantics exactly: total attempts (minimum 1, `WithMaxAttempts(0)` still means one attempt), transient-only default classification, `RetryAfterHint` honored, context checked after each failure.
 
 ## API
 
@@ -216,7 +201,7 @@ The `github.com/cplieger/httpx/v5/certtest` subpackage supplies throwaway self-s
 - `IsTransient`: classify errors as transient (retryable); respects `PermanentError`. A caller's expired or canceled context is terminal; an `http.Client.Timeout` or transport `ResponseHeaderTimeout` is a per-attempt bound and IS retried (see [Timeouts and deadlines](#timeouts-and-deadlines))
 - `AttemptTimeout(err)` / `IsAttemptTimeout(err)`: mark a timeout as the expiry of a bound over ONE attempt, making it retryable, and test for that mark. The mirror of `Permanent`, and the only way an error that CARRIES `context.DeadlineExceeded` becomes retryable — the mark keeps the deadline visible to `errors.Is(err, context.DeadlineExceeded)` for the caller's own callers. `WithAttemptTimeout` applies it for you (see [Timeouts and deadlines](#timeouts-and-deadlines)).
 - `RetryAfterHint`: an interface (`error` + `RetryAfterHint() time.Duration`) an error implements to supply the next retry wait. `Do` honors it when the error is transient and the duration is positive; the implementer must cap the value, since httpx applies no ceiling of its own here.
-- `Transient`: an interface (`error` + `IsTransient() bool`) an error implements to declare its own retryability, consulted by `IsTransient`. Both capability interfaces embed `error` — like `net.Error` — because they are read through `errors.As`/`errors.AsType` over an error tree, whose nodes are errors by construction, so a caller can write `errors.AsType[httpx.Transient](err)` (`errors.AsType` constrains its type parameter to `error`, where `errors.As` accepted any target).
+- `Transient`: an interface (`error` + `IsTransient() bool`) an error implements to declare its own retryability, consulted by `IsTransient`. Both capability interfaces embed `error`, like `net.Error`, so a caller can write `errors.AsType[httpx.Transient](err)`.
 - `CheckHTTPStatus`: map an HTTP status to a typed error; success is 2xx only (see [Status checking](#status-checking))
 - `IsRetryableStatus(code)`: does the retry loop treat this status as transient? True for 408, 429, and any 5xx. It is the same rule the built-in retry uses, not a copy of it — `GetBytes`'s attempt function calls this function, so the two cannot drift. For the caller that runs `GetBytes` with `WithMaxAttempts(1)` inside its own retry budget and therefore classifies the returned `*StatusError` itself (see [Nesting a door in your own retry loop](#nesting-a-door-in-your-own-retry-loop)). The `RetryRoundTripper`'s default policy is narrower (429/502/503/504); pass this predicate through `TransportConfig.CheckRetry` to widen it.
 - `ParseRetryAfter` / `ParseRetryAfterResponse`: parse a Retry-After header (capped at `RetryAfterCap` / raw)
