@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/httpx/v5"
@@ -199,30 +200,42 @@ func TestGetBytes_exhausts_on_persistent_failure(t *testing.T) {
 	}
 }
 
+// TestGetBytes_aborts_on_context_cancellation pins that a cancel landing during
+// a backoff sleep aborts the loop instead of spending another attempt.
+//
+// It runs in a synctest bubble so the cancel lands at a KNOWN point in the
+// progression rather than a raced one. On a real clock the goroutine's 50ms
+// against the loop's 100ms base delay was a timing bet: a stall long enough to
+// push the cancel past the second inter-attempt sleep would let a third attempt
+// through and fail the call-count assertion for a reason the code did not
+// cause. Under the fake clock the cancel is ordered, so the counts are exact —
+// and synctest.Sleep (Go 1.27) adds the settle that time.Sleep alone does not,
+// so the main goroutine is provably parked in SleepCtx when the cancel arrives.
 func TestGetBytes_aborts_on_context_cancellation(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusTooManyRequests)
-	}))
-	defer srv.Close()
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
 
-	ctx, cancel := context.WithCancel(t.Context())
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
+		ctx, cancel := context.WithCancel(t.Context())
+		go func() {
+			synctest.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
 
-	_, err := httpx.GetBytes(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(100*time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
-	if err == nil {
-		t.Fatalf("Retry after ctx cancel = nil, want error")
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("error = %v, want context.Canceled wrapped", err)
-	}
-	if got := calls.Load(); got > 2 {
-		t.Errorf("server call count = %d, want <= 2", got)
-	}
+		_, err := httpx.GetBytes(ctx, srv.Client(), srv.URL, httpx.WithBaseDelay(100*time.Millisecond), httpx.WithMaxBodyBytes(10<<20))
+		if err == nil {
+			t.Fatalf("Retry after ctx cancel = nil, want error")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("error = %v, want context.Canceled wrapped", err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Errorf("server call count = %d, want exactly 1 (the cancel lands inside the first backoff sleep)", got)
+		}
+	})
 }
 
 func TestGetBytes_body_size_limit(t *testing.T) {
@@ -249,64 +262,70 @@ func TestGetBytes_body_size_limit(t *testing.T) {
 	}
 }
 
+// TestGetBytes_honors_retry_after asserts the honored Retry-After wait EXACTLY,
+// in synthetic time. See TestRetryRoundTripper_retries_on_429_with_retry_after
+// for why the bubble needs httptest.NewTestServer rather than a real listener.
 func TestGetBytes_honors_retry_after(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) == 1 {
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	}))
-	defer srv.Close()
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if calls.Add(1) == 1 {
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}))
 
-	start := time.Now()
-	body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("Retry = %v, want nil", err)
-	}
-	if string(body) != "ok" {
-		t.Errorf("body = %q, want ok", body)
-	}
-	if elapsed < 900*time.Millisecond {
-		t.Errorf("elapsed = %v, want >= 900ms (Retry-After: 1 honored)", elapsed)
-	}
+		start := time.Now()
+		body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Retry = %v, want nil", err)
+		}
+		if string(body) != "ok" {
+			t.Errorf("body = %q, want ok", body)
+		}
+		if elapsed != time.Second {
+			t.Errorf("elapsed = %v, want exactly 1s (the Retry-After, not the 1ms BaseDelay)", elapsed)
+		}
+	})
 }
 
 // TestGetBytes_honors_retry_after_on_503 asserts the Retry helper waits the
 // server-requested Retry-After on a 5xx, not just on 429 (cycle-1 h-f4
 // extended honoring to every retryable 5xx via retryAttempt's >=500 branch).
+// Runs in synthetic time.
 func TestGetBytes_honors_retry_after_on_503(t *testing.T) {
 	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		t.Run(fmt.Sprintf("%d", status), func(t *testing.T) {
-			var calls atomic.Int32
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if calls.Add(1) == 1 {
-					w.Header().Set("Retry-After", "1")
-					w.WriteHeader(status)
-					return
-				}
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte("ok"))
-			}))
-			defer srv.Close()
+			synctest.Test(t, func(t *testing.T) {
+				var calls atomic.Int32
+				srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if calls.Add(1) == 1 {
+						w.Header().Set("Retry-After", "1")
+						w.WriteHeader(status)
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("ok"))
+				}))
 
-			start := time.Now()
-			body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
-			elapsed := time.Since(start)
-			if err != nil {
-				t.Fatalf("Retry = %v, want nil", err)
-			}
-			if string(body) != "ok" {
-				t.Errorf("body = %q, want ok", body)
-			}
-			// Retry-After: 1 must be honored on the 5xx, not just on 429.
-			if elapsed < 900*time.Millisecond {
-				t.Errorf("elapsed = %v, want >= 900ms (Retry-After: 1 honored on %d)", elapsed, status)
-			}
+				start := time.Now()
+				body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, shortOpts()...)
+				elapsed := time.Since(start)
+				if err != nil {
+					t.Fatalf("Retry = %v, want nil", err)
+				}
+				if string(body) != "ok" {
+					t.Errorf("body = %q, want ok", body)
+				}
+				// Retry-After: 1 must be honored on the 5xx, not just on 429.
+				if elapsed != time.Second {
+					t.Errorf("elapsed = %v, want exactly 1s (Retry-After honored on %d)", elapsed, status)
+				}
+			})
 		})
 	}
 }

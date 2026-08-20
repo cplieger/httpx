@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/httpx/v5"
@@ -61,39 +62,54 @@ func TestRetryRoundTripper_retries_on_503(t *testing.T) {
 	}
 }
 
+// TestRetryRoundTripper_retries_on_429_with_retry_after asserts the honored
+// Retry-After wait EXACTLY, in synthetic time.
+//
+// The bubble is what makes the assertion exact. On a real clock this test slept
+// a full second and could only assert a fuzzy lower bound (>= 900ms) to survive
+// scheduler noise, which let a wait of 900ms — or of an hour — pass.
+// synctest.Test virtualizes the clock, and httptest.NewTestServer (Go 1.27)
+// supplies the in-memory network the bubble needs: a real loopback listener
+// parks a goroutine on an external socket, which is never "durably blocked", so
+// the fake clock could never advance and the test would hang until the go test
+// timeout. Server.Listener is nil on that path; Server.URL is "http://example.com"
+// and Server.Client() routes every host to the handler, so nothing else changes.
 func TestRetryRoundTripper_retries_on_429_with_retry_after(t *testing.T) {
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) == 1 {
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if calls.Add(1) == 1 {
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3})
+		client := &http.Client{Transport: rt}
+
+		start := time.Now()
+		resp, err := client.Get(srv.URL)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3})
-	client := &http.Client{Transport: rt}
-
-	start := time.Now()
-	resp, err := client.Get(srv.URL)
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
-	}
-	if elapsed < 900*time.Millisecond {
-		t.Errorf("elapsed = %v, want >= 900ms (Retry-After honored)", elapsed)
-	}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+		if elapsed != time.Second {
+			t.Errorf("elapsed = %v, want exactly 1s (the Retry-After, not the 1ms BaseDelay)", elapsed)
+		}
+	})
 }
 
 // TestRetryRoundTripper_honors_retry_after_on_503 asserts the RoundTripper
 // honors Retry-After on a 5xx, not just on 429 (cycle-1 h-f4 broadened the
-// sleepBeforeRetry override to any retryable response: 429/502/503/504).
+// sleepBeforeRetry override to any retryable response: 429/502/503/504). Runs
+// in synthetic time; see the sibling 429 test for why the bubble needs
+// httptest.NewTestServer.
 func TestRetryRoundTripper_honors_retry_after_on_503(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -105,34 +121,35 @@ func TestRetryRoundTripper_honors_retry_after_on_503(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var calls atomic.Int32
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if calls.Add(1) == 1 {
-					w.Header().Set("Retry-After", "1")
-					w.WriteHeader(tt.status)
-					return
+			synctest.Test(t, func(t *testing.T) {
+				var calls atomic.Int32
+				srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if calls.Add(1) == 1 {
+						w.Header().Set("Retry-After", "1")
+						w.WriteHeader(tt.status)
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+				}))
+
+				rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3})
+				client := &http.Client{Transport: rt}
+
+				start := time.Now()
+				resp, err := client.Get(srv.URL)
+				elapsed := time.Since(start)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
 				}
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer srv.Close()
-
-			rt := httpx.NewRetryRoundTripper(srv.Client().Transport, httpx.TransportConfig{BaseDelay: time.Millisecond, MaxAttempts: 3})
-			client := &http.Client{Transport: rt}
-
-			start := time.Now()
-			resp, err := client.Get(srv.URL)
-			elapsed := time.Since(start)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				t.Errorf("status = %d, want 200", resp.StatusCode)
-			}
-			// Retry-After: 1 must be honored on the 5xx, not just on 429.
-			if elapsed < 900*time.Millisecond {
-				t.Errorf("elapsed = %v, want >= 900ms (Retry-After honored on %s)", elapsed, tt.name)
-			}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Errorf("status = %d, want 200", resp.StatusCode)
+				}
+				// Retry-After: 1 must be honored on the 5xx, not just on 429.
+				if elapsed != time.Second {
+					t.Errorf("elapsed = %v, want exactly 1s (Retry-After honored on %s)", elapsed, tt.name)
+				}
+			})
 		})
 	}
 }
