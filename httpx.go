@@ -466,9 +466,11 @@ func JitteredBackoff(backoff time.Duration) time.Duration {
 	if backoff <= 0 {
 		return backoff
 	}
-	half := int64(backoff) / 2
-	jitter := rand.Int64N(half + 1) //nolint:gosec // G404: jitter, not crypto
-	return time.Duration(half + jitter)
+	// rand.N is generic over any integer kind, so the draw happens in
+	// time.Duration itself rather than round-tripping through int64. half is at
+	// most MaxInt64/2, so half+1 cannot overflow.
+	half := backoff / 2
+	return half + rand.N(half+1) //nolint:gosec // G404: jitter, not crypto
 }
 
 // SafeDouble doubles a duration, guarding against int64 overflow.
