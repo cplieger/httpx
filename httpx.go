@@ -1206,6 +1206,27 @@ func RedactSecret(err error, secret string) error {
 //     this function can no longer match.
 //
 // Composed, that order is: redact, normalize, redact, cap.
+//
+// # This package performs one of those transforms
+//
+// Every URL httpx renders — *[StatusError].Error(), and every "url" attribute
+// in a [GetBytes] log line — goes through a parse-and-re-serialize step that
+// blanks query values and drops userinfo. That step is a URL-encoding transform
+// in rule 2's sense, so redacting a known secret out of one of those strings is
+// the "only after the transform" mistake. Measured on go1.27.0 (identical on
+// go1.26.7): for a secret in the request PATH, which is the one
+// credential-bearing position the rendering keeps verbatim, a secret containing
+// a space renders as tok%20en, a non-ASCII byte as tok%C3%A9n, and a '#'
+// truncates the value at the fragment boundary — so a byte-exact needle held in
+// the caller's own representation matches none of them and the value reaches the
+// log percent-encoded. A stray '%' is the safe case: the URL fails to parse and
+// the whole rendering collapses to a fixed placeholder.
+//
+// So a caller holding a credential that rides in a URL PATH must redact it
+// before the URL reaches this package (or pass the needle in its
+// percent-encoded form as well). A credential in the query string or the
+// userinfo needs nothing: the rendering removes those wholesale, without
+// matching anything.
 func RedactSecretString(s string, secret Secret) string {
 	if secret == "" {
 		return s
@@ -1220,6 +1241,13 @@ func RedactSecretString(s string, secret Secret) string {
 // IHttpClientFactory adopted). Query keys, scheme, host, and path are kept for
 // debugging; the fragment is dropped. Unparseable input yields a fixed
 // placeholder rather than risk logging a raw secret-bearing string.
+//
+// It re-serializes the URL, so it is a normalizing transform in the sense
+// [RedactSecretString]'s ordering contract means: a secret in the PATH — the one
+// credential-bearing position this function keeps verbatim — can come out
+// percent-encoded, and a caller redacting it out of the result afterwards then
+// matches nothing. The contract's "this package performs one of those
+// transforms" section carries the measurements and the caller's obligation.
 func redactURL(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
