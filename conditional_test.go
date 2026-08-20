@@ -208,8 +208,7 @@ func TestDoConditionalStatusMapping(t *testing.T) {
 			name: "429 maps to RateLimitError", status: http.StatusTooManyRequests,
 			check: func(t *testing.T, err error) {
 				t.Helper()
-				var rl *RateLimitError
-				if !errors.As(err, &rl) {
+				if _, ok := errors.AsType[*RateLimitError](err); !ok {
 					t.Errorf("err = %v, want *RateLimitError", err)
 				}
 			},
@@ -218,8 +217,7 @@ func TestDoConditionalStatusMapping(t *testing.T) {
 			name: "401 maps to AuthError", status: http.StatusUnauthorized,
 			check: func(t *testing.T, err error) {
 				t.Helper()
-				var ae *AuthError
-				if !errors.As(err, &ae) {
+				if _, ok := errors.AsType[*AuthError](err); !ok {
 					t.Errorf("err = %v, want *AuthError", err)
 				}
 			},
@@ -248,8 +246,7 @@ func TestDoConditionalStatusMapping(t *testing.T) {
 				}
 				// The fallback is still reachable in v4, just narrower: a 2xx
 				// that is neither the 200 nor the 304 handled above.
-				var se *HTTPStatusError
-				if errors.As(err, &se) {
+				if _, ok := errors.AsType[*HTTPStatusError](err); ok {
 					t.Errorf("err = %T, want the plain unexpected-status error, not a status mapping", err)
 				}
 			},

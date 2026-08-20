@@ -167,8 +167,8 @@ func Permanent(err error) error {
 
 // IsPermanent reports whether err (or any wrapped error) is a *PermanentError.
 func IsPermanent(err error) bool {
-	var pe *PermanentError
-	return errors.As(err, &pe)
+	_, ok := errors.AsType[*PermanentError](err)
+	return ok
 }
 
 // --- Transient marking ---
@@ -300,8 +300,8 @@ func AttemptTimeout(err error) error {
 // IsAttemptTimeout reports whether err (or any wrapped error) was marked by
 // [AttemptTimeout] as a per-attempt timeout.
 func IsAttemptTimeout(err error) bool {
-	var ate *attemptTimeoutError
-	return errors.As(err, &ate)
+	_, ok := errors.AsType[*attemptTimeoutError](err)
+	return ok
 }
 
 // --- Constants ---
@@ -537,12 +537,10 @@ func IsTransient(err error) bool {
 	if IsPermanent(err) {
 		return false
 	}
-	var authErr *AuthError
-	if errors.As(err, &authErr) {
+	if _, ok := errors.AsType[*AuthError](err); ok {
 		return false
 	}
-	var rlErr *RateLimitError
-	if errors.As(err, &rlErr) {
+	if _, ok := errors.AsType[*RateLimitError](err); ok {
 		return false
 	}
 	// Ordered ahead of the context-error rejection on purpose: the mark exists
@@ -560,12 +558,10 @@ func IsTransient(err error) bool {
 	if isCallerContextError(err) {
 		return false
 	}
-	var t Transient
-	if errors.As(err, &t) {
+	if t, ok := errors.AsType[Transient](err); ok {
 		return t.IsTransient()
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
+	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
 		return true
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
@@ -574,8 +570,8 @@ func IsTransient(err error) bool {
 	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
 		return true
 	}
-	var dnsErr *net.DNSError
-	return errors.As(err, &dnsErr)
+	_, isDNS := errors.AsType[*net.DNSError](err)
+	return isDNS
 }
 
 // isCallerContextError reports whether err says the CALLER's context expired
@@ -611,6 +607,11 @@ func IsTransient(err error) bool {
 //     back in. (Through an *http.Client this case does not arise for a caller
 //     deadline: net/http prefers the request context's own error over the dial
 //     error whenever that context is done, so the sentinel is present.)
+//
+// The final line stays on [errors.As] rather than [errors.AsType]: it asks one
+// question about two types, and AsType cannot be an expression, so the rewrite
+// would split that single boolean fact into two statements and an early return.
+// Neither binding is read, so nothing is gained by paying for it.
 func isCallerContextError(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return true
@@ -1152,8 +1153,7 @@ func RedactTransportError(err error, prefix string, secret Secret) error {
 	if err == nil {
 		return nil
 	}
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
 		err = urlErrorCause(urlErr)
 	}
 	var wrapped error
@@ -1261,8 +1261,7 @@ func LogSafeError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
 		return urlErrorCause(urlErr)
 	}
 	return err
