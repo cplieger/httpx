@@ -320,11 +320,16 @@ func resolveWait(explicit, backoff time.Duration) time.Duration {
 // runAttempt runs one attempt of fn under the configured per-attempt bound
 // (WithAttemptTimeout). With no bound configured fn sees the caller's context
 // unchanged, so the option-absent path is exactly a direct call.
-func runAttempt[T any](ctx context.Context, cfg *loopConfig, fn func(ctx context.Context) (T, error)) (T, error) {
-	if cfg.attemptTimeout <= 0 {
+//
+// It is a generic METHOD (Go 1.27). Before 1.27 a method could not declare its
+// own type parameter, so this operation had to be a package-level function
+// taking its receiver as an argument — the one member of loopConfig's six that
+// was not a method, for a reason that no longer exists.
+func (c *loopConfig) runAttempt[T any](ctx context.Context, fn func(ctx context.Context) (T, error)) (T, error) {
+	if c.attemptTimeout <= 0 {
 		return fn(ctx)
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, cfg.attemptTimeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, c.attemptTimeout)
 	defer cancel()
 	result, err := fn(attemptCtx)
 	return result, markAttemptTimeout(ctx, attemptCtx, err)
@@ -439,7 +444,7 @@ func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opt
 	var lastErr error
 	backoff := cfg.baseDelay
 	for attempt := range cfg.maxAttempts {
-		result, err := runAttempt(ctx, &cfg, fn)
+		result, err := cfg.runAttempt(ctx, fn)
 		if err == nil {
 			cfg.logRetrySuccess(attempt)
 			return result, nil
