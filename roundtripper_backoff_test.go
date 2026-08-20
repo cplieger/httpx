@@ -224,8 +224,7 @@ func TestRetryRoundTripper_sleep_error_aborts_with_bare_context_error(t *testing
 	if err == nil {
 		t.Fatal("RoundTrip err = nil, want context error from interrupted sleep")
 	}
-	var ue *url.Error
-	if errors.As(err, &ue) {
+	if _, ok := errors.AsType[*url.Error](err); ok {
 		t.Errorf("RoundTrip err = %T (%v), want bare context error, not *url.Error", err, err)
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {

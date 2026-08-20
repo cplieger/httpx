@@ -119,8 +119,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 			calls++
 			return &HTTPStatusError{Code: 503}
 		})
-		var statusErr *HTTPStatusError
-		if !errors.As(err, &statusErr) {
+		if _, ok := errors.AsType[*HTTPStatusError](err); !ok {
 			t.Fatalf("expected *HTTPStatusError, got %v", err)
 		}
 		if calls != 1 {
@@ -156,8 +155,7 @@ func TestDoRateLimitOnly(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error after exhausting attempts")
 		}
-		var rlErr *RateLimitError
-		if !errors.As(err, &rlErr) {
+		if _, ok := errors.AsType[*RateLimitError](err); !ok {
 			t.Fatalf("expected RateLimitError, got %T: %v", err, err)
 		}
 		if calls != 2 {
@@ -296,8 +294,7 @@ func TestDo(t *testing.T) {
 			calls++
 			return "", &RateLimitError{Msg: "429", RetryAfter: time.Millisecond}
 		}, WithMaxAttempts(3), WithBaseDelay(time.Millisecond))
-		var rlErr *RateLimitError
-		if !errors.As(err, &rlErr) {
+		if _, ok := errors.AsType[*RateLimitError](err); !ok {
 			t.Fatalf("expected *RateLimitError, got %v", err)
 		}
 		if calls != 1 {
@@ -438,8 +435,7 @@ func TestPermanentError(t *testing.T) {
 		if !errors.Is(pe, inner) {
 			t.Error("errors.Is(pe, inner) = false")
 		}
-		var target *PermanentError
-		if !errors.As(pe, &target) {
+		if _, ok := errors.AsType[*PermanentError](pe); !ok {
 			t.Error("errors.As(*PermanentError) = false")
 		}
 	})
@@ -734,8 +730,7 @@ func TestDoRateLimitOnly_zero_attempts_clamps_to_one(t *testing.T) {
 		return sentinel
 	})
 	// maxAttempts<1 clamps to 1: fn runs exactly once and its error is returned.
-	var rlErr *RateLimitError
-	if !errors.As(err, &rlErr) {
+	if _, ok := errors.AsType[*RateLimitError](err); !ok {
 		t.Errorf("Do(rate-limit-only, maxAttempts=0) = %v, want the single attempt's *RateLimitError", err)
 	}
 	if calls != 1 {
@@ -754,8 +749,7 @@ func TestDoRateLimitOnly_no_sleep_after_final_attempt(t *testing.T) {
 	err := doRateLimited(ctx, 1, time.Minute, func(_ context.Context) error {
 		return &RateLimitError{Msg: "slow"}
 	})
-	var rlErr *RateLimitError
-	if !errors.As(err, &rlErr) {
+	if _, ok := errors.AsType[*RateLimitError](err); !ok {
 		t.Errorf("Do(rate-limit-only, maxAttempts=1) = %v, want *RateLimitError (no trailing sleep)", err)
 	}
 }
@@ -783,8 +777,7 @@ func TestDoRateLimitOnly_positive_retry_after_caps_below_max_wait(t *testing.T) 
 	err := doRateLimited(ctx, 2, 10*time.Second, func(_ context.Context) error {
 		return &RateLimitError{Msg: "slow", RetryAfter: 10 * time.Millisecond}
 	})
-	var rlErr *RateLimitError
-	if !errors.As(err, &rlErr) {
+	if _, ok := errors.AsType[*RateLimitError](err); !ok {
 		t.Errorf("Do(rate-limit-only, RetryAfter=10ms) = %v, want *RateLimitError (RetryAfter honored)", err)
 	}
 }

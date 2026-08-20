@@ -271,7 +271,7 @@ func newLoopConfig(opts []DoOption) loopConfig {
 // newGetConfig builds a GetBytes configuration from opts (nil options are
 // skipped) and applies defaults.
 func newGetConfig(opts []GetOption) getConfig {
-	cfg := getConfig{loopConfig: loopConfig{maxAttempts: DefaultMaxAttempts}}
+	cfg := getConfig{maxAttempts: DefaultMaxAttempts}
 	for _, o := range opts {
 		if o != nil {
 			o.applyGet(&cfg)
@@ -298,8 +298,7 @@ func (c *loopConfig) logRetrySuccess(attempt int) {
 // the RetryAfterHint interface (already capped by the implementer, see the
 // interface doc); zero means no hint.
 func retryAfterHintWait(err error) time.Duration {
-	var h RetryAfterHint
-	if errors.As(err, &h) {
+	if h, ok := errors.AsType[RetryAfterHint](err); ok {
 		if d := h.RetryAfterHint(); d > 0 {
 			return d
 		}
@@ -361,8 +360,7 @@ func markAttemptTimeout(ctx, attemptCtx context.Context, err error) error {
 // explicit wait to honor (zero means jittered backoff).
 func (c *loopConfig) classify(err error) (retryable bool, explicitWait time.Duration) {
 	if c.rlMode != rlNone {
-		var rl *RateLimitError
-		if errors.As(err, &rl) {
+		if rl, ok := errors.AsType[*RateLimitError](err); ok {
 			wait := c.rlMaxWait
 			if rl.RetryAfter > 0 {
 				wait = min(rl.RetryAfter, c.rlMaxWait)
@@ -628,8 +626,7 @@ func getAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *ge
 	// the cap+1 probe, its int64-overflow guard, and closing the body.
 	body, err := ReadLimitedBody(resp.Body, cfg.maxBodyBytes)
 	if err != nil {
-		var tooLarge *ResponseTooLargeError
-		if errors.As(err, &tooLarge) {
+		if _, ok := errors.AsType[*ResponseTooLargeError](err); ok {
 			return nil, 0, err
 		}
 		return nil, 0, fmt.Errorf("read response: %w", err)
@@ -645,6 +642,6 @@ func (e *retryableError) Unwrap() error { return e.err }
 
 // isRetryStatus reports whether an error from getAttempt is retryable.
 func isRetryStatus(err error) bool {
-	var re *retryableError
-	return errors.As(err, &re)
+	_, ok := errors.AsType[*retryableError](err)
+	return ok
 }
