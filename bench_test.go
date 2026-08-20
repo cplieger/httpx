@@ -55,8 +55,7 @@ func BenchmarkRetryRoundTripper_Success(b *testing.B) {
 	rt := NewRetryRoundTripper(&stubRT{resp: okResp}, TransportConfig{MaxAttempts: 3})
 	req, _ := http.NewRequestWithContext(b.Context(), http.MethodGet, "http://example.com", http.NoBody)
 
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		resp, err := rt.RoundTrip(req)
 		if err != nil {
 			b.Fatal(err)
@@ -80,8 +79,7 @@ func BenchmarkRetryRoundTripper_RetryThenSuccess(b *testing.B) {
 	rt := NewRetryRoundTripper(inner, TransportConfig{MaxAttempts: 4, BaseDelay: time.Nanosecond})
 	req, _ := http.NewRequestWithContext(b.Context(), http.MethodGet, "http://example.com", http.NoBody)
 
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		inner.reset()
 		resp, err := rt.RoundTrip(req)
 		if err != nil {
@@ -98,7 +96,7 @@ func BenchmarkRetryRoundTripper_RetryThenSuccess(b *testing.B) {
 
 func BenchmarkJitteredBackoff(b *testing.B) {
 	base := time.Second
-	for range b.N {
+	for b.Loop() {
 		_ = JitteredBackoff(base)
 	}
 }
@@ -107,7 +105,7 @@ func BenchmarkJitteredBackoff(b *testing.B) {
 
 func BenchmarkSafeDouble(b *testing.B) {
 	d := 500 * time.Millisecond
-	for range b.N {
+	for b.Loop() {
 		d = SafeDouble(d)
 		if d < 0 {
 			d = 500 * time.Millisecond // reset to prevent trivial ops at max
@@ -118,7 +116,7 @@ func BenchmarkSafeDouble(b *testing.B) {
 // --- ParseRetryAfter benchmarks ---
 
 func BenchmarkParseRetryAfter_Seconds(b *testing.B) {
-	for range b.N {
+	for b.Loop() {
 		_ = ParseRetryAfter("30")
 	}
 }
@@ -126,13 +124,13 @@ func BenchmarkParseRetryAfter_Seconds(b *testing.B) {
 func BenchmarkParseRetryAfter_HTTPDate(b *testing.B) {
 	// A fixed date string to exercise the HTTP-date parsing path.
 	header := "Tue, 03 Jun 2025 08:00:00 GMT"
-	for range b.N {
+	for b.Loop() {
 		_ = ParseRetryAfter(header)
 	}
 }
 
 func BenchmarkParseRetryAfter_Empty(b *testing.B) {
-	for range b.N {
+	for b.Loop() {
 		_ = ParseRetryAfter("")
 	}
 }
@@ -142,21 +140,20 @@ func BenchmarkParseRetryAfter_Empty(b *testing.B) {
 func BenchmarkIsTransient_UnexpectedEOF(b *testing.B) {
 	// io.ErrUnexpectedEOF is the canonical transient network error path.
 	err := fmt.Errorf("read body: %w", io.ErrUnexpectedEOF)
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = IsTransient(err)
 	}
 }
 
 func BenchmarkIsTransient_Nil(b *testing.B) {
-	for range b.N {
+	for b.Loop() {
 		_ = IsTransient(nil)
 	}
 }
 
 func BenchmarkIsTransient_PermanentError(b *testing.B) {
 	err := Permanent(errors.New("bad request"))
-	for range b.N {
+	for b.Loop() {
 		_ = IsTransient(err)
 	}
 }
