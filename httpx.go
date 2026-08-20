@@ -41,9 +41,18 @@ type RateLimitError struct {
 
 func (e *RateLimitError) Error() string { return e.Msg }
 
-// Transient is the interface for errors that can report whether they
-// represent a transient (retryable) failure.
+// Transient is the interface an error implements to report whether it
+// represents a transient (retryable) failure. It embeds error because every
+// value this interface can ever name IS one: it is read through
+// [errors.As]/[errors.AsType] over an error tree, whose nodes are errors by
+// construction, so a non-error implementation is unreachable. Declaring the
+// error half makes the type say that, keeps Error() available on a recovered
+// value for diagnostics, and is what lets a caller write
+// errors.AsType[Transient](err) — [errors.AsType] constrains its type
+// parameter to error, where the older [errors.As] accepted any target. Same
+// shape as [net.Error].
 type Transient interface {
+	error
 	IsTransient() bool
 }
 
@@ -56,7 +65,12 @@ type Transient interface {
 // hint MUST already be capped by the implementer (e.g. via ParseRetryAfter);
 // Do sleeps on it verbatim and applies no ceiling of its own, so an uncapped
 // value is an unbounded-wait hazard.
+//
+// It embeds error for the same reason [Transient] does: the interface is read
+// through [errors.As]/[errors.AsType] over an error tree, so it can only ever
+// name an error.
 type RetryAfterHint interface {
+	error
 	RetryAfterHint() time.Duration
 }
 

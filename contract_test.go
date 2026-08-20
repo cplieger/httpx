@@ -508,3 +508,71 @@ func assertTerminalLine(t *testing.T, logged, msg, wantLevel string) {
 	}
 	t.Errorf("no %q line logged; got:\n%s", msg, logged)
 }
+
+// === v5 contract: the two capability interfaces are reachable by errors.AsType
+
+// TestCapabilityInterfacesSatisfyError pins the v5 shape of httpx.Transient and
+// httpx.RetryAfterHint: both embed error, so both satisfy errors.AsType's
+// [E error] type parameter.
+//
+// It is a compile-time contract with a runtime witness. The compile half is the
+// two errors.AsType instantiations below: before v5 neither interface declared
+// an Error method, so both spellings were rejected with "Transient does not
+// satisfy error (missing method Error)" — and Go 1.27's
+// `go fix -errorsastype` rewrote httpx's own errors.As sites (and every
+// consumer's) into exactly that non-compiling form, because the fixer does not
+// check the constraint before rewriting. Deleting the embedded error from
+// either interface re-breaks this file.
+//
+// The runtime half pins that the wider declared type did not narrow the found
+// set: errors.As over an error tree can only ever reach values that are already
+// errors, so requiring Error() adds no condition an implementor in a chain can
+// fail. Both spellings must therefore agree on the same error.
+func TestCapabilityInterfacesSatisfyError(t *testing.T) {
+	t.Parallel()
+
+	// Wrapped twice so both spellings have to walk the chain rather than match
+	// the top-level value.
+	transientErr := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", httpx.MarkTransient(errors.New("boom"))))
+
+	tr, ok := errors.AsType[httpx.Transient](transientErr)
+	if !ok {
+		t.Fatal("errors.AsType[httpx.Transient] = false, want true")
+	}
+	if !tr.IsTransient() {
+		t.Error("Transient.IsTransient() = false, want true")
+	}
+	// The embedded error is what makes the recovered value self-describing.
+	if got := tr.Error(); got != "boom" {
+		t.Errorf("Transient.Error() = %q, want %q", got, "boom")
+	}
+	var viaAs httpx.Transient
+	if !errors.As(transientErr, &viaAs) || viaAs != tr {
+		t.Errorf("errors.As and errors.AsType disagree on httpx.Transient: As gave %v, AsType gave %v", viaAs, tr)
+	}
+
+	hintErr := fmt.Errorf("outer: %w", &fixedHint{d: 3 * time.Second})
+
+	h, ok := errors.AsType[httpx.RetryAfterHint](hintErr)
+	if !ok {
+		t.Fatal("errors.AsType[httpx.RetryAfterHint] = false, want true")
+	}
+	if got := h.RetryAfterHint(); got != 3*time.Second {
+		t.Errorf("RetryAfterHint.RetryAfterHint() = %v, want 3s", got)
+	}
+	if got := h.Error(); got != "hinted" {
+		t.Errorf("RetryAfterHint.Error() = %q, want %q", got, "hinted")
+	}
+	var hintViaAs httpx.RetryAfterHint
+	if !errors.As(hintErr, &hintViaAs) || hintViaAs != h {
+		t.Errorf("errors.As and errors.AsType disagree on httpx.RetryAfterHint: As gave %v, AsType gave %v", hintViaAs, h)
+	}
+}
+
+// fixedHint is a minimal httpx.RetryAfterHint implementor for the contract test
+// above. It is the shape a consumer writes, so it doubles as the check that an
+// ordinary implementor needs nothing beyond the Error method it already had.
+type fixedHint struct{ d time.Duration }
+
+func (e *fixedHint) Error() string                 { return "hinted" }
+func (e *fixedHint) RetryAfterHint() time.Duration { return e.d }
