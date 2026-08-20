@@ -124,7 +124,7 @@ defer rc.Close()
 
 ## Migrating from v4
 
-v5 is signature hardening only — no behavior changes. The redaction helpers take the secret as a named type, `Secret`, so the value-to-hide and the text-to-scan cannot be transposed at a call site (a reversed call turns the redactor into a leak), and the two presence-style redirect options take the `bool` their neighbour `WithAllowSchemeDowngrade` always did.
+v5 is signature hardening only — no behavior changes. The redaction helpers take the secret as a named type, `Secret`, so the value-to-hide and the text-to-scan cannot be transposed at a call site (a reversed call turns the redactor into a leak); the two presence-style redirect options take the `bool` their neighbour `WithAllowSchemeDowngrade` always did; and the two capability interfaces embed `error`.
 
 | v4 | v5 |
 | --- | --- |
@@ -132,9 +132,13 @@ v5 is signature hardening only — no behavior changes. The redaction helpers ta
 | `RedactTransportError(err, prefix, secret)` — `prefix` and `secret` both plain `string` | `RedactTransportError(err, prefix, httpx.Secret(token))` |
 | `WithSameHost()` | `WithSameHost(true)`; `false` is the no-option default (only allowlisted targets are followed) |
 | `WithPreserveMethod()` | `WithPreserveMethod(true)`; `false` is the no-option default (a method-changing hop is followed as net/http rewrites it) |
+| `Transient` = `IsTransient() bool` | `Transient` = `error` + `IsTransient() bool` |
+| `RetryAfterHint` = `RetryAfterHint() time.Duration` | `RetryAfterHint` = `error` + `RetryAfterHint() time.Duration` |
 | module path suffix `/v4` | `github.com/cplieger/httpx/v5` in `go.mod` and every import |
 
 A call passing an untyped string constant (`RedactSecretString(s, "token")`) compiles unchanged; only a `string` variable in the secret position needs the `httpx.Secret(...)` conversion. A transposed call — the secret where the text belongs — is now a compile error, which is the point. `RedactSecret(err, secret)` is unchanged: its parameters already differ in type, so a swap never compiled.
+
+The two interface changes need no work in a normal implementor: an implementor is an error already, or it could not appear in the chain `errors.As` walks. Only a type that declared `IsTransient()`/`RetryAfterHint()` without an `Error()` method stops satisfying — such a type was never reachable through either interface's only access path. What the change buys the caller is `errors.AsType`: `errors.AsType[httpx.Transient](err)` and `errors.AsType[httpx.RetryAfterHint](err)` now compile, where before `errors.AsType`'s `[E error]` constraint refused both and `go fix -errorsastype` produced code that did not build.
 
 ## Migrating from v3
 
@@ -211,7 +215,8 @@ The `github.com/cplieger/httpx/v5/certtest` subpackage supplies throwaway self-s
 
 - `IsTransient`: classify errors as transient (retryable); respects `PermanentError`. A caller's expired or canceled context is terminal; an `http.Client.Timeout` or transport `ResponseHeaderTimeout` is a per-attempt bound and IS retried (see [Timeouts and deadlines](#timeouts-and-deadlines))
 - `AttemptTimeout(err)` / `IsAttemptTimeout(err)`: mark a timeout as the expiry of a bound over ONE attempt, making it retryable, and test for that mark. The mirror of `Permanent`, and the only way an error that CARRIES `context.DeadlineExceeded` becomes retryable — the mark keeps the deadline visible to `errors.Is(err, context.DeadlineExceeded)` for the caller's own callers. `WithAttemptTimeout` applies it for you (see [Timeouts and deadlines](#timeouts-and-deadlines)).
-- `RetryAfterHint`: an interface (`RetryAfterHint() time.Duration`) an error implements to supply the next retry wait. `Do` honors it when the error is transient and the duration is positive; the implementer must cap the value, since httpx applies no ceiling of its own here.
+- `RetryAfterHint`: an interface (`error` + `RetryAfterHint() time.Duration`) an error implements to supply the next retry wait. `Do` honors it when the error is transient and the duration is positive; the implementer must cap the value, since httpx applies no ceiling of its own here.
+- `Transient`: an interface (`error` + `IsTransient() bool`) an error implements to declare its own retryability, consulted by `IsTransient`. Both capability interfaces embed `error` — like `net.Error` — because they are read through `errors.As`/`errors.AsType` over an error tree, whose nodes are errors by construction, so a caller can write `errors.AsType[httpx.Transient](err)` (`errors.AsType` constrains its type parameter to `error`, where `errors.As` accepted any target).
 - `CheckHTTPStatus`: map an HTTP status to a typed error; success is 2xx only (see [Status checking](#status-checking))
 - `IsRetryableStatus(code)`: does the retry loop treat this status as transient? True for 408, 429, and any 5xx. It is the same rule the built-in retry uses, not a copy of it — `GetBytes`'s attempt function calls this function, so the two cannot drift. For the caller that runs `GetBytes` with `WithMaxAttempts(1)` inside its own retry budget and therefore classifies the returned `*StatusError` itself (see [Nesting a door in your own retry loop](#nesting-a-door-in-your-own-retry-loop)). The `RetryRoundTripper`'s default policy is narrower (429/502/503/504); pass this predicate through `TransportConfig.CheckRetry` to widen it.
 - `ParseRetryAfter` / `ParseRetryAfterResponse`: parse a Retry-After header (capped at `RetryAfterCap` / raw)

@@ -41,7 +41,8 @@
 // # Classification and error control
 //
 // [IsTransient] decides retryability; extend it for your own error types via
-// the [Transient] and [RetryAfterHint] interfaces, or mark one error at a time
+// the [Transient] and [RetryAfterHint] interfaces (both embed error, so
+// [errors.AsType] reaches them), or mark one error at a time
 // with [MarkTransient]. [Permanent] (and [PermanentError], [IsPermanent])
 // marks an error non-retryable;
 // [AttemptTimeout] (and [IsAttemptTimeout]) marks a timeout as the expiry of a
