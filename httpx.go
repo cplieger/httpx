@@ -325,6 +325,96 @@ const redirectCap = 5
 
 // --- Retry-After parsing ---
 
+// maxRetryAfterDateLen bounds what will be handed to [http.ParseTime].
+//
+// Every date format it accepts is short: IMF-fixdate is 29 characters, RFC 850
+// with the longest weekday is 33, and asctime is 24. 64 clears all three, so no
+// value this refuses could have parsed as a date.
+//
+// The bound exists because the parse amplifies. Each of ParseTime's three
+// failed layout attempts CLONES the input into the error it returns, so a long
+// value is copied several times over on its way to being rejected: measured at
+// about 7 bytes of allocation per header byte, which made a 1 MB Retry-After
+// cost roughly 7 MB of garbage. The allocation COUNT stays flat whatever the
+// length, so no metric the weekly benchmark tracker charts could see it. The
+// header is upstream-controlled, and an upstream that is already failing is the
+// one sending it.
+const maxRetryAfterDateLen = 64
+
+// looksLikeDeltaSeconds reports whether h has the shape strconv.ParseInt
+// accepts at base 10: an optional sign followed by at least one ASCII digit.
+//
+// It is a pre-filter rather than an optimization of the parse. Handing a long
+// non-numeric value straight to ParseInt makes IT clone the whole string into a
+// *strconv.NumError that is discarded, which is the same amplification the date
+// bound above exists to prevent. A scan costs nothing and there is no length
+// bound to be had here, because a delta-seconds value may carry unlimited
+// leading zeros and still parse.
+func looksLikeDeltaSeconds(h string) bool {
+	if h == "" {
+		return false
+	}
+	if h[0] == '+' || h[0] == '-' {
+		h = h[1:]
+	}
+	if h == "" {
+		return false
+	}
+	for i := range len(h) {
+		if h[i] < '0' || h[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// maxInt64Digits is the number of digits in math.MaxInt64 (9223372036854775807).
+// A delta-seconds value with more SIGNIFICANT digits than this cannot fit an
+// int64, so strconv.ParseInt would return a range error and the value would end
+// up as zero. Deciding that from the digit count instead keeps the oversized
+// string away from ParseInt, which clones its whole input into the error it
+// builds; leading zeros are stripped first because they are unbounded and carry
+// no magnitude.
+const maxInt64Digits = 19
+
+// deltaSeconds interprets h, already known to have the delta-seconds shape, as a
+// Retry-After wait. Zero for anything non-positive or out of range, matching
+// what the two parsers between them used to return for the same input.
+func deltaSeconds(h string) time.Duration {
+	// Every negative value ends as zero (a wait in the past is no wait), so it
+	// never needs parsing at all.
+	if h[0] == '-' {
+		return 0
+	}
+	h = strings.TrimPrefix(h, "+")
+	// TrimLeft returns a substring, so this costs nothing.
+	if h = strings.TrimLeft(h, "0"); h == "" {
+		return 0 // all zeros, however many
+	}
+	if len(h) > maxInt64Digits {
+		return 0
+	}
+	n, err := strconv.ParseInt(h, 10, 64)
+	if err != nil {
+		// Nineteen digits can still exceed MaxInt64. The clone ParseInt makes
+		// here is of a 19-byte string, not of the header.
+		return 0
+	}
+	if n <= 0 {
+		return 0
+	}
+	// int64 guard is correct on 32-bit platforms: ParseInt(...,10,64)
+	// keeps parsing and the guard in int64 space, so a large delta-seconds
+	// value is capped rather than (as strconv.Atoi did) failing with a
+	// range error above the platform int max on GOARCH=386 and falling
+	// through to HTTP-date parsing.
+	const maxSecs = (1<<63 - 1) / int64(time.Second)
+	if n > maxSecs {
+		return time.Duration(maxSecs) * time.Second
+	}
+	return time.Duration(n) * time.Second
+}
+
 // parseRetryAfterValue parses a Retry-After header value (delta-seconds or
 // HTTP-date) into an uncapped, non-negative duration. Returns zero for
 // missing, malformed, or past values. It is the shared core for both
@@ -334,20 +424,11 @@ func parseRetryAfterValue(h string) time.Duration {
 	if h == "" {
 		return 0
 	}
-	if n, err := strconv.ParseInt(h, 10, 64); err == nil {
-		if n <= 0 {
-			return 0
-		}
-		// int64 guard is correct on 32-bit platforms: ParseInt(...,10,64)
-		// keeps parsing and the guard in int64 space, so a large delta-seconds
-		// value is capped rather than (as strconv.Atoi did) failing with a
-		// range error above the platform int max on GOARCH=386 and falling
-		// through to HTTP-date parsing.
-		const maxSecs = (1<<63 - 1) / int64(time.Second)
-		if n > maxSecs {
-			return time.Duration(maxSecs) * time.Second
-		}
-		return time.Duration(n) * time.Second
+	if looksLikeDeltaSeconds(h) {
+		return deltaSeconds(h)
+	}
+	if len(h) > maxRetryAfterDateLen {
+		return 0
 	}
 	if t, err := http.ParseTime(h); err == nil {
 		if d := time.Until(t); d > 0 {

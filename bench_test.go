@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -266,6 +267,14 @@ var (
 // with a garbage tail), and a rewrite that grew the count per input byte or per
 // added layout would blow past this long before it reached it.
 const maxParseAllocs = 32
+
+// maxParseBytes is the same kind of ceiling for allocated BYTES, and it is the
+// one that can actually see a header-copying parse. Measured worst case across
+// every class and length is 336 bytes, all of it from the date parse on inputs
+// under the date bound; the pre-fix behaviour reached roughly 7 MB on a 1 MB
+// header. Anything between those two numbers is a parse that has started
+// copying what the upstream sent.
+const maxParseBytes = 4096
 
 // maxRedactAllocs is the same kind of ceiling for the error-shaped redaction
 // helpers, whose prefixed form measures 5.
@@ -667,10 +676,16 @@ func TestParseRetryAfterCostDoesNotScaleWithHeaderLength(t *testing.T) {
 					baseline = got
 					continue
 				}
-				if got != baseline {
+				// Not-greater rather than equal. A long value now short-circuits
+				// before either parser touches it, so its count DROPS to zero
+				// while the shortest fixture still runs the date parse, and an
+				// equality would report that improvement as a failure. Growth is
+				// the regression; a fall is the fix.
+				if got > baseline {
 					t.Errorf("ParseRetryAfter(%s) allocated %v times per run at "+
-						"length %d but %v at length %d, want equal: parsing cost "+
-						"must not grow with a header the upstream sizes",
+						"length %d but only %v at length %d, want no more than the "+
+						"short input: parsing cost must not grow with a header the "+
+						"upstream sizes",
 						abbrev(h), got, n, baseline, class.lengths[0])
 				}
 				if got > maxParseAllocs {
@@ -678,13 +693,47 @@ func TestParseRetryAfterCostDoesNotScaleWithHeaderLength(t *testing.T) {
 						"length %d, want at most %d", abbrev(h), got, n, maxParseAllocs)
 				}
 			}
+			// BYTES are the axis that carried the defect, and the count above was
+			// blind to it. strconv.ParseInt and each of http.ParseTime's three
+			// failed layout attempts CLONE the input into the error they return,
+			// so an unparseable header used to cost about 7 bytes of allocation
+			// per header byte while the count stayed flat: a 1 MB Retry-After
+			// bought roughly 7 MB of garbage, upstream-controlled, from a sender
+			// that is already failing. Fixed by pre-filtering the numeric shape
+			// (so ParseInt never sees a non-numeric string) and bounding what
+			// reaches ParseTime by the longest date format it accepts.
+			//
+			// The assertion is an absolute CEILING, not a ratio and not equality
+			// against the shortest fixture. Below the date bound the parse still
+			// runs and its byte cost varies a little with the input, so the
+			// shortest measurement is neither the minimum nor a stable divisor;
+			// above the bound the cost is zero. What holds at every length is
+			// that the total is bounded by a constant, and that is exactly what
+			// a proportional parse cannot satisfy: the old behaviour reached
+			// about 7 MB on a 1 MB header, four orders of magnitude past this.
+			var maxBytes uint64
+			for _, n := range class.lengths {
+				h := class.build(n)
+				got := allocBytesPerRun(50, func() {
+					durSink = ParseRetryAfter(h)
+				})
+				maxBytes = max(maxBytes, got)
+				if got > maxParseBytes {
+					t.Errorf("ParseRetryAfter(%s) allocated %d bytes per run at "+
+						"length %d, want at most %d at any length: a parse that "+
+						"copies the header charges the process for a value the "+
+						"upstream chose the size of",
+						abbrev(h), got, n, maxParseBytes)
+				}
+			}
+
 			// Logged only on the way to green: on failure the numbers above are
 			// the story, and a "constant N" summary derived from the smallest
 			// input would contradict them.
 			if !t.Failed() {
-				t.Logf("%s: a constant %v allocations from %d to %d header bytes "+
-					"(byte volume does grow, ~7x the header; see the comment)",
-					name, baseline, class.lengths[0], class.lengths[len(class.lengths)-1])
+				t.Logf("%s: at most %v allocations and %d bytes across %d to %d "+
+					"header bytes", name, baseline, maxBytes,
+					class.lengths[0], class.lengths[len(class.lengths)-1])
 			}
 		})
 	}
@@ -1046,4 +1095,21 @@ func TestLogSafeErrorAllocations(t *testing.T) {
 			}
 		})
 	}
+}
+
+// allocBytesPerRun is the bytes twin of [testing.AllocsPerRun]. It exists
+// because a parse that clones its input moves BYTES while leaving the
+// allocation count untouched, so a contract written only on the count cannot
+// see that class at all. Same shape as AllocsPerRun: one settling run, then the
+// delta over n runs measured from a known GC point.
+func allocBytesPerRun(n int, f func()) uint64 {
+	f()
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for range n {
+		f()
+	}
+	runtime.ReadMemStats(&after)
+	return (after.TotalAlloc - before.TotalAlloc) / uint64(n)
 }
