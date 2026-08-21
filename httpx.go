@@ -325,20 +325,36 @@ const redirectCap = 5
 
 // --- Retry-After parsing ---
 
-// maxRetryAfterDateLen bounds what will be handed to [http.ParseTime].
+// maxRetryAfterDateLen bounds what is handed to [http.ParseTime].
 //
-// Every date format it accepts is short: IMF-fixdate is 29 characters, RFC 850
-// with the longest weekday is 33, and asctime is 24. 64 clears all three, so no
-// value this refuses could have parsed as a date.
+// This is a DELIBERATE REFUSAL of pathological input, not a claim of
+// equivalence, and the distinction matters because an earlier version of this
+// comment got it wrong. It asserted that no value this refuses could have parsed
+// as a date. That is false: time.RFC850's zone element accepts GMT followed by a
+// sign and an UNBOUNDED run of digits (parseSignedOffset into leadingInt), so
+// "Monday, 02-Jan-38 15:04:05 GMT+" plus forty zeros plus "23" is 73 bytes long
+// and parses. Under this bound it returns 0 instead. A 6.2M-execution
+// differential fuzz did not find that, because the generator never built a valid
+// RFC850 date carrying a zero-padded offset; it was found by reading the
+// stdlib's parser.
 //
-// The bound exists because the parse amplifies. Each of ParseTime's three
-// failed layout attempts CLONES the input into the error it returns, so a long
-// value is copied several times over on its way to being rejected: measured at
-// about 7 bytes of allocation per header byte, which made a 1 MB Retry-After
-// cost roughly 7 MB of garbage. The allocation COUNT stays flat whatever the
-// length, so no metric the weekly benchmark tracker charts could see it. The
-// header is upstream-controlled, and an upstream that is already failing is the
-// one sending it.
+// So the bound trades a behaviour change on input no server sends for the
+// removal of a real amplification. Every date format ParseTime accepts is short
+// - IMF-fixdate 29 characters, RFC850 with the longest weekday 33, asctime 24 -
+// and a legitimate numeric zone offset fits inside that. What is refused is a
+// date whose zone offset is padded past 64 bytes, which carries the same
+// semantic value as its unpadded spelling.
+//
+// The amplification being removed is the reason to accept that trade. Each of
+// ParseTime's three failed layout attempts CLONES the input into the error it
+// returns: measured, ParseTime alone accounts for 6.3 MB of allocation on a 1 MB
+// header, and the allocation COUNT stays flat whatever the length, so no metric
+// the weekly benchmark tracker charts could see it. The header is
+// upstream-controlled and an upstream that is already failing is the one sending
+// it.
+//
+// TestParseRetryAfterRefusesAPaddedZoneOffset pins the divergence so it stays a
+// decision rather than becoming a surprise.
 const maxRetryAfterDateLen = 64
 
 // looksLikeDeltaSeconds reports whether h has the shape strconv.ParseInt

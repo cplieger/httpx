@@ -1113,3 +1113,40 @@ func allocBytesPerRun(n int, f func()) uint64 {
 	runtime.ReadMemStats(&after)
 	return (after.TotalAlloc - before.TotalAlloc) / uint64(n)
 }
+
+// TestParseRetryAfterRefusesAPaddedZoneOffset pins the one input where
+// maxRetryAfterDateLen changes behaviour, so the change stays a decision on the
+// record rather than a surprise a future reader has to rediscover.
+//
+// time.RFC850's zone element accepts GMT followed by a sign and an unbounded run
+// of digits, so a date can be made arbitrarily long while still parsing. Padding
+// carries no semantic value: the offset below means the same as its unpadded
+// spelling. The bound refuses it, and the amplification the bound removes is why
+// (see maxRetryAfterDateLen). Both directions are asserted: the padded form is
+// refused, and the SAME date unpadded is still accepted, so a future change that
+// widened the refusal to real dates would fail here.
+func TestParseRetryAfterRefusesAPaddedZoneOffset(t *testing.T) {
+	const unpadded = "Monday, 02-Jan-38 15:04:05 GMT+0023"
+	padded := "Monday, 02-Jan-38 15:04:05 GMT+" + strings.Repeat("0", 40) + "23"
+
+	if len(unpadded) > maxRetryAfterDateLen {
+		t.Fatalf("the unpadded fixture is %d bytes, over the %d-byte bound: it must be "+
+			"inside the bound or the accept half of this test is vacuous",
+			len(unpadded), maxRetryAfterDateLen)
+	}
+	if _, err := http.ParseTime(padded); err != nil {
+		t.Fatalf("http.ParseTime rejected %q: the fixture must PARSE upstream or this "+
+			"test is not pinning a divergence at all (%v)", abbrev(padded), err)
+	}
+
+	if got := ParseRetryAfter(unpadded); got == 0 {
+		t.Errorf("ParseRetryAfter(%q) = 0, want non-zero: a real date inside the bound "+
+			"must still be accepted", unpadded)
+	}
+	if got := ParseRetryAfter(padded); got != 0 {
+		t.Errorf("ParseRetryAfter(a %d-byte date with a zero-padded zone offset) = %v, "+
+			"want 0: the bound refuses it deliberately, and http.ParseTime accepting it "+
+			"is exactly why that is a behaviour change and not an equivalence",
+			len(padded), got)
+	}
+}
