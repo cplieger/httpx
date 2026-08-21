@@ -776,7 +776,13 @@ func TestGetBytes_does_not_sleep_before_first_attempt(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	// The deadline is sized against the behaviour it must EXCLUDE, not against
+	// how fast a local round trip usually is. A pre-first-attempt sleep would
+	// last the 10s base delay, so 3s falsifies it with room to spare, while a
+	// no-sleep call returns in about a millisecond and so passes even when the
+	// rest of the suite is saturating the machine. At 100ms this test failed
+	// intermittently on a loaded host with nothing wrong in the code.
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
 	// The first attempt must NOT sleep, so a fast response returns before the
