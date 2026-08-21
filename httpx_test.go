@@ -770,10 +770,14 @@ func TestDoRateLimitOnly_zero_retry_after_uses_max_wait(t *testing.T) {
 
 func TestDoRateLimitOnly_positive_retry_after_caps_below_max_wait(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	// Sized against the 10s max wait this must prove was capped, not against the
+	// 10ms the capped wait actually takes. Same fragility as the two tests fixed
+	// alongside this one: a budget tuned to expected latency fails under load
+	// while the code is correct.
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	// A positive RetryAfter must shrink the wait to 10ms so the retry completes
-	// well within the 150ms deadline and returns the rate-limit error.
+	// well within the deadline and returns the rate-limit error.
 	err := doRateLimited(ctx, 2, 10*time.Second, func(_ context.Context) error {
 		return &RateLimitError{Msg: "slow", RetryAfter: 10 * time.Millisecond}
 	})

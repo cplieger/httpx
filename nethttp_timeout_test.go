@@ -447,7 +447,13 @@ func TestGetBytes_retriesClientTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := &http.Client{Timeout: 30 * time.Millisecond}
+	// The handler blocks until cleanup, so Client.Timeout is what ends each
+	// attempt and its value only has to be long enough to reach the handler.
+	// At 30ms a loaded host could not always complete three dial-and-send
+	// cycles inside the budget, so the server saw two requests and the test
+	// reported a retry defect that was not there. 500ms keeps the whole test
+	// under two seconds and is far above scheduling jitter.
+	client := &http.Client{Timeout: 500 * time.Millisecond}
 	_, err := httpx.GetBytes(t.Context(), client, srv.URL,
 		httpx.WithMaxAttempts(3), httpx.WithBaseDelay(time.Millisecond), httpx.WithLogger(discardLogger()))
 	if err == nil {
