@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787320270995,
-  "repoUrl": "https://github.com/cplieger/httpx",
+  "lastUpdate": 1787321244090,
+  "repoUrl": "https://github.com/cplieger/ci",
   "entries": {
     "Benchmark": [
       {
@@ -925,6 +925,238 @@ window.BENCHMARK_DATA = {
           {
             "name": "BenchmarkSafeDouble",
             "value": 1.249,
+            "range": "± 0.005",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Christopher Plieger",
+            "username": "cplieger",
+            "email": "917744+cplieger@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "d6d1f597c73f03c468c3df3152caa5ac0534a3bb",
+          "message": "chore(deps): update cplieger/ci digest to 8de9bc8 (#500)",
+          "timestamp": "2026-08-21T14:03:38Z",
+          "url": "https://github.com/cplieger/ci/commit/d6d1f597c73f03c468c3df3152caa5ac0534a3bb"
+        },
+        "date": 1787321243803,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "BenchmarkIsTransient_Nil - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_Nil - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_Nil",
+            "value": 2.385,
+            "range": "± 0.052",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError",
+            "value": 6.2715,
+            "range": "± 0.306",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF",
+            "value": 129.9,
+            "range": "± 1",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff",
+            "value": 10.48,
+            "range": "± 0.11",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty",
+            "value": 4.674,
+            "range": "± 0.031",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate - B/op",
+            "value": 80,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate - allocs/op",
+            "value": 2,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate",
+            "value": 350.65,
+            "range": "± 2.5",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds",
+            "value": 16.72,
+            "range": "± 0.51",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess - B/op",
+            "value": 1291,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess - allocs/op",
+            "value": 11,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess",
+            "value": 875.3,
+            "range": "± 68.7",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success - B/op",
+            "value": 512,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success - allocs/op",
+            "value": 3,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success",
+            "value": 295.2,
+            "range": "± 34.3",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble",
+            "value": 1.2485,
             "range": "± 0.005",
             "unit": "ns/op",
             "extra": "10 samples, median"
