@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/cplieger/httpx/v5/certtest"
 )
@@ -34,6 +35,18 @@ func TestSelfSignedCA(t *testing.T) {
 	}
 	if !cert.BasicConstraintsValid {
 		t.Error("BasicConstraintsValid is false; a real CA chain would reject it")
+	}
+
+	// The validity window is backdated so the certificate is usable the
+	// instant it is generated: a NotBefore in the future makes every x509
+	// verifier reject the chain as not yet valid, and a NotAfter in the past
+	// as expired.
+	now := time.Now()
+	if !cert.NotBefore.Before(now) {
+		t.Errorf("NotBefore = %v, want a time before now (%v)", cert.NotBefore, now)
+	}
+	if !cert.NotAfter.After(now) {
+		t.Errorf("NotAfter = %v, want a time after now (%v)", cert.NotAfter, now)
 	}
 
 	// The core use case: the PEM must load into a pool (what caCertPool /
