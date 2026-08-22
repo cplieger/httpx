@@ -335,9 +335,8 @@ func drainResp(resp *http.Response) {
 
 // NewRetryClient returns an *http.Client whose Transport is a
 // RetryRoundTripper over base (nil base means http.DefaultTransport) and
-// whose CheckRedirect is policy. It is the one-call form of the composition
-// plexapi-style consumers assemble by hand: retry transport plus an explicit
-// redirect policy.
+// whose CheckRedirect is policy. It is the one-call form of pairing
+// NewRetryRoundTripper with an explicit redirect policy.
 //
 // policy is REQUIRED and must be non-nil: NewRetryClient panics on a nil
 // policy, because a nil CheckRedirect silently means net/http's default
