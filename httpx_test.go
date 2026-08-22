@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"syscall"
@@ -58,6 +59,12 @@ func TestIsTransient(t *testing.T) {
 		{"unexpected EOF", io.ErrUnexpectedEOF, true},
 		{"conn reset", syscall.ECONNRESET, true},
 		{"conn refused", syscall.ECONNREFUSED, true},
+		{"broken pipe", syscall.EPIPE, true},
+		// The shape net/http hands back: a write errno arrives inside an
+		// *os.SyscallError inside a *net.OpError, and *net.OpError satisfies
+		// net.Error, so this case also pins that the net.Error rung above does
+		// not claim it first (Errno.Timeout is false for EPIPE).
+		{"broken pipe wrapped in a net.OpError", &net.OpError{Op: "write", Net: "tcp", Err: os.NewSyscallError("write", syscall.EPIPE)}, true},
 		{"dns error", &net.DNSError{Err: "no such host"}, true},
 		{"plain error", errors.New("misc"), false},
 	}

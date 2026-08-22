@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -317,9 +318,9 @@ func (e *capabilityError) IsTransient() bool { return e.transient }
 // transientErrors are the classes IsTransient reports as retryable, one per
 // mechanism in the classifier: the AttemptTimeout mark, the capability
 // interface, the built-in *HTTPStatusError transient band, MarkTransient, a
-// net.Error timeout, io.ErrUnexpectedEOF, the two syscall errnos, and a DNS
-// failure. Each appears bare and, where a consumer would realistically wrap it,
-// at depth.
+// net.Error timeout, io.ErrUnexpectedEOF, the dropped-connection errnos, and a
+// DNS failure. Each appears bare and, where a consumer would realistically wrap
+// it, at depth.
 var transientErrors = map[string]error{
 	"attempt_timeout":           AttemptTimeout(context.DeadlineExceeded),
 	"attempt_timeout_wrapped":   wrapChain(AttemptTimeout(context.DeadlineExceeded), 8),
@@ -334,6 +335,8 @@ var transientErrors = map[string]error{
 	"econnreset":                syscall.ECONNRESET,
 	"econnreset_wrapped":        fmt.Errorf("write tcp: %w", syscall.ECONNRESET),
 	"econnrefused":              syscall.ECONNREFUSED,
+	"epipe":                     syscall.EPIPE,
+	"epipe_net_op_error":        &net.OpError{Op: "write", Net: "tcp", Err: os.NewSyscallError("write", syscall.EPIPE)},
 	"dns_error":                 &net.DNSError{Err: "no such host", Name: "api.example"},
 	"dns_error_wrapped":         fmt.Errorf("dial: %w", &net.DNSError{Err: "no such host"}),
 	"url_error_over_eof":        &url.Error{Op: "Get", URL: "https://api.example/x", Err: io.ErrUnexpectedEOF},
