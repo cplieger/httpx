@@ -666,7 +666,24 @@ func IsTransient(err error) bool {
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
+	// One class, three errnos: the connection cannot carry the request because
+	// the peer is not on the other end of it — nothing accepted it
+	// (ECONNREFUSED), or the peer tore down one we held (ECONNRESET, EPIPE).
+	// Which of the last two surfaces is a timing accident: a peer RST gives
+	// ECONNRESET on the first write and EPIPE on every later one, and Go
+	// ignores SIGPIPE so write(2) hands the errno to the caller instead of
+	// killing the process. Omitting EPIPE made one dropped connection
+	// retryable and the identical one terminal, decided by which side of that
+	// boundary the write fell on.
+	//
+	// Narrower than it reads, for a caller going through an *http.Client:
+	// net/http retries the common case itself (a reused persistent connection
+	// whose write put no bytes on the wire, when the body is empty or replayable
+	// via GetBody), so what reaches here is mostly the residue that transport
+	// refuses — a non-replayable request, a POST without GetBody above all.
+	if errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EPIPE) {
 		return true
 	}
 	_, isDNS := errors.AsType[*net.DNSError](err)
