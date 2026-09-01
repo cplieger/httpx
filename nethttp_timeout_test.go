@@ -333,11 +333,11 @@ func TestIsTransient_clientTimeoutDuringDial(t *testing.T) {
 	}
 }
 
-// TestRetryRoundTripper_retriesResponseHeaderTimeout is the live shape the
-// finding was raised from: plexapi puts its per-attempt bound on the base
-// transport under NewRetryRoundTripper with the DEFAULT policy, which
-// classifies through IsTransient. Before the split that bound's expiry ended
-// the sequence after one attempt.
+// TestRetryRoundTripper_retriesResponseHeaderTimeout is the live shape this
+// split protects: plexapi puts its per-attempt bound on the base transport
+// under NewRetryRoundTripper with the DEFAULT policy, which classifies
+// through IsTransient. Without the split that bound's expiry would end the
+// sequence after one attempt.
 func TestRetryRoundTripper_retriesResponseHeaderTimeout(t *testing.T) {
 	t.Parallel()
 	srv := stallServer(t)

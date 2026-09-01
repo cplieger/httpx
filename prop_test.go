@@ -143,8 +143,8 @@ func FuzzParseRetryAfterResponse(f *testing.F) {
 		if d < 0 {
 			t.Fatalf("ParseRetryAfterResponse(%q) returned negative: %v", val, d)
 		}
-		// Cross-function consistency invariant (cycle-1 l-f4 merged both onto
-		// the shared parseRetryAfterValue, so they must differ only by the cap):
+		// Cross-function consistency invariant: both delegate to the shared
+		// parseRetryAfterValue, so they must differ only by the cap:
 		// ParseRetryAfter(val) == min(ParseRetryAfterResponse(resp), cap).
 		// A tolerance absorbs the sub-microsecond clock drift between the two
 		// time.Until evaluations an HTTP-date value triggers; a real regression
