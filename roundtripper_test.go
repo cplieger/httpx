@@ -106,10 +106,8 @@ func TestRetryRoundTripper_retries_on_429_with_retry_after(t *testing.T) {
 }
 
 // TestRetryRoundTripper_honors_retry_after_on_503 asserts the RoundTripper
-// honors Retry-After on a 5xx, not just on 429 (cycle-1 h-f4 broadened the
-// sleepBeforeRetry override to any retryable response: 429/502/503/504). Runs
-// in synthetic time; see the sibling 429 test for why the bubble needs
-// httptest.NewTestServer.
+// honors Retry-After on a 5xx, not just on 429. Runs in synthetic time; see
+// the sibling 429 test for why the bubble needs httptest.NewTestServer.
 func TestRetryRoundTripper_honors_retry_after_on_503(t *testing.T) {
 	tests := []struct {
 		name   string

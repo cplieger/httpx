@@ -294,9 +294,8 @@ func TestGetBytes_honors_retry_after(t *testing.T) {
 }
 
 // TestGetBytes_honors_retry_after_on_503 asserts the Retry helper waits the
-// server-requested Retry-After on a 5xx, not just on 429 (cycle-1 h-f4
-// extended honoring to every retryable 5xx via retryAttempt's >=500 branch).
-// Runs in synthetic time.
+// server-requested Retry-After on a 5xx, not just on 429. Runs in synthetic
+// time.
 func TestGetBytes_honors_retry_after_on_503(t *testing.T) {
 	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		t.Run(fmt.Sprintf("%d", status), func(t *testing.T) {
