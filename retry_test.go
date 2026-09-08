@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"math"
 	"net/http"
@@ -23,6 +24,19 @@ import (
 // bufLogger returns a debug-level text logger writing into buf.
 func bufLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// swapDefaultLogger is this package's copy of the three-global restore; the
+// reason log's writer and flags travel with slog's is on httpx_test.go's
+// swapDefaultLogger.
+func swapDefaultLogger(t *testing.T, logger *slog.Logger) {
+	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(logger)
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
 }
 
 func shortOpts() []httpx.GetOption {
@@ -371,9 +385,7 @@ func TestParseRetryAfter(t *testing.T) {
 // TestDrain_small_body swaps slog.Default; not parallel.
 func TestDrain_small_body(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	// A sub-limit body drains via io.CopyN returning io.EOF, which Drain must
 	// treat as a clean drain (the !errors.Is(err, io.EOF) guard), never a failure.
@@ -847,9 +859,7 @@ func TestGetBytes_retry_debug_log_reports_one_indexed_attempt(t *testing.T) {
 // TestDrain_clean_drain_does_not_log_failure swaps slog.Default; not parallel.
 func TestDrain_clean_drain_does_not_log_failure(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	// A body larger than the 64KB drain limit: CopyN returns nil (no EOF).
 	httpx.Drain(io.NopCloser(strings.NewReader(strings.Repeat("y", 128<<10))))
@@ -861,9 +871,7 @@ func TestDrain_clean_drain_does_not_log_failure(t *testing.T) {
 // TestDrain_logs_on_non_eof_read_error swaps slog.Default; not parallel.
 func TestDrain_logs_on_non_eof_read_error(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	httpx.Drain(errDrainBody{})
 	if !strings.Contains(buf.String(), "failed to drain response body") {

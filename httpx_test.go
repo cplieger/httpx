@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"os"
@@ -19,6 +20,46 @@ import (
 // bufLogger returns a slog.Logger writing text records (Debug and up) to buf.
 func bufLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// swapDefaultLogger installs logger as the process default for the test and
+// restores all three globals slog.SetDefault writes. It also points the log
+// package at the installed handler and SKIPS that redirect for slog's own
+// default handler, so restoring slog alone leaves log writing into a buffer
+// nothing reads. slog goes back first: reinstalling a non-default handler
+// re-runs the redirect and would undo an earlier log restore. Restored with
+// t.Cleanup rather than defer, which would not run on a subtest's failure path.
+func swapDefaultLogger(t *testing.T, logger *slog.Logger) {
+	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(logger)
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
+}
+
+// TestSwapDefaultLogger_restoresLogPackageGlobals pins the restore every
+// slog.Default() assertion in this package rests on: a leaked redirect silences
+// every later slog call in the binary, because the stock default handler emits
+// through log.Output.
+func TestSwapDefaultLogger_restoresLogPackageGlobals(t *testing.T) {
+	wantWriter, wantFlags := log.Writer(), log.Flags()
+
+	t.Run("swap", func(t *testing.T) {
+		var buf bytes.Buffer
+		swapDefaultLogger(t, bufLogger(&buf))
+		if log.Writer() == wantWriter {
+			t.Fatal("slog.SetDefault did not redirect log's writer, so this test cannot observe the restore")
+		}
+	})
+
+	if log.Writer() != wantWriter {
+		t.Error("log.Writer() not restored; later slog calls write into the swapped handler's buffer")
+	}
+	if got := log.Flags(); got != wantFlags {
+		t.Errorf("log.Flags() = %d, want %d", got, wantFlags)
+	}
 }
 
 // doRateLimited adapts the v2 RetryOnRateLimit shape onto Do +
@@ -836,9 +877,7 @@ func TestDo_zero_base_delay_defaults_to_base(t *testing.T) {
 
 func TestDo_first_try_success_omits_succeeded_log(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	_, err := Do(t.Context(),
 		func(_ context.Context) (string, error) { return "ok", nil },
@@ -853,9 +892,7 @@ func TestDo_first_try_success_omits_succeeded_log(t *testing.T) {
 
 func TestDo_success_after_one_retry_logs_attempt_counts(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	calls := 0
 	_, err := Do(t.Context(),
@@ -884,9 +921,7 @@ func TestDo_success_after_one_retry_logs_attempt_counts(t *testing.T) {
 
 func TestDo_no_retry_log_after_final_attempt(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	calls := 0
 	_, err := Do(t.Context(),
@@ -913,9 +948,7 @@ func TestDo_no_retry_log_after_final_attempt(t *testing.T) {
 // silent. Swaps slog.Default to prove the negative, so not parallel.
 func TestDo_WithLogger_routes_all_lines(t *testing.T) {
 	var defBuf, callBuf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&defBuf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&defBuf))
 
 	_, err := Do(t.Context(),
 		func(_ context.Context) (string, error) {
@@ -939,9 +972,7 @@ func TestDo_WithLogger_routes_all_lines(t *testing.T) {
 // slog.Default, so it must not run in parallel.
 func TestDoRateLimitOnly_retry_debug_log_reports_one_indexed_attempt(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	calls := 0
 	err := doRateLimited(t.Context(), 3, time.Millisecond, func(_ context.Context) error {
@@ -971,9 +1002,7 @@ func TestDoRateLimitOnly_retry_debug_log_reports_one_indexed_attempt(t *testing.
 // slog.Default, so it must not run in parallel.
 func TestDoRateLimitOnly_zero_max_wait_still_honors_hint(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	calls := 0
 	err := doRateLimited(t.Context(), 2, 0, func(_ context.Context) error {
@@ -998,9 +1027,7 @@ func TestDoRateLimitOnly_zero_max_wait_still_honors_hint(t *testing.T) {
 // v2 helper emitted ("rate limit retries exhausted"), preserved by the mode.
 func TestDoRateLimitOnly_exhaustion_warn_message(t *testing.T) {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	err := doRateLimited(t.Context(), 2, time.Millisecond, func(_ context.Context) error {
 		return &RateLimitError{Msg: "rl", RetryAfter: time.Millisecond}
