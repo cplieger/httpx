@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -74,9 +73,7 @@ func TestDrain_does_not_log_remote_authored_body_error(t *testing.T) {
 	srv := malformedTrailerServer(t)
 
 	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(bufLogger(&buf))
-	defer slog.SetDefault(prev)
+	swapDefaultLogger(t, bufLogger(&buf))
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
 		srv+"/api/webhooks/1234567890/"+webhookCredential, http.NoBody)
