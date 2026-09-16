@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789517740597,
-  "repoUrl": "https://github.com/cplieger/httpx",
+  "lastUpdate": 1789567553490,
+  "repoUrl": "https://github.com/cplieger/ci",
   "entries": {
     "Benchmark": [
       {
@@ -2086,6 +2086,238 @@ window.BENCHMARK_DATA = {
             "name": "BenchmarkSafeDouble",
             "value": 1.25,
             "range": "± 0.002",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Christopher Plieger",
+            "username": "cplieger",
+            "email": "917744+cplieger@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "Christopher Plieger",
+            "username": "cplieger",
+            "email": "917744+cplieger@users.noreply.github.com"
+          },
+          "id": "09cc4b840ea4287151c69cae879cdb185cc1b4da",
+          "message": "ci: correct the weekly-bench vibekit budget figure\n\nThe max-parallel comment claimed vibekit measured 36.5 minutes at\n-count=10. It never did: the shard needed about 77 minutes and was\ncancelled at the 60-minute job wall every week since enrolment, because\none benchmark's per-op cost grew with b.N. That benchmark is fixed and\nthe suite measures 25 minutes locally, so the comment now names the\nfigure it is and tells the reader to re-read it off the next run.",
+          "timestamp": "2026-09-16T12:01:07Z",
+          "url": "https://github.com/cplieger/ci/commit/09cc4b840ea4287151c69cae879cdb185cc1b4da"
+        },
+        "date": 1789567553006,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "BenchmarkIsTransient_Nil - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_Nil - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_Nil",
+            "value": 1.3525,
+            "range": "± 0.07",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError",
+            "value": 3.6945,
+            "range": "± 0.106",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF",
+            "value": 66.14,
+            "range": "± 1.29",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff",
+            "value": 6.9125,
+            "range": "± 0.189",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty",
+            "value": 2.724,
+            "range": "± 0.116",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate",
+            "value": 134.5,
+            "range": "± 3.65",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds",
+            "value": 11.2,
+            "range": "± 0.205",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess - B/op",
+            "value": 1291,
+            "range": "± 0.5",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess - allocs/op",
+            "value": 11,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess",
+            "value": 500.85,
+            "range": "± 17.8",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success - B/op",
+            "value": 512,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success - allocs/op",
+            "value": 3,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success",
+            "value": 173.65,
+            "range": "± 4.35",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble",
+            "value": 0.671,
+            "range": "± 0.1112",
             "unit": "ns/op",
             "extra": "10 samples, median"
           }
