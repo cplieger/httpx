@@ -2,10 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx/v5.svg)](https://pkg.go.dev/github.com/cplieger/httpx/v5)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/httpx)](https://github.com/cplieger/httpx/blob/main/go.mod)
-[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/coverage.json)](https://github.com/cplieger/httpx/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/mutation.json)](https://github.com/cplieger/httpx/issues?q=label%3Agremlins-tracker)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13213/badge)](https://www.bestpractices.dev/projects/13213)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/httpx/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/httpx)
 
 > Resilient outbound-HTTP toolkit for Go: retry, backoff, transient-error classification, and more.
 
