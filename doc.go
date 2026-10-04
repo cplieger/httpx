@@ -8,8 +8,8 @@
 // The package deliberately keeps these concerns together: they compose into
 // a single [net/http.Client], whose configuration surface (Transport,
 // CheckRedirect, per-request contexts) spans exactly this set. This overview
-// maps the surface; the README carries usage examples, the v2 migration
-// table, and the timeout model.
+// maps the surface; the README carries usage examples, and docs/timeouts.md
+// the timeout model.
 //
 // # Retry doors
 //
@@ -56,16 +56,11 @@
 // retry budget.
 //
 // Success is EXACTLY 2xx. [CheckHTTPStatus] returns nil only for [200, 300)
-// and an error for every other status, a 3xx included — the v4 breaking change
-// (v3 accepted the whole 200-399 band as success). A 3xx reaches a caller only
-// under a non-following redirect policy ([RefuseAllRedirects], or any
+// and an error for every other status, a 3xx included. A 3xx reaches a caller
+// only under a non-following redirect policy ([RefuseAllRedirects], or any
 // CheckRedirect returning [http.ErrUseLastResponse], which net/http surfaces
-// as the 3xx response itself with a nil error), and the old window reported
-// that redirect stub as success. It is now an *[HTTPStatusError]: still
-// non-transient, still unchanged by the redaction helpers. Migrating from v3:
-// a surfaced 3xx now errors, which affects only callers pairing a
-// non-following policy with [CheckHTTPStatus]; a hand-rolled 2xx band check
-// beside such a call is now redundant and can be deleted.
+// as the 3xx response itself with a nil error), and it is an
+// *[HTTPStatusError]: non-transient, and unchanged by the redaction helpers.
 //
 // # Retry-After
 //

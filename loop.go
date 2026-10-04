@@ -198,9 +198,8 @@ func WithRateLimitRetry(maxWait time.Duration) DoOption {
 
 // WithRateLimitOnly makes Do retry ONLY *RateLimitError (matched through
 // wrapped errors); every other error, including transient transport errors,
-// is returned immediately. It absorbs v2's RetryOnRateLimit: the wait
-// semantics match WithRateLimitRetry, the terminal Warn is "rate limit
-// retries exhausted", and, matching the v2 contract, the FINAL attempt's
+// is returned immediately. The wait semantics match WithRateLimitRetry, the
+// terminal Warn is "rate limit retries exhausted", and the FINAL attempt's
 // error wins even under an already-canceled context (cancellation is observed
 // in the always-positive inter-attempt sleep instead). Mutually exclusive
 // with WithRateLimitRetry.
@@ -228,15 +227,10 @@ func WithMaxBodyBytes(n int64) GetOption { return maxBodyBytesOption(n) }
 
 // --- Config assembly ---
 
-// normalize applies the shared defaults and clamps: maxAttempts below 1
-// clamps to 1 (the option-absent default is DefaultMaxAttempts, set by the
-// config constructors — unlike TransportConfig's struct fields, option
-// absence is expressible here, so WithMaxAttempts(0) keeps its v2 meaning of
-// "exactly one attempt"), a non-positive baseDelay takes DefaultBaseDelay, a
-// nil logger takes slog.Default(), an empty label reads "operation", and a
-// non-positive rate-limit maxWait clamps to RetryAfterCap (a zero ceiling
-// would zero every wait; SleepCtx returns immediately for non-positive
-// durations, and the loop would hot-spin with no cancellation check).
+// normalize applies defaults and clamps. maxAttempts < 1 means one attempt
+// (options can express absence, unlike TransportConfig fields). A non-positive
+// rate-limit maxWait takes RetryAfterCap: a zero ceiling would zero every wait
+// and the loop would hot-spin with no cancellation check.
 func (c *loopConfig) normalize() {
 	if c.maxAttempts < 1 {
 		c.maxAttempts = 1
@@ -418,23 +412,14 @@ func (c *loopConfig) exhaustedLevel() slog.Level {
 
 // --- Door 1: Do ---
 
-// Do calls fn up to WithMaxAttempts times (total, including the first call)
-// with jittered exponential backoff, returning the first success.
-// Non-retryable errors are returned immediately. By default the retryable set
-// is IsTransient (a *RateLimitError is deliberately NOT transient; a generic
-// operation must not blindly re-fire a rate-limited call) and a transient
-// error carrying a positive RetryAfterHint waits that hint instead of the
-// backoff, the exponential base still advancing. WithRateLimitRetry and
-// WithRateLimitOnly opt into rate-limit retry per their docs.
-//
-// Under the default and WithRateLimitRetry modes a context canceled after a
-// failed attempt returns ctx.Err(); under WithRateLimitOnly the final
-// attempt's error wins (the v2 RetryOnRateLimit contract). WithAttemptTimeout
-// bounds each attempt and makes that bound's expiry retryable, the caller's own
-// deadline staying terminal. Logging goes to WithLogger (default
-// slog.Default()): per-attempt lines at Debug, the terminal exhaustion at Warn
-// - or at Debug when the budget is a single attempt, since nothing was retried
-// and the caller's own loop owns the warning (see exhaustedLevel).
+// Do calls fn up to WithMaxAttempts times (total) with jittered exponential
+// backoff and returns the first success; a non-retryable error returns at
+// once. By default only IsTransient errors retry (a *RateLimitError is not
+// transient) and a positive RetryAfterHint replaces the backoff wait. After a
+// failed attempt a canceled context returns ctx.Err(), except under
+// WithRateLimitOnly, where the final attempt's error wins. Retries log at
+// Debug to WithLogger; exhaustion logs at Warn, or Debug for a single-attempt
+// budget (see exhaustedLevel).
 func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opts ...DoOption) (T, error) {
 	var zero T
 	cfg := newLoopConfig(opts)
@@ -478,39 +463,13 @@ func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opt
 
 // --- Door 2: GetBytes ---
 
-// GetBytes performs an HTTP GET with bounded exponential-backoff retry on
-// 429 and 5xx responses and on transient transport errors (timeouts,
-// connection resets, DNS failures - see IsTransient). 4xx (non-429) and
-// non-transient transport errors are returned immediately. Honors
-// Retry-After (capped at RetryAfterCap). The response body is read to
-// WithMaxBodyBytes and returned; an over-limit body fails loud with
-// *ResponseTooLargeError (no body). Every logged url attribute and every
-// returned error is redacted (see the package's URL redaction docs).
-//
-// GetBytes deliberately keeps its own retry loop rather than delegating to
-// RetryRoundTripper.RoundTrip. It is a decorator over the same shared
-// primitives (resolveWait, JitteredBackoff, SafeDouble, SleepCtx,
-// ParseRetryAfter, IsTransient, Drain), not a thin wrapper over the
-// RoundTripper cycle, because GetBytes carries behavior the transparent
-// RoundTripper has no equivalent for and which must stay byte-for-byte stable
-// for existing consumers:
-//   - []byte return with the body capped at WithMaxBodyBytes (the RoundTripper
-//     hands back an *http.Response and never reads the body);
-//   - URL/secret redaction on every log "url" attr (redactURL) and every
-//     returned/wrapped error (LogSafeError, StatusError.Error()), the
-//     CWE-532 hardening the RoundTripper path does not perform;
-//   - rich per-attempt slog logging plus the "retries exhausted after %s: %w"
-//     wrapper, which the RoundTripper exposes only as an OnRetry hook;
-//   - classification of every 5xx (not just 502/503/504) as retryable, and of
-//     every non-2xx as a permanent *StatusError carrying the request URL (the
-//     2xx success band is CheckHTTPStatus's, delegated to since v4; only the
-//     error value differs, because this door's errors render a redacted URL).
-//     A 3xx reaches here only when the client refuses redirects, and is an
-//     error: the redirect stub is not the requested resource and GetBytes
-//     cannot surface Location.
-//
-// Routing GetBytes through RoundTrip would silently change one or more of
-// these, so the loop is intentionally not merged.
+// GetBytes performs a GET, retrying 429, 5xx and transient transport errors
+// with bounded backoff (honoring Retry-After up to RetryAfterCap), and returns
+// the body read to WithMaxBodyBytes (*ResponseTooLargeError past it). Any
+// other non-2xx is a permanent *StatusError. Every logged url and returned
+// error is redacted. It keeps its own loop rather than wrapping
+// RetryRoundTripper, which has no body cap, redaction or 5xx-wide retry, so
+// merging the two would change this door's behavior.
 func GetBytes(ctx context.Context, client *http.Client, reqURL string, opts ...GetOption) ([]byte, error) {
 	cfg := newGetConfig(opts)
 	log := cfg.logger
@@ -616,8 +575,8 @@ func getAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *ge
 	}
 	// Success is any 2xx. Everything else is a permanent failure for this
 	// door: it returns body bytes, and a redirect stub or an error page is not
-	// the requested resource. Since v4 CheckHTTPStatus draws the same line
-	// (nil only for 2xx), so the band decision is delegated to it rather than
+	// the requested resource. CheckHTTPStatus draws the same line (nil only
+	// for 2xx), so the band decision is delegated to it rather than
 	// restated here — the one thing GetBytes substitutes is the error VALUE:
 	// its *StatusError carries the request URL (rendered redacted), which
 	// consumers type-assert on, where the classifier's errors are URL-less.
