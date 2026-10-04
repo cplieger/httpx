@@ -35,48 +35,14 @@ type ConditionalResult struct {
 	NotModified bool
 }
 
-// DoConditional executes req as a single conditional request: it owns both
-// conditional headers — any pre-existing If-None-Match / If-Modified-Since on
-// req is removed, then each is set from v (an empty field is not sent), so v
-// alone decides what is replayed — performs the request on client, and
-// classifies the response.
-//
-//   - 304 -> NotModified=true (body drained and closed; Validators zero — keep
-//     the ones you sent).
-//   - 200 -> the bounded body plus the response's fresh validators. A body over
-//     maxBodyBytes fails loud with *ResponseTooLargeError rather than being
-//     silently truncated; maxBodyBytes <= 0 means DefaultMaxBodyBytes.
-//   - Anything else -> an error: the CheckHTTPStatus mapping for every non-2xx
-//     status (*AuthError for 401/403, *RateLimitError for 429,
-//     *HTTPStatusError otherwise — transient only for 502/503/504, and since
-//     v4 that mapping covers a 3xx from a redirect-refusing client too), or a
-//     plain non-transient error for a 2xx that is neither usable content nor a
-//     revalidation (a 204, a 206). The body is always closed.
-//
-// A transport error from the request itself is reduced via LogSafeError
-// before it is returned: a *url.Error embeds the full request URL, so the
-// reduction keeps query-string secrets out of caller error text (the same
-// contract GetBytes applies to every error it returns), while preserving the
-// cause for transient classification when composed with Do.
-//
-// It is deliberately a SINGLE attempt so the caller owns the retry and cache
-// policy: wrap it in Do (transient classification composes through the
-// returned errors), rebuild req per attempt, and decide app-side
-// when a cached copy may be reused on failure (stale-on-error) and whether
-// validators may be sent at all (send the zero Validators when the cached body
-// is unusable, so an empty cache can never be "revalidated" into a 304 with
-// nothing to reuse). Intended for GET (or HEAD, where Body stays empty).
-//
-// Validator hygiene: validators are validated in BOTH directions against the
-// header field-value grammar (RFC 9110: no control bytes other than HTAB, no
-// DEL) plus a 1 KiB per-value cap. A 200's ETag / Last-Modified that fails the
-// check is captured as empty, so a hostile or corrupt upstream value can never
-// enter the caller's persisted cache state; a replayed v field that fails it
-// is not sent, so a validator poisoned in a store outside this package
-// degrades to an unconditional GET and self-heals through the next 200's
-// clean capture instead of failing at net/http's request-write validation on
-// every subsequent attempt. Both drops are silent - the cost is one full
-// re-download, never a correctness fault.
+// DoConditional sends req once with If-None-Match/If-Modified-Since set only
+// from v (replacing any on req) and classifies the response: 304 is
+// NotModified; 200 returns the body (*ResponseTooLargeError over maxBodyBytes,
+// where <= 0 means DefaultMaxBodyBytes) and its validators; a non-2xx is
+// CheckHTTPStatus's error and any other 2xx a plain error. Transport errors
+// pass through LogSafeError. The caller owns retry (wrap in Do, rebuild req per
+// attempt) and must send zero Validators when its cached body is unusable. A
+// validator failing RFC 9110 field-value grammar or 1 KiB is silently dropped.
 func DoConditional(client *http.Client, req *http.Request, v Validators, maxBodyBytes int64) (ConditionalResult, error) {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = DefaultMaxBodyBytes
@@ -115,13 +81,9 @@ func DoConditional(client *http.Client, req *http.Request, v Validators, maxBody
 		if statusErr := CheckHTTPStatus(resp); statusErr != nil {
 			return ConditionalResult{}, statusErr
 		}
-		// Still reachable, narrower since v4: CheckHTTPStatus now returns nil
-		// only for 2xx, so this fallback covers exactly a 2xx that is neither
-		// the 200 nor the 304 handled above — a 204, a 206, a 201. Those are
-		// successful responses that carry no usable representation for a
-		// conditional GET, so they are a plain non-transient error rather than
-		// a status-mapped one. A 3xx from a redirect-refusing client no longer
-		// lands here; it is now a *HTTPStatusError from the mapping above.
+		// CheckHTTPStatus returns nil only for 2xx, so this covers a 2xx that is
+		// neither the 200 nor the 304 above (a 204, 206, 201): no usable
+		// representation for a conditional GET, so a plain non-transient error.
 		return ConditionalResult{}, fmt.Errorf("unexpected status %d on conditional request", resp.StatusCode)
 	}
 }

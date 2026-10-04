@@ -472,31 +472,11 @@ func ParseRetryAfterResponse(resp *http.Response) time.Duration {
 
 // --- Status checking ---
 
-// CheckHTTPStatus classifies an HTTP response, mapping anything that is not a
-// success to a typed error. Success is EXACTLY 2xx: a status in [200, 300)
-// returns nil and EVERY other status returns an error — 401/403 →
-// *AuthError, 429 → *RateLimitError, and everything else (a 3xx, any other
-// 4xx, any 5xx, and an informational 1xx) → *HTTPStatusError carrying the
-// code.
-//
-// The 2xx-only window is a v4 change; v3 and earlier returned nil for the
-// whole 200-399 band. A 3xx reaches a caller only when the client is
-// configured NOT to follow redirects — [RefuseAllRedirects], or any
-// CheckRedirect returning [http.ErrUseLastResponse], which net/http hands back
-// as the 3xx response itself with a nil error. Under the old window that
-// redirect stub classified as SUCCESS, so a token-bearing client that
-// deliberately refuses the hop then treated the unfollowed redirect as a
-// completed request; this is the "caller's own status handling"
-// [RefuseAllRedirects] delegates to, and it now reports the 3xx as the failure
-// it is. A caller that pairs a non-following policy with its own hand-rolled
-// 2xx band check no longer needs it.
-//
-// A 3xx is deliberately a *HTTPStatusError rather than a new error type or a
-// second classifier, so it flows through the existing plumbing unchanged:
-// [IsTransient] reports false (only 502/503/504 are transient),
-// [HTTPStatusError.IsServerError] and [HTTPStatusError.IsClientError] both
-// report false (a 3xx is neither ≥ 500 nor in [400, 500)), and [LogSafeError]
-// and the redaction helpers pass it through untouched (it embeds no URL).
+// CheckHTTPStatus returns nil for a 2xx and otherwise a typed error: 401/403
+// → *AuthError, 429 → *RateLimitError, anything else (1xx, 3xx, other 4xx,
+// 5xx) → *HTTPStatusError carrying the code, transient only for 502/503/504.
+// A 3xx reaches it only from a client that does not follow redirects (see
+// [RefuseAllRedirects]) and is reported as a failure, not a completed request.
 func CheckHTTPStatus(resp *http.Response) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
@@ -1224,19 +1204,12 @@ func DockerGitHubRedirectPolicy(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// RefuseAllRedirects is a CheckRedirect policy that follows NO redirect: it
-// returns http.ErrUseLastResponse, so the client hands the caller the redirect
-// response itself (status 3xx, body open, nil error) instead of the followed
-// hop. It is the policy for a token-bearing client of an API that issues no
-// redirects: Go's client forwards custom request headers (an X-Plex-Token, an
-// X-Api-Key) across redirects — only Authorization, Cookie, and
-// WWW-Authenticate are stripped, and only on a cross-domain hop — so a hostile
-// 302 (MITM, DNS poisoning) would exfiltrate the credential to an
-// attacker-chosen origin. With the hop refused, the credential never leaves
-// the configured host and the unexpected 3xx surfaces to the caller's own
-// status handling — which is [CheckHTTPStatus]: since v4 it classifies a 3xx
-// as an error (*HTTPStatusError), so a surfaced redirect stub is reported as
-// the failure it is instead of passing as success.
+// RefuseAllRedirects is a CheckRedirect policy that follows no redirect: the
+// client returns the 3xx response itself with a nil error. Use it for a
+// token-bearing client of an API that never redirects, because net/http
+// forwards custom headers (X-Plex-Token, X-Api-Key) across a redirect and a
+// hostile 302 would leak them. [CheckHTTPStatus] reports the surfaced 3xx as
+// an error.
 func RefuseAllRedirects(*http.Request, []*http.Request) error {
 	return http.ErrUseLastResponse
 }

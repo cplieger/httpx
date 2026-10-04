@@ -23,9 +23,8 @@ type OnRetry func(attempt int, req *http.Request, resp *http.Response, err error
 type PrepareRetry func(req *http.Request) error
 
 // TransportConfig configures a RetryRoundTripper (and, through NewRetryClient,
-// the retrying client). The zero value is ready to use and behaves exactly
-// like an unconfigured v2 round-tripper: three total attempts, one-second
-// base delay, the default retry policy, no hooks, no elapsed ceiling, no
+// the retrying client). The zero value is ready to use: three total attempts,
+// one-second base delay, the default retry policy, no hooks, no elapsed ceiling, no
 // non-idempotent replay.
 type TransportConfig struct {
 	// CheckRetry overrides the retry policy. nil means the default policy:
@@ -41,9 +40,8 @@ type TransportConfig struct {
 	PrepareRetry PrepareRetry
 	// MaxAttempts is the TOTAL attempt count including the initial request.
 	// Zero means unset and takes DefaultMaxAttempts (3); a NEGATIVE value
-	// means exactly one attempt (the "try once" configuration — v2 expressed
-	// it as WithRTMaxAttempts(0), but a zero struct field cannot distinguish
-	// absent from zero, so v3 moves try-once to negatives).
+	// means exactly one attempt (a zero struct field cannot distinguish absent
+	// from zero, so try-once is spelled as a negative).
 	MaxAttempts int
 	// BaseDelay is the initial backoff delay; non-positive means
 	// DefaultBaseDelay (1s). Waits are equal-jitter with overflow-safe
@@ -334,24 +332,12 @@ func drainResp(resp *http.Response) {
 }
 
 // NewRetryClient returns an *http.Client whose Transport is a
-// RetryRoundTripper over base (nil base means http.DefaultTransport) and
-// whose CheckRedirect is policy. It is the one-call form of pairing
-// NewRetryRoundTripper with an explicit redirect policy.
-//
-// policy is REQUIRED and must be non-nil: NewRetryClient panics on a nil
-// policy, because a nil CheckRedirect silently means net/http's default
-// follow-anywhere behavior (up to 10 hops to any host, custom auth headers
-// forwarded) — exactly the unsafe omission this constructor exists to
-// prevent. Pass DefaultRedirectPolicy (same-host), RefuseAllRedirects, or a
-// RedirectPolicyFunc allowlist.
-//
-// The returned client sets no Client.Timeout: a Client.Timeout above a
-// retrying transport caps the WHOLE retry sequence and defeats the retries
-// beneath it. Note that neither MaxElapsedTime nor the request context can
-// interrupt a stalled in-flight attempt from between attempts: bound single
-// attempts on the base transport (e.g. ResponseHeaderTimeout on a
-// CloneDefaultTransport()) and bound the total with a context deadline
-// (http.NewRequestWithContext) or TransportConfig.MaxElapsedTime.
+// RetryRoundTripper over base (nil means http.DefaultTransport) and whose
+// CheckRedirect is policy. It panics on a nil policy, because nil means
+// net/http's follow-anywhere default; pass DefaultRedirectPolicy,
+// RefuseAllRedirects or a RedirectPolicyFunc. It sets no Client.Timeout, which
+// would cap the whole retry sequence: bound one attempt on the base transport
+// and the total with a context deadline or TransportConfig.MaxElapsedTime.
 func NewRetryClient(base http.RoundTripper, policy CheckRedirect, cfg TransportConfig) *http.Client {
 	if policy == nil {
 		panic("httpx.NewRetryClient: nil redirect policy (pass DefaultRedirectPolicy, RefuseAllRedirects, or a RedirectPolicyFunc allowlist)")
