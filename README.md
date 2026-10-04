@@ -92,7 +92,7 @@ Go forwards custom headers such as `X-Api-Key` across a redirect. `DefaultRedire
 
 In its log lines and error messages, `GetBytes` replaces a URL's userinfo and each query value with `REDACTED`. It reduces transport errors to their cause, so their text carries no raw URL. The exported `StatusError.URL` field still holds the original URL for your code, so do not log that field. URL paths are kept, so do not put a credential in a URL path you pass to `GetBytes`. `RedactSecretString` takes the secret as the `Secret` type, so swapping the two arguments does not compile.
 
-[Redirects, TLS and redaction](docs/security.md) covers each policy option, the pinned-CA transport and the order to redact in.
+[Redirects, TLS and redaction](docs/security-model.md) covers each policy option, the pinned-CA transport and the order to redact in.
 
 ## Unsupported by design
 
@@ -103,7 +103,7 @@ httpx has no circuit breaker, retry budget, alternative jitter strategies, exhau
 - [Retries](docs/retries.md) covers the three ways to retry, their options, backoff, rate limits, exhaustion and logging.
 - [Timeouts and deadlines](docs/timeouts.md) says which timeouts are retried and where to put each bound.
 - [Status codes, errors and bodies](docs/responses.md) lists the status mapping, error types, body caps and conditional GET.
-- [Redirects, TLS and redaction](docs/security.md) covers redirect policies, the pinned-CA transport and keeping secrets out of logs.
+- [Redirects, TLS and redaction](docs/security-model.md) covers redirect policies, the pinned-CA transport and keeping secrets out of logs.
 - [Unsupported by design](docs/non-goals.md) lists the features left out on purpose, with the reasons.
 
 ## Contributing
