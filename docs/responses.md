@@ -44,7 +44,7 @@ A 3xx is an ordinary `*HTTPStatusError`, so the rest of the package handles it u
 
 `Drain` still matters on Go 1.27, where an HTTP/1 response body drains itself on `Close`. The standard library does not do this for HTTP/2, which every transport httpx builds attempts, and `Drain` also works on a body that is not an `*http.Response` body.
 
-A failed drain only costs connection reuse. `Drain` logs one Debug line, `failed to drain response body`, with no attributes, on `slog.Default()`. It never logs the read error, because the far end writes that text and it can echo a credential from the request URL. [Redirects, TLS and redaction](security.md) explains the case.
+A failed drain only costs connection reuse. `Drain` logs one Debug line, `failed to drain response body`, with no attributes, on `slog.Default()`. It never logs the read error, because the far end writes that text and it can echo a credential from the request URL. [Redirects, TLS and redaction](security-model.md) explains the case.
 
 ## Conditional GET
 

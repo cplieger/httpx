@@ -135,7 +135,7 @@ Because the exhaustion error keeps the `Retry-After` hint, an enclosing `Do` wai
 
 With a single attempt nothing was retried, so the loop around the call owns the warning. `WithExhaustedLevel(level)` sets the level of the final line for any attempt count, and it is the only way to raise it above Warn. Use it to demote the line when your own failure log carries more context, without losing the Debug lines a discard logger would also drop.
 
-The slow-response timer runs per attempt, so backoff sleeps never count as upstream latency. The transport logs nothing, so observe its retries through `OnRetry`, where redacting the URL is up to you. Every URL these lines carry is redacted as [Redirects, TLS and redaction](security.md) describes.
+The slow-response timer runs per attempt, so backoff sleeps never count as upstream latency. The transport logs nothing, so observe its retries through `OnRetry`, where redacting the URL is up to you. Every URL these lines carry is redacted as [Redirects, TLS and redaction](security-model.md) describes.
 
 ## Backoff building blocks
 
