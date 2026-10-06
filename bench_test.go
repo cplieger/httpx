@@ -305,7 +305,7 @@ func abbrev(s string) string {
 
 // capabilityError implements the Transient capability interface, the extension
 // seam a consumer's own error type uses to declare its own retryability (arrapi's
-// StatusError is the fleet's instance). It is here because IsTransient reaches it
+// StatusError is one). It is here because IsTransient reaches it
 // through errors.AsType against an INTERFACE, which is the one lookup in the
 // classifier that could plausibly box a value and allocate.
 type capabilityError struct {
@@ -538,15 +538,11 @@ func TestBackoffPrimitivesAllocations(t *testing.T) {
 }
 
 // TestParseRetryAfterAllocationsOnWellFormedValues pins the two input classes a
-// cooperating upstream actually sends.
-//
-// delta-seconds is the form every rate-limiter in the fleet's upstreams emits,
-// and an absent header is what the overwhelming majority of responses carry.
-// Both are free today, and both are on the per-response path: GetBytes parses
-// Retry-After on every retryable status, and CheckHTTPStatus parses it on every
-// 429. The date forms are deliberately NOT in this table — they measure 2 to 8
-// and asserting zero there would be asserting a bug; their contract is the
-// bounded one below.
+// cooperating upstream actually sends: delta-seconds, the form rate-limiters
+// emit, and an absent header, what most responses carry. Both are free and on
+// the per-response path: GetBytes parses Retry-After on every retryable status,
+// and CheckHTTPStatus on every 429. The date forms measure 2 to 8 allocations,
+// so they are NOT in this table; their contract is the bounded one below.
 func TestParseRetryAfterAllocationsOnWellFormedValues(t *testing.T) {
 	headers := map[string]string{
 		"delta_seconds":           "30",
