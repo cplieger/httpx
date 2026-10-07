@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790731270753,
-  "repoUrl": "https://github.com/cplieger/httpx",
+  "lastUpdate": 1791336713808,
+  "repoUrl": "https://github.com/cplieger/ci",
   "entries": {
     "Benchmark": [
       {
@@ -2782,6 +2782,238 @@ window.BENCHMARK_DATA = {
             "name": "BenchmarkSafeDouble",
             "value": 1.4425,
             "range": "± 0.0845",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Christopher Plieger",
+            "username": "cplieger",
+            "email": "917744+cplieger@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "e9fbabb1dd7e2a15de9212889c454856c6b43e0f",
+          "message": "ci: scale gremlins timeouts by workers, pick integration by cost (#705)\n\nci: scale gremlins timeouts by workers, pick integration by cost\n\ngremlins gives each mutant coverage-pass time x a coefficient (default 3), but the coverage pass runs alone on every CPU while each of N workers gets about 1/N of them, so a CPU-bound suite timed out surviving mutants and scored them out of efficacy (wiregen read 100% with 12 mutants alive). The coefficient is now 3 x the workers passed to gremlins.\n\nEach module now runs --integration --coverpkg ./... when the measured suite time x the dry-run mutant count / workers is under a quarter of the run job time cap, which lives once as a fanout output; otherwise, or when any input cannot be measured, it stays per-package. The tracker row records the mode, marks the week a repo switches, and compares trend and the regression label only against weeks of the same mode. The gremlins tracker goldens are regenerated on purpose for the new Mode column and a corrected efficacy legend (TIMED OUT counts in neither side).",
+          "timestamp": "2026-10-06T21:29:40Z",
+          "url": "https://github.com/cplieger/ci/commit/e9fbabb1dd7e2a15de9212889c454856c6b43e0f"
+        },
+        "date": 1791336713592,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "BenchmarkIsTransient_Nil - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_Nil - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_Nil",
+            "value": 2.52,
+            "range": "± 0.0295",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_PermanentError",
+            "value": 6.2425,
+            "range": "± 0.015",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkIsTransient_UnexpectedEOF",
+            "value": 131,
+            "range": "± 0.3",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkJitteredBackoff",
+            "value": 10.12,
+            "range": "± 0.05",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Empty",
+            "value": 5.3125,
+            "range": "± 0.0525",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_HTTPDate",
+            "value": 270.9,
+            "range": "± 4.25",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkParseRetryAfter_Seconds",
+            "value": 22.605,
+            "range": "± 0.19",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess - B/op",
+            "value": 1292,
+            "range": "± 0.5",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess - allocs/op",
+            "value": 11,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_RetryThenSuccess",
+            "value": 862.85,
+            "range": "± 13.1",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success - B/op",
+            "value": 512,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success - allocs/op",
+            "value": 3,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkRetryRoundTripper_Success",
+            "value": 294.95,
+            "range": "± 14.45",
+            "unit": "ns/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble - B/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "B/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble - allocs/op",
+            "value": 0,
+            "range": "± 0",
+            "unit": "allocs/op",
+            "extra": "10 samples, median"
+          },
+          {
+            "name": "BenchmarkSafeDouble",
+            "value": 1.249,
+            "range": "± 0.001",
             "unit": "ns/op",
             "extra": "10 samples, median"
           }
