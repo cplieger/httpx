@@ -483,6 +483,56 @@ func TestRetryRoundTripper_context_cancellation(t *testing.T) {
 	}
 }
 
+// Each attempt carries the caller's context, so cancelling it aborts an
+// attempt stalled inside the base transport rather than waiting it out.
+func TestRetryClient_context_cancel_aborts_stalled_attempt(t *testing.T) {
+	var calls atomic.Int32
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		arrived <- struct{}{}
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	client := httpx.NewRetryClient(srv.Client().Transport, httpx.RefuseAllRedirects, httpx.TransportConfig{
+		BaseDelay:   time.Millisecond,
+		MaxAttempts: 3,
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		resp, doErr := client.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		done <- doErr
+	}()
+
+	<-arrived
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("client.Do after cancel = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("client.Do still blocked 5s after the request context was cancelled mid-attempt")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("server calls = %d, want 1 (a cancelled context starts no further attempt)", got)
+	}
+}
+
 func TestRetryRoundTripper_exhausts_retries(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
