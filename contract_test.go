@@ -576,3 +576,5 @@ type fixedHint struct{ d time.Duration }
 
 func (e *fixedHint) Error() string                 { return "hinted" }
 func (e *fixedHint) RetryAfterHint() time.Duration { return e.d }
+
+var _ httpx.RetryAfterHint = (*fixedHint)(nil)
