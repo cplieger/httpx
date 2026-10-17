@@ -67,7 +67,7 @@ if err := httpx.CheckHTTPStatus(resp); err != nil {
 - Backoff and Retry-After: `JitteredBackoff`, `SafeDouble`, `SleepCtx`, `ParseRetryAfter`, `ParseRetryAfterResponse`.
 - Classification: `IsTransient`, `Permanent`, `MarkTransient`, `AttemptTimeout`, `IsRetryableStatus`, the `Transient` and `RetryAfterHint` interfaces.
 - Status and errors: `CheckHTTPStatus` and the `AuthError`, `RateLimitError`, `HTTPStatusError`, `StatusError` and `ResponseTooLargeError` types.
-- Redirects: `DefaultRedirectPolicy`, `RefuseAllRedirects` and `RedirectPolicyFunc` with its options.
+- Redirects: `DefaultRedirectPolicy`, `RefuseAllRedirects` and `RedirectPolicyFunc` with its options, and the `RedirectRefusedError` every hard refusal returns.
 - TLS: `CATransport` pins a private CA, `CloneDefaultTransport`, and the `certtest` package for tests.
 - Redaction: `LogSafeError`, `RedactSecret`, `RedactSecretString`, `RedactTransportError`.
 - Bodies and caching: `ReadLimitedBody`, `LimitedBody`, `Drain`, `DrainClose`, `DoConditional`.
@@ -88,7 +88,7 @@ A context deadline is the total budget and is never retried. A per-attempt timeo
 
 ## Credentials in logs and redirects
 
-Go forwards custom headers such as `X-Api-Key` across a redirect. `DefaultRedirectPolicy` follows same-host hops only, and every shipped policy refuses an `https` to `http` downgrade. A `RedirectPolicyFunc` allowlist follows the other hosts you name, and allows a downgrade only with `WithAllowSchemeDowngrade(true)`. `RefuseAllRedirects` follows none and hands the 3xx back to you, which `CheckHTTPStatus` reports as an error.
+Go forwards custom headers such as `X-Api-Key` across a redirect. `DefaultRedirectPolicy` follows same-host hops only, and every shipped policy refuses an `https` to `http` downgrade. Same host is not same origin: another port on that host can be another service. For a client whose key must reach only the service you configured, use `RedirectPolicyFunc(WithSameOrigin(true))`, which follows only the original scheme, host and port. A `RedirectPolicyFunc` allowlist follows the other hosts you name, and allows a downgrade only with `WithAllowSchemeDowngrade(true)`. `RefuseAllRedirects` follows none and hands the 3xx back to you, which `CheckHTTPStatus` reports as an error.
 
 In its log lines and error messages, `GetBytes` replaces a URL's userinfo and each query value with `REDACTED`. It reduces transport errors to their cause, so their text carries no raw URL. The exported `StatusError.URL` field still holds the original URL for your code, so do not log that field. URL paths are kept, so do not put a credential in a URL path you pass to `GetBytes`. `RedactSecretString` takes the secret as the `Secret` type, so swapping the two arguments does not compile.
 

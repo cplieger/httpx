@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"errors"
 	"math"
 	"net/http"
 	"net/url"
@@ -375,14 +376,14 @@ func FuzzRedactURL(f *testing.F) {
 	})
 }
 
-// FuzzSameOriginRedirect exercises the WithSameHost + WithAllowSchemeDowngrade
+// FuzzSameHostRedirect exercises the WithSameHost + WithAllowSchemeDowngrade
 // invariants (white-box, so it can reuse the policy's own asciiLower /
 // isSchemeDowngrade oracle): with WithSameHost and downgrades refused (the
 // default), a redirect is accepted iff its target host equals the origin host
 // AND it is not an https->http downgrade; with downgrades allowed, only the
 // same-host check gates acceptance. FuzzRedirectPolicyFunc seeds an empty origin
 // scheme, so it never drives the scheme-downgrade branch this covers.
-func FuzzSameOriginRedirect(f *testing.F) {
+func FuzzSameHostRedirect(f *testing.F) {
 	f.Add("https", "arr.example", "https", "arr.example")   // same origin
 	f.Add("http", "arr.example", "https", "arr.example")    // upgrade
 	f.Add("https", "arr.example", "http", "arr.example")    // downgrade
@@ -415,6 +416,86 @@ func FuzzSameOriginRedirect(f *testing.F) {
 		gotAllow := RedirectPolicyFunc(WithSameHost(true), WithAllowSchemeDowngrade(true))(&http.Request{URL: tgt}, via)
 		if sameHost != (gotAllow == nil) {
 			t.Fatalf("WithSameHost+AllowDowngrade %s->%s: err=%v (sameHost=%v)", orig, tgt, gotAllow, sameHost)
+		}
+	})
+}
+
+// TestSameOriginRedirect_property draws origin and target from random schemes,
+// hosts in random ASCII case and ports (absent, both defaults, another), and
+// checks WithSameOrigin(true) against the model built from those parts: a hop
+// is followed iff scheme, host and effective port are equal, and a refusal is
+// RedirectOtherOrigin naming the target's origin as drawn. Adding
+// WithSameHost(true) never changes the verdict, and WithSameHost(true) alone
+// follows every hop WithSameOrigin(true) follows.
+func TestSameOriginRedirect_property(t *testing.T) {
+	t.Parallel()
+	schemes := []string{"http", "https"}
+	hosts := []string{"arr.example", "other.example", "127.0.0.1", "[::1]"}
+	ports := []string{"", "80", "443", "8989"}
+	effective := func(scheme, port string) string {
+		switch {
+		case port != "":
+			return port
+		case scheme == "http":
+			return "80"
+		}
+		return "443"
+	}
+	rapid.Check(t, func(t *rapid.T) {
+		type end struct{ scheme, host, written, port string }
+		draw := func(label string) end {
+			e := end{
+				scheme: rapid.SampledFrom(schemes).Draw(t, label+"Scheme"),
+				host:   rapid.SampledFrom(hosts).Draw(t, label+"Host"),
+				port:   rapid.SampledFrom(ports).Draw(t, label+"Port"),
+			}
+			b := []byte(e.host)
+			for i, c := range b {
+				if 'a' <= c && c <= 'z' && rapid.Bool().Draw(t, label+"Upper") {
+					b[i] = c - ('a' - 'A')
+				}
+			}
+			e.written = string(b)
+			return e
+		}
+		parse := func(e end, path string) *url.URL {
+			hostport := e.written
+			if e.port != "" {
+				hostport += ":" + e.port
+			}
+			u, err := url.Parse(e.scheme + "://" + hostport + path)
+			if err != nil {
+				t.Fatalf("url.Parse: %v", err)
+			}
+			return u
+		}
+		o, g := draw("orig"), draw("target")
+		via := []*http.Request{{URL: parse(o, "/a")}}
+		target := &http.Request{URL: parse(g, "/b?k=v")}
+		want := o.scheme == g.scheme && o.host == g.host && effective(o.scheme, o.port) == effective(g.scheme, g.port)
+
+		err := RedirectPolicyFunc(WithSameOrigin(true))(target, via)
+		if want != (err == nil) {
+			t.Fatalf("WithSameOrigin(true) %s -> %s = %v, want followed=%v", via[0].URL, target.URL, err, want)
+		}
+		if err != nil {
+			wantOrigin := g.scheme + "://" + g.written
+			if g.port != "" && g.port != effective(g.scheme, "") {
+				wantOrigin += ":" + g.port
+			}
+			refused, ok := errors.AsType[*RedirectRefusedError](err)
+			if !ok || refused.Reason != RedirectOtherOrigin || refused.Origin != wantOrigin {
+				t.Fatalf("refusal = %#v, want Reason RedirectOtherOrigin, Origin %q", err, wantOrigin)
+			}
+		}
+		withHost := RedirectPolicyFunc(WithSameOrigin(true), WithSameHost(true))(target, via)
+		if (withHost == nil) != (err == nil) {
+			t.Fatalf("adding WithSameHost(true) changed the verdict: %v, then %v", err, withHost)
+		}
+		if want {
+			if hostOnly := RedirectPolicyFunc(WithSameHost(true))(target, via); hostOnly != nil {
+				t.Fatalf("WithSameHost(true) refused a same-origin hop %s -> %s: %v", via[0].URL, target.URL, hostOnly)
+			}
 		}
 	})
 }

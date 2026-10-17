@@ -2,6 +2,7 @@ package httpx_test
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,8 +43,8 @@ func TestDockerGitHubRedirectPolicy(t *testing.T) {
 		{"evil.com refused", "evil.com", 0, true},
 		{"localhost refused", "localhost", 0, true},
 		{"127.0.0.1 refused", "127.0.0.1", 0, true},
-		{"too many redirects", "hub.docker.com", 5, true},
-		{"4 redirects still ok", "hub.docker.com", 4, false},
+		{"too many redirects", "hub.docker.com", 6, true},
+		{"5 redirects still ok", "hub.docker.com", 5, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -74,8 +75,8 @@ func TestRedirectPolicyFunc(t *testing.T) {
 		{"exact host allowed", "example.com", 0, false},
 		{"suffix allowed", "sub.example.org", 0, false},
 		{"unknown refused", "evil.com", 0, true},
-		{"too many hops", "example.com", 3, true},
-		{"2 hops ok", "example.com", 2, false},
+		{"too many hops", "example.com", 4, true},
+		{"3 hops ok", "example.com", 3, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -115,15 +116,15 @@ func TestRedirectPolicyFunc_suffixes_only_allows_configured_suffix(t *testing.T)
 	}
 }
 
-// TestRedirectPolicyFunc_default_max_hops verifies the default hop cap is
-// redirectCap (5) when WithMaxHops is not set: 4 hops allowed, 5 refused.
+// TestRedirectPolicyFunc_default_max_hops verifies the default hop cap when
+// WithMaxHops is not set: the 5th redirect is followed, the 6th refused.
 func TestRedirectPolicyFunc_default_max_hops(t *testing.T) {
 	policy := httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("example.com"))
-	if err := policy(redirectReq("example.com"), redirectVia(4)); err != nil {
-		t.Errorf("4 hops should be allowed: %v", err)
+	if err := policy(redirectReq("example.com"), redirectVia(5)); err != nil {
+		t.Errorf("the 5th redirect should be followed: %v", err)
 	}
-	if err := policy(redirectReq("example.com"), redirectVia(5)); err == nil {
-		t.Error("5 hops should be refused (default maxHops=5)")
+	if err := policy(redirectReq("example.com"), redirectVia(6)); err == nil {
+		t.Error("the 6th redirect should be refused (default cap 5)")
 	}
 }
 
@@ -155,12 +156,12 @@ func TestDefaultRedirectPolicy_first_redirect_no_via(t *testing.T) {
 func TestDefaultRedirectPolicy_too_many_hops(t *testing.T) {
 	origURL, _ := url.Parse("https://example.com/start")
 	redirURL, _ := url.Parse("https://example.com/x")
-	via := make([]*http.Request, 5)
+	via := make([]*http.Request, 6)
 	for i := range via {
 		via[i] = &http.Request{URL: origURL}
 	}
 	if err := httpx.DefaultRedirectPolicy(&http.Request{URL: redirURL}, via); err == nil {
-		t.Error("should refuse after 5 hops")
+		t.Error("should refuse the 6th redirect")
 	}
 }
 
@@ -556,20 +557,20 @@ func TestRedirectPolicyFunc_preserveMethod_precedence(t *testing.T) {
 			policy:  httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("api.example"), httpx.WithPreserveMethod(true)),
 			target:  "https://evil.example/x",
 			via:     []string{http.MethodPost},
-			wantMsg: "refusing redirect to evil.example",
+			wantMsg: "refusing redirect to https://evil.example",
 		},
 		{
 			name:    "scheme-downgrade refusal wins",
 			policy:  httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithPreserveMethod(true)),
 			target:  "http://api.example/x",
 			via:     []string{http.MethodPost},
-			wantMsg: "refusing scheme downgrade to api.example",
+			wantMsg: "refusing scheme downgrade to http://api.example",
 		},
 		{
 			name:    "hop cap wins",
 			policy:  httpx.RedirectPolicyFunc(httpx.WithSameHost(true), httpx.WithMaxHops(2), httpx.WithPreserveMethod(true)),
 			target:  "https://api.example/x",
-			via:     []string{http.MethodPost, http.MethodPost},
+			via:     []string{http.MethodPost, http.MethodPost, http.MethodPost},
 			wantMsg: "too many redirects",
 		},
 	}
@@ -590,8 +591,8 @@ func TestRedirectPolicyFunc_preserveMethod_precedence(t *testing.T) {
 }
 
 // TestRedirectPolicyFunc_preserveMethod_grants_nothing pins that the option only
-// ever narrows: on its own (no allowlist, no WithSameHost) the policy still
-// refuses every redirect via the fail-closed no-target branch.
+// ever narrows: on its own (no allowlist, WithSameHost or WithSameOrigin) the
+// policy still refuses every redirect via the fail-closed no-target branch.
 func TestRedirectPolicyFunc_preserveMethod_grants_nothing(t *testing.T) {
 	policy := httpx.RedirectPolicyFunc(httpx.WithPreserveMethod(true))
 	err := policy(methodReq(t, http.MethodGet, "https://api.example/next"),
@@ -796,4 +797,374 @@ func TestRedirectPolicyFunc_false_equals_absent_and_last_wins(t *testing.T) {
 			t.Errorf("policy(POST 302 hop) with WithPreserveMethod(false) = %v, want nil (false must equal leaving the option out)", err)
 		}
 	})
+}
+
+// refusal asserts err is a *RedirectRefusedError with the given reason and
+// origin.
+func refusal(t *testing.T, err error, reason httpx.RedirectReason, origin string) {
+	t.Helper()
+	refused, ok := errors.AsType[*httpx.RedirectRefusedError](err)
+	if !ok {
+		t.Fatalf("err = %v (%T), want *httpx.RedirectRefusedError", err, err)
+	}
+	if refused.Reason != reason {
+		t.Errorf("Reason = %v, want %v", refused.Reason, reason)
+	}
+	if refused.Origin != origin {
+		t.Errorf("Origin = %q, want %q", refused.Origin, origin)
+	}
+}
+
+// TestSameOriginRefusesOtherPort pins the exact-origin rule (RFC 6454): under
+// WithSameOrigin(true) a hop is followed only to the original scheme, host
+// (ASCII-folded) and effective port, and WithSameHost(true) follows the
+// first two hops this refuses, which is why a key-bearing client needs it.
+func TestSameOriginRefusesOtherPort(t *testing.T) {
+	refusedHops := []struct {
+		name, orig, target, origin string
+	}{
+		{"same host other port", "https://arr.example:8989/a", "https://arr.example:9090/b", "https://arr.example:9090"},
+		{"http to https on the same host", "http://arr.example/a", "https://arr.example/b", "https://arr.example"},
+		{"other host", "https://arr.example/a", "https://other.example/b", "https://other.example"},
+	}
+	sameOrigin := httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true))
+	sameHost := httpx.RedirectPolicyFunc(httpx.WithSameHost(true))
+	for _, tt := range refusedHops {
+		t.Run(tt.name, func(t *testing.T) {
+			err := sameOrigin(reqTo(t, tt.target), viaWithOrigin(t, tt.orig))
+			refusal(t, err, httpx.RedirectOtherOrigin, tt.origin)
+			if err != nil && err.Error() != "refusing redirect to "+tt.origin {
+				t.Errorf("Error() = %q, want %q", err.Error(), "refusing redirect to "+tt.origin)
+			}
+		})
+	}
+	for _, tt := range refusedHops[:2] {
+		t.Run(tt.name+" under WithSameHost", func(t *testing.T) {
+			if err := sameHost(reqTo(t, tt.target), viaWithOrigin(t, tt.orig)); err != nil {
+				t.Errorf("WithSameHost(true) %s -> %s = %v, want followed", tt.orig, tt.target, err)
+			}
+		})
+	}
+	followed := []struct{ name, orig, target string }{
+		{"same origin", "https://arr.example:8989/a", "https://arr.example:8989/b"},
+		{"host case folded", "https://ARR.Example/a", "https://arr.example/b"},
+		{"explicit 443 equals https default", "https://arr.example:443/a", "https://arr.example/b"},
+		{"https default equals explicit 443", "https://arr.example/a", "https://arr.example:443/b"},
+		{"explicit 80 equals http default", "http://arr.example/a", "http://Arr.Example:80/b"},
+	}
+	for _, tt := range followed {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := sameOrigin(reqTo(t, tt.target), viaWithOrigin(t, tt.orig)); err != nil {
+				t.Errorf("WithSameOrigin(true) %s -> %s = %v, want followed", tt.orig, tt.target, err)
+			}
+		})
+	}
+}
+
+// TestRedirectRefusalsTyped pins that every hard refusal of a shipped policy
+// is a *RedirectRefusedError carrying the hop target's origin and the rule
+// that refused it, so a caller tells them apart with errors.As alone; the
+// origin never carries the target's userinfo, path or query, and parses.
+func TestRedirectRefusalsTyped(t *testing.T) {
+	const target = "https://user:pw@evil.example:8443/key/path?apikey=k"
+	tests := []struct {
+		name    string
+		policy  httpx.CheckRedirect
+		target  string
+		via     []*http.Request
+		reason  httpx.RedirectReason
+		origin  string
+		message string
+	}{
+		{
+			name:   "no allowlist",
+			policy: httpx.RedirectPolicyFunc(),
+			target: target, via: viaWithOrigin(t, "https://api.example/a"),
+			reason: httpx.RedirectNotAllowed, origin: "https://evil.example:8443",
+			message: "redirects not allowed",
+		},
+		{
+			name:   "cross host",
+			policy: httpx.RedirectPolicyFunc(httpx.WithSameHost(true)),
+			target: target, via: viaWithOrigin(t, "https://api.example/a"),
+			reason: httpx.RedirectOtherOrigin, origin: "https://evil.example:8443",
+			message: "refusing redirect to https://evil.example:8443",
+		},
+		{
+			name:   "downgrade",
+			policy: httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("cdn.example")),
+			target: "http://cdn.example/x?apikey=k", via: viaWithOrigin(t, "https://api.example/a"),
+			reason: httpx.RedirectDowngrade, origin: "http://cdn.example",
+			message: "refusing scheme downgrade to http://cdn.example",
+		},
+		{
+			name:   "hop cap names the hop's target",
+			policy: httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("api.example", "cdn.example"), httpx.WithMaxHops(1)),
+			target: "https://cdn.example:8443/c?apikey=k", via: append(viaWithOrigin(t, "https://api.example/a"), &http.Request{}),
+			reason: httpx.RedirectTooMany, origin: "https://cdn.example:8443",
+			message: "too many redirects",
+		},
+		{
+			name:   "zoned IPv6 target keeps its zone escaped",
+			policy: httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true)),
+			target: "http://[fe80::1%25eth1]:8080/b", via: viaWithOrigin(t, "http://[fe80::1%25eth0]:8080/a"),
+			reason: httpx.RedirectOtherOrigin, origin: "http://[fe80::1%25eth1]:8080",
+			message: "refusing redirect to http://[fe80::1%25eth1]:8080",
+		},
+		{
+			name:   "DockerGitHubRedirectPolicy other host",
+			policy: httpx.DockerGitHubRedirectPolicy,
+			target: target, via: viaWithOrigin(t, "https://hub.docker.com/a"),
+			reason: httpx.RedirectOtherOrigin, origin: "https://evil.example:8443",
+			message: "refusing redirect to https://evil.example:8443",
+		},
+		{
+			name:   "DockerGitHubRedirectPolicy downgrade",
+			policy: httpx.DockerGitHubRedirectPolicy,
+			target: "http://hub.docker.com/b", via: viaWithOrigin(t, "https://hub.docker.com/a"),
+			reason: httpx.RedirectDowngrade, origin: "http://hub.docker.com",
+			message: "refusing scheme downgrade to http://hub.docker.com",
+		},
+		{
+			name:   "DockerGitHubRedirectPolicy hop cap",
+			policy: httpx.DockerGitHubRedirectPolicy,
+			target: "https://hub.docker.com/b", via: redirectVia(6),
+			reason: httpx.RedirectTooMany, origin: "https://hub.docker.com",
+			message: "too many redirects",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.policy(reqTo(t, tt.target), tt.via)
+			refusal(t, err, tt.reason, tt.origin)
+			if err != nil && err.Error() != tt.message {
+				t.Errorf("Error() = %q, want %q", err.Error(), tt.message)
+			}
+			if _, perr := url.Parse(tt.origin); perr != nil {
+				t.Errorf("url.Parse(Origin %q) = %v, want a URL", tt.origin, perr)
+			}
+		})
+	}
+}
+
+// TestRedirectRefusalsHandBuilt pins the policy on requests net/http never
+// builds: a nil or host-less URL refuses with an empty Origin instead of
+// panicking, and a scheme written in upper case still reads as its origin.
+func TestRedirectRefusalsHandBuilt(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy httpx.CheckRedirect
+		req    *http.Request
+		via    []*http.Request
+		reason httpx.RedirectReason // zero: followed
+		origin string
+	}{
+		{
+			name:   "nil target URL",
+			policy: httpx.RedirectPolicyFunc(),
+			req:    &http.Request{},
+			reason: httpx.RedirectNotAllowed,
+		},
+		{
+			name:   "host-less target and nil original URL under WithSameOrigin",
+			policy: httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true)),
+			req:    &http.Request{URL: &url.URL{Path: "/b"}},
+			via:    []*http.Request{{}},
+			reason: httpx.RedirectOtherOrigin,
+		},
+		{
+			name:   "upper-case target scheme",
+			policy: httpx.RedirectPolicyFunc(),
+			req:    &http.Request{URL: &url.URL{Scheme: "HTTPS", Host: "evil.example"}},
+			reason: httpx.RedirectNotAllowed, origin: "https://evil.example",
+		},
+		{
+			name:   "upper-case original scheme is the same origin",
+			policy: httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true)),
+			req:    &http.Request{URL: &url.URL{Scheme: "https", Host: "arr.example"}},
+			via:    []*http.Request{{URL: &url.URL{Scheme: "HTTPS", Host: "arr.example"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.policy(tt.req, tt.via)
+			if tt.reason == 0 {
+				if err != nil {
+					t.Errorf("policy = %v, want followed", err)
+				}
+				return
+			}
+			refusal(t, err, tt.reason, tt.origin)
+		})
+	}
+}
+
+// TestSameOriginComposition pins how WithSameOrigin composes with the other
+// options: the original host is followed only at its own scheme and effective
+// port whatever WithSameHost says, allowlisted hosts are still followed, the
+// downgrade rule governs only those other hosts, and the later option wins.
+func TestSameOriginComposition(t *testing.T) {
+	const orig = "https://arr.example:8989/a"
+	tests := []struct {
+		name   string
+		opts   []httpx.RedirectOption
+		target string
+		reason httpx.RedirectReason // zero: followed
+		origin string
+	}{
+		{
+			name:   "WithSameHost does not widen the original host's port",
+			opts:   []httpx.RedirectOption{httpx.WithSameOrigin(true), httpx.WithSameHost(true)},
+			target: "https://arr.example:9090/b", reason: httpx.RedirectOtherOrigin, origin: "https://arr.example:9090",
+		},
+		{
+			name:   "WithSameHost placed first does not widen it either",
+			opts:   []httpx.RedirectOption{httpx.WithSameHost(true), httpx.WithSameOrigin(true)},
+			target: "https://arr.example:9090/b", reason: httpx.RedirectOtherOrigin, origin: "https://arr.example:9090",
+		},
+		{
+			name:   "same origin with WithSameHost",
+			opts:   []httpx.RedirectOption{httpx.WithSameOrigin(true), httpx.WithSameHost(true)},
+			target: "https://arr.example:8989/b",
+		},
+		{
+			name:   "an allowed host stays followed on any port",
+			opts:   []httpx.RedirectOption{httpx.WithSameOrigin(true), httpx.WithAllowedHosts("cdn.example")},
+			target: "https://cdn.example:444/b",
+		},
+		{
+			name:   "an allowed suffix stays followed",
+			opts:   []httpx.RedirectOption{httpx.WithSameOrigin(true), httpx.WithAllowedSuffixes(".cdn.example")},
+			target: "https://edge.cdn.example/b",
+		},
+		{
+			name:   "allowlisting the original host does not widen its origin",
+			opts:   []httpx.RedirectOption{httpx.WithSameOrigin(true), httpx.WithAllowedHosts("arr.example")},
+			target: "https://arr.example:9090/b", reason: httpx.RedirectOtherOrigin, origin: "https://arr.example:9090",
+		},
+		{
+			name:   "a downgrade to an allowed host is refused by default",
+			opts:   []httpx.RedirectOption{httpx.WithSameOrigin(true), httpx.WithAllowedHosts("cdn.example")},
+			target: "http://cdn.example/b", reason: httpx.RedirectDowngrade, origin: "http://cdn.example",
+		},
+		{
+			name: "WithAllowSchemeDowngrade lets an allowed host downgrade",
+			opts: []httpx.RedirectOption{
+				httpx.WithSameOrigin(true), httpx.WithAllowedHosts("cdn.example"), httpx.WithAllowSchemeDowngrade(true),
+			},
+			target: "http://cdn.example/b",
+		},
+		{
+			name: "WithAllowSchemeDowngrade does not let the original host downgrade",
+			opts: []httpx.RedirectOption{
+				httpx.WithSameOrigin(true), httpx.WithAllowedHosts("cdn.example"), httpx.WithAllowSchemeDowngrade(true),
+			},
+			target: "http://arr.example:8989/b", reason: httpx.RedirectOtherOrigin, origin: "http://arr.example:8989",
+		},
+		{
+			name:   "later WithSameOrigin(false) turns the permission off",
+			opts:   []httpx.RedirectOption{httpx.WithSameOrigin(true), httpx.WithSameOrigin(false)},
+			target: "https://arr.example:8989/b", reason: httpx.RedirectNotAllowed, origin: "https://arr.example:8989",
+		},
+		{
+			name:   "later WithSameOrigin(true) turns it on",
+			opts:   []httpx.RedirectOption{httpx.WithSameOrigin(false), httpx.WithSameOrigin(true)},
+			target: "https://arr.example:8989/b",
+		},
+		{
+			name:   "WithSameOrigin(false) leaves WithSameHost as it was",
+			opts:   []httpx.RedirectOption{httpx.WithSameHost(true), httpx.WithSameOrigin(false)},
+			target: "https://arr.example:9090/b",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := httpx.RedirectPolicyFunc(tt.opts...)(reqTo(t, tt.target), viaWithOrigin(t, orig))
+			if tt.reason == 0 {
+				if err != nil {
+					t.Errorf("%s -> %s = %v, want followed", orig, tt.target, err)
+				}
+				return
+			}
+			refusal(t, err, tt.reason, tt.origin)
+		})
+	}
+}
+
+// redirectChain serves /hop/<i> as a same-origin redirect to /hop/<i+1> until
+// /hop/<n>, which answers 200, and counts the requests it answered.
+func redirectChain(t *testing.T, n int) (srv *httptest.Server, hits *atomic.Int32) {
+	t.Helper()
+	hits = &atomic.Int32{}
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		var i int
+		if _, err := fmt.Sscanf(r.URL.Path, "/hop/%d", &i); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if i >= n {
+			_, _ = w.Write([]byte("end"))
+			return
+		}
+		http.Redirect(w, r, fmt.Sprintf("/hop/%d", i+1), http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, hits
+}
+
+// TestMaxHopsFollowsExactlyN pins the hop cap through net/http: WithMaxHops(n)
+// follows a chain of exactly n redirects and refuses the (n+1)th with
+// RedirectTooMany, and leaving the option out (or n <= 0) means 5.
+func TestMaxHopsFollowsExactlyN(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []httpx.RedirectOption
+		n    int
+	}{
+		{"WithMaxHops(1)", []httpx.RedirectOption{httpx.WithMaxHops(1)}, 1},
+		{"WithMaxHops(3)", []httpx.RedirectOption{httpx.WithMaxHops(3)}, 3},
+		{"default", nil, 5},
+		{"WithMaxHops(0) is the default", []httpx.RedirectOption{httpx.WithMaxHops(0)}, 5},
+	}
+	get := func(t *testing.T, policy httpx.CheckRedirect, url string) (*http.Response, error) {
+		t.Helper()
+		client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: policy}
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		return client.Do(req)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := httpx.RedirectPolicyFunc(append([]httpx.RedirectOption{httpx.WithSameOrigin(true)}, tt.opts...)...)
+
+			srv, hits := redirectChain(t, tt.n)
+			resp, err := get(t, policy, srv.URL+"/hop/0")
+			if err != nil {
+				t.Fatalf("a chain of %d redirects: %v, want followed", tt.n, err)
+			}
+			httpx.Drain(resp.Body)
+			resp.Body.Close()
+			if got := hits.Load(); got != int32(tt.n+1) {
+				t.Errorf("a chain of %d redirects reached the server %d times, want %d", tt.n, got, tt.n+1)
+			}
+
+			longer, longerHits := redirectChain(t, tt.n+1)
+			resp, err = get(t, policy, longer.URL+"/hop/0")
+			if err == nil {
+				httpx.Drain(resp.Body)
+				resp.Body.Close()
+				t.Fatalf("a chain of %d redirects was followed, want the redirect after the %dth refused", tt.n+1, tt.n)
+			}
+			refusal(t, err, httpx.RedirectTooMany, longer.URL)
+			if httpx.IsTransient(err) {
+				t.Errorf("IsTransient(%v) = true, want false: a refused redirect is not retried", err)
+			}
+			if got := longerHits.Load(); got != int32(tt.n+1) {
+				t.Errorf("a chain of %d redirects reached the server %d times, want %d", tt.n+1, got, tt.n+1)
+			}
+		})
+	}
 }
