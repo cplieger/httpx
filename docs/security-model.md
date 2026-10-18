@@ -8,7 +8,7 @@ Go strips `Authorization`, `Cookie` and `WWW-Authenticate` on a cross-domain red
 
 | Policy | Follows |
 | --- | --- |
-| `DefaultRedirectPolicy` | same-host redirects only, including an `http` to `https` upgrade on that host. `NewClient` installs it |
+| `DefaultRedirectPolicy` | same-host redirects only, on any port, including an `http` to `https` upgrade on that host. `NewClient` installs it |
 | `RefuseAllRedirects` | nothing. It returns `http.ErrUseLastResponse`, so the client hands back the 3xx with a nil error |
 | `DockerGitHubRedirectPolicy` | an example allowlist for `docker.com` and `github.com` hosts |
 | `RedirectPolicyFunc(opts...)` | the hosts its options allow |
@@ -25,12 +25,23 @@ Every shipped policy refuses an `https` to `http` downgrade, even to an allowed 
 | --- | --- | --- |
 | `WithAllowedHosts(hosts...)` | none | Exact host names allowed as targets |
 | `WithAllowedSuffixes(suffixes...)` | none | Domain suffixes allowed, such as `.cdn.example.com` |
-| `WithSameHost(bool)` | false | Also allows the original request's own host |
-| `WithMaxHops(n)` | 5 | Most redirect hops followed |
+| `WithSameHost(bool)` | false | Also allows the original request's own host, on any port and scheme |
+| `WithSameOrigin(bool)` | false | Also allows the original request's own origin: its scheme, host and port |
+| `WithMaxHops(n)` | 5 | Redirects followed in one request. The next one is refused |
 | `WithAllowSchemeDowngrade(bool)` | false | Allows an `https` to `http` hop |
 | `WithPreserveMethod(bool)` | false | Refuses a hop that would change the request method |
 
-With no allowed host, no suffix and no `WithSameHost(true)`, the policy refuses every redirect. Host names compare without regard to ASCII case. A later option overrides an earlier one, so appending `WithSameHost(false)` turns the permission back off.
+With no allowed host, no suffix, no `WithSameHost(true)` and no `WithSameOrigin(true)`, the policy refuses every redirect. Host names compare without regard to ASCII case. An IP address compares by value, so `[2001:db8::a]` and `[2001:db8:0::a]` are one host, and its IPv6 zone compares exactly, so `[fe80::1%25eth0]` and `[fe80::1%25ETH0]` are two hosts. A suffix matches a host name only, never an IP address. A later option overrides an earlier one, so appending `WithSameHost(false)` turns the permission back off.
+
+### Same origin
+
+`WithSameHost(true)` follows a hop to another port on the same host, and an `http` to `https` upgrade. Another port can be another service, which then receives your custom auth header. `WithSameOrigin(true)` follows a hop to the original host only at its own scheme and port, as RFC 6454 defines an origin. A missing port counts as 80 for `http` and 443 for `https`.
+
+With `WithSameOrigin(true)`, the origin alone decides a hop to the original host, even when `WithSameHost(true)` or `WithAllowedHosts` also names it. Hops to other hosts are still judged by the allowlist and by `WithAllowSchemeDowngrade`.
+
+### Refusals
+
+Every hard refusal from a shipped policy, by the hop cap, the target permission or the downgrade rule, is a `*RedirectRefusedError`, inside the `*url.Error` that `http.Client` returns. Its `Reason` names the rule: `RedirectNotAllowed`, `RedirectOtherOrigin`, `RedirectDowngrade` or `RedirectTooMany`. Use `errors.As` and `Reason` to tell them apart, not the error text. Its `Origin` field holds the target's scheme, host and port, never its userinfo, path or query, and the error text names only that origin. The origin is escaped as in a URL, so an IPv6 zone reads `%25` and `url.Parse` reads it back. This error is never transient, so `Do` does not retry it. `RefuseAllRedirects` and a `WithPreserveMethod(true)` refusal return `http.ErrUseLastResponse` instead, so you get the 3xx itself with a nil error.
 
 ### Keeping the request method
 
@@ -38,7 +49,7 @@ net/http turns a POST, PUT, PATCH or DELETE into a GET across a 301, 302 or 303 
 
 `WithPreserveMethod(true)` refuses such a hop instead. It returns `http.ErrUseLastResponse`, so you get the 3xx with a nil error, and `CheckHTTPStatus` reports it as an error, the same pairing `RefuseAllRedirects` uses. The request is never re-sent with the original method.
 
-The comparison is with the original request. A POST kept by a 307 and then turned into a GET by a 302 is refused at the second hop. A hop chain with no original request fails closed. The hop cap, the allowlist and the downgrade refusal are checked first and return hard errors. The option only narrows a policy, so with no allowlist and no `WithSameHost(true)` it still refuses everything.
+The comparison is with the original request. A POST kept by a 307 and then turned into a GET by a 302 is refused at the second hop. A hop chain with no original request fails closed. The hop cap, the allowlist and the downgrade refusal are checked first and return hard errors. The option only narrows a policy, so with no allowlist, no `WithSameHost(true)` and no `WithSameOrigin(true)` it still refuses everything.
 
 ## Trusting only your own CA
 

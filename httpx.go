@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -320,7 +321,7 @@ const (
 // drainLimit caps body drain reads for connection reuse.
 const drainLimit = 64 << 10
 
-// redirectCap is the maximum redirect hops.
+// redirectCap is the number of redirects a shipped policy follows by default.
 const redirectCap = 5
 
 // --- Retry-After parsing ---
@@ -868,6 +869,7 @@ type redirectCfg struct {
 	allowedSuffixes      []string
 	maxHops              int
 	sameHost             bool
+	sameOrigin           bool
 	allowSchemeDowngrade bool
 	preserveMethod       bool
 }
@@ -875,37 +877,47 @@ type redirectCfg struct {
 // RedirectOption configures a redirect policy created by RedirectPolicyFunc.
 type RedirectOption func(*redirectCfg)
 
-// WithAllowedHosts sets the exact hostnames allowed as redirect targets.
+// WithAllowedHosts sets the exact hostnames allowed as redirect targets. A
+// name matches without regard to ASCII case; an IP address entry, written
+// without brackets ("2001:db8::a", "fe80::1%eth0"), matches by address, its
+// IPv6 zone exactly. An empty entry matches nothing.
 func WithAllowedHosts(hosts ...string) RedirectOption {
 	return func(c *redirectCfg) { c.allowedHosts = hosts }
 }
 
 // WithAllowedSuffixes sets the domain suffixes allowed (e.g. ".docker.com").
+// A suffix matches a host name only, never an IP literal.
 func WithAllowedSuffixes(suffixes ...string) RedirectOption {
 	return func(c *redirectCfg) { c.allowedSuffixes = suffixes }
 }
 
-// WithMaxHops sets the maximum number of redirect hops. Default: 5.
+// WithMaxHops makes the policy follow at most n redirects in one request and
+// refuse the next with [RedirectTooMany]. n <= 0 means the default, 5.
 func WithMaxHops(n int) RedirectOption {
 	return func(c *redirectCfg) { c.maxHops = n }
 }
 
 // WithSameHost permits a redirect whose target host equals the original
-// request's host (ASCII case-insensitive, RFC 3986 §6.2.2.1), in addition to
-// any WithAllowedHosts / WithAllowedSuffixes entries. The default (false)
-// matches leaving the option out: only allowlisted targets are followed.
-// WithSameHost(true) is the building block for a same-origin policy: combined
-// with the default scheme-downgrade refusal (see WithAllowSchemeDowngrade),
-// it follows a service's own same-host redirects (including an http->https
-// upgrade) while refusing a cross-host hop that would forward a custom auth
-// header to another origin. A policy built with only WithSameHost(true) (no
-// allowlisted hosts) permits exactly the same-host set.
-//
-// Like every RedirectOption, later values overwrite earlier ones: appending
-// WithSameHost(false) to an option slice that already carries
-// WithSameHost(true) turns the permission back off.
+// request's host, as [WithSameOrigin] compares hosts, beside any allowlist
+// entries. It follows that host on any port and an http->https upgrade there,
+// so a custom auth header can reach another service on the host;
+// [WithSameOrigin] keeps it on one origin. An https->http hop stays
+// under [WithAllowSchemeDowngrade]. Later options win, so a later
+// WithSameHost(false) turns the permission back off.
 func WithSameHost(same bool) RedirectOption {
 	return func(c *redirectCfg) { c.sameHost = same }
+}
+
+// WithSameOrigin permits a redirect to the original request's origin: its
+// scheme, its port (absent reads 80 for http, 443 for https) and its host, a
+// name compared ASCII case-insensitively and an IP literal by address with its
+// IPv6 zone, a local implementation-defined identifier (RFC 4007 section 11.2),
+// compared byte for byte. Unlike [WithSameHost] it refuses another port and an
+// http->https upgrade. When set, the origin alone decides a hop to the original
+// host, whatever [WithSameHost] or [WithAllowedHosts] say; the allowlist and
+// the downgrade rule judge other hosts, and a refusal is [RedirectOtherOrigin].
+func WithSameOrigin(same bool) RedirectOption {
+	return func(c *redirectCfg) { c.sameOrigin = same }
 }
 
 // WithAllowSchemeDowngrade permits a redirect that downgrades the scheme
@@ -919,42 +931,20 @@ func WithAllowSchemeDowngrade(allow bool) RedirectOption {
 	return func(c *redirectCfg) { c.allowSchemeDowngrade = allow }
 }
 
-// WithPreserveMethod REFUSES a redirect hop that would change the request
-// method, rather than rewriting the method back. The default (false) matches
-// leaving the option out: a method-changing hop is followed as net/http
-// rewrites it. net/http downgrades a POST (or PUT/PATCH/DELETE) to a GET
-// across a 301, 302, or 303 and drops the body, per RFC 9110 §15.4 and Go's
-// issue 18570 compatibility rule; only a 307 or 308 carries the method and
-// body forward. For an API call whose meaning IS its method, that silent
-// downgrade turns a write into a read against a URL the caller never named,
-// so WithPreserveMethod(true) makes the client stop instead.
-//
-// A refused hop returns [http.ErrUseLastResponse], not an error: net/http then
-// hands the caller the 3xx response itself (status, Location header, body open,
-// nil error), exactly as [RefuseAllRedirects] does, and the surfaced 3xx is an
-// error under [CheckHTTPStatus]. The method is never rewritten back to the
-// original — the request is simply not re-sent.
-//
-// The comparison is against the ORIGINAL request (via[0]), so a chain that
-// preserves the method once and changes it later is still refused: a POST
-// through a 307 (method kept) followed by a 302 (method downgraded to GET) is
-// refused at the second hop. A same-method hop (a GET chain, or a POST through
-// a 307/308) is unaffected and still subject to the hop cap, the target
-// allowlist, and the scheme-downgrade rule, which all take precedence — a
-// cross-host or downgrading hop is refused as a hard error even when the
-// method also changes. When via is empty (net/http never does this; a
-// hand-built chain can) the original method is unknowable, so the hop is
-// refused too: the option fails closed.
-//
-// It only ever narrows what a policy follows, so it grants nothing on its own:
-// [RedirectPolicyFunc] with WithPreserveMethod(true) and no allowlist and no
-// [WithSameHost] entry still refuses every redirect.
+// WithPreserveMethod refuses, when true, a hop that would change the request
+// method, as net/http does to a POST, PUT, PATCH or DELETE across a 301, 302 or
+// 303 (RFC 9110 §15.4, https://go.dev/issue/18570). It returns
+// [http.ErrUseLastResponse], so the caller gets the 3xx with a nil error, as
+// with [RefuseAllRedirects]. The method is compared with the original request
+// (via[0]) and an empty via fails closed. The hop cap, target and downgrade
+// refusals take precedence, and it grants nothing: with no allowlist,
+// [WithSameHost] or [WithSameOrigin] every redirect is still refused.
 func WithPreserveMethod(preserve bool) RedirectOption {
 	return func(c *redirectCfg) { c.preserveMethod = preserve }
 }
 
 // asciiLower lowercases only ASCII letters A-Z, leaving every other byte
-// unchanged. Host comparison in RFC 3986 §6.2.2.1 is ASCII case-insensitive;
+// unchanged. URI schemes and reg-names fold ASCII case (RFC 3986 §6.2.2.1);
 // strings.ToLower must NOT be used here because it folds each invalid UTF-8
 // byte to U+FFFD, collapsing distinct hosts (e.g. "\xfe" and "\xae") into one
 // allowlist-matching equivalence class — a redirect-allowlist bypass. It also
@@ -977,22 +967,161 @@ func asciiLower(s string) string {
 	return string(b)
 }
 
-// hostMatchesSuffix reports whether host matches the given dot-prefixed suffix.
-// The suffix must start with ".". It matches if host equals the suffix without
-// the leading dot, or if host ends with the suffix.
-func hostMatchesSuffix(host, suffix string) bool {
-	return host == suffix[1:] || strings.HasSuffix(host, suffix)
+// RedirectReason names the rule of a redirect policy that refused a hop.
+type RedirectReason int
+
+const (
+	// RedirectNotAllowed means the policy follows no redirect at all (no
+	// allowlist, no WithSameHost(true), no WithSameOrigin(true)).
+	RedirectNotAllowed RedirectReason = iota + 1
+	// RedirectOtherOrigin means the target is neither an allowed host nor, under
+	// WithSameHost or WithSameOrigin, the original request's host or origin.
+	RedirectOtherOrigin
+	// RedirectDowngrade means an https->http hop to an otherwise allowed target.
+	RedirectDowngrade
+	// RedirectTooMany means the hop would exceed the policy's hop cap.
+	RedirectTooMany
+)
+
+// RedirectRefusedError is a shipped redirect policy's hard refusal of one hop:
+// the hop cap, target permission and downgrade checks of a [RedirectPolicyFunc]
+// policy, [DefaultRedirectPolicy] and [DockerGitHubRedirectPolicy] answer one,
+// so a caller tells them apart with [errors.As] and Reason alone.
+// [RefuseAllRedirects] and a [WithPreserveMethod] refusal answer
+// [http.ErrUseLastResponse] instead. An [http.Client] returns it inside a
+// [*url.Error], and it is never transient.
+type RedirectRefusedError struct {
+	// Origin is the refused target's origin, "scheme://host" plus ":port"
+	// when the port is not the scheme's default, escaped so [url.Parse]
+	// reads it back. It never holds the target's userinfo, path or query, so
+	// Error is safe to log for a target that carried a credential there.
+	Origin string
+	// Reason is the rule that refused the hop.
+	Reason RedirectReason
+}
+
+// Error renders the refusal from Reason and Origin only.
+func (e *RedirectRefusedError) Error() string {
+	switch e.Reason {
+	case RedirectNotAllowed:
+		return "redirects not allowed"
+	case RedirectTooMany:
+		return "too many redirects"
+	case RedirectDowngrade:
+		return "refusing scheme downgrade to " + e.Origin
+	default:
+		return "refusing redirect to " + e.Origin
+	}
+}
+
+func refuseHop(target *url.URL, reason RedirectReason) *RedirectRefusedError {
+	return &RedirectRefusedError{Origin: originOf(target), Reason: reason}
+}
+
+// originOf serializes u's origin as a URL [url.Parse] reads back: the
+// lowercased scheme, the host as the target wrote it (not case-folded, so a
+// caller redacting a credential from Origin finds its bytes), and the port
+// only when it is not the default. [url.URL.String] escapes the host as a URL
+// does: an IPv6 zone's % reads %25, a non-ASCII byte %XX.
+func originOf(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	scheme := asciiLower(u.Scheme)
+	host := u.Hostname()
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port := u.Port(); port != "" && port != defaultPort(scheme) {
+		host += ":" + port
+	}
+	return (&url.URL{Scheme: scheme, Host: host}).String()
+}
+
+// defaultPort is the port an absent one means for scheme (lowercased), or ""
+// for a scheme net/http does not dial.
+func defaultPort(scheme string) string {
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
+}
+
+// hostKey is a host's identity for every redirect decision, comparable with
+// ==. An IP literal sets addr only, so it compares by address with its IPv6
+// zone exact (RFC 4007 section 11.2 leaves the zone format to the
+// implementation, and net resolves a zone by its exact interface name) and no
+// name rule, such as a suffix, ever matches it. A reg-name sets name only,
+// ASCII-lowercased (RFC 3986 section 6.2.2.1).
+type hostKey struct {
+	addr netip.Addr
+	name string
+}
+
+// hostKeyOf returns the identity of hostname as [url.URL.Hostname] gives it,
+// its IPv6 zone already percent-decoded and never decoded again, or false
+// when it is empty.
+func hostKeyOf(hostname string) (hostKey, bool) {
+	if hostname == "" {
+		return hostKey{}, false
+	}
+	if addr, err := netip.ParseAddr(hostname); err == nil {
+		return hostKey{addr: addr}, true
+	}
+	return hostKey{name: asciiLower(hostname)}, true
+}
+
+// matchesSuffix reports whether k is a name equal to suffix without its
+// leading "." or ending in suffix, which must be dot-prefixed.
+func (k hostKey) matchesSuffix(suffix string) bool {
+	return k.name != "" && (k.name == suffix[1:] || strings.HasSuffix(k.name, suffix))
+}
+
+// originKey is a URL's origin, the RFC 6454 section 4 origin tuple with its
+// host compared as hostKey compares it, comparable with ==. port is the
+// effective port, 0 when the URL has none and its scheme no default.
+type originKey struct {
+	host   hostKey
+	scheme string
+	port   uint16
+}
+
+// originKeyOf returns u's origin, or false for a nil or host-less URL or a
+// port outside 0-65535, which no dialer reaches.
+func originKeyOf(u *url.URL) (originKey, bool) {
+	if u == nil {
+		return originKey{}, false
+	}
+	host, ok := hostKeyOf(u.Hostname())
+	if !ok {
+		return originKey{}, false
+	}
+	o := originKey{host: host, scheme: asciiLower(u.Scheme)}
+	port := u.Port()
+	if port == "" {
+		port = defaultPort(o.scheme)
+	}
+	if port != "" {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return originKey{}, false
+		}
+		o.port = uint16(n)
+	}
+	return o, true
 }
 
 // RedirectPolicyFunc returns a CheckRedirect function configured with the given
-// options. A redirect is followed only when its target host is allowed — an
-// exact WithAllowedHosts entry, a WithAllowedSuffixes match, or (with
-// WithSameHost(true)) the original request's own host — and, unless
-// WithAllowSchemeDowngrade is set, the redirect does not downgrade https->http.
-// With no allowlist and no WithSameHost(true), all redirects are refused. The
-// hop cap is WithMaxHops (default 5). WithPreserveMethod(true) additionally
-// refuses (via http.ErrUseLastResponse, so the 3xx surfaces to the caller) a
-// hop that would change the request method.
+// options. A redirect is followed only to an allowed target (a WithAllowedHosts
+// entry, a WithAllowedSuffixes match, the original host under WithSameHost, the
+// original origin under WithSameOrigin) and, unless WithAllowSchemeDowngrade is
+// set, never https->http. With none of those permissions every redirect is
+// refused. The hop cap is WithMaxHops. Every hard refusal is a
+// [*RedirectRefusedError]; WithPreserveMethod(true) instead answers
+// http.ErrUseLastResponse for a hop that would change the method.
 func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Request) error {
 	cfg := redirectCfg{}
 	for _, o := range opts {
@@ -1000,22 +1129,21 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 			o(&cfg)
 		}
 	}
-	if len(cfg.allowedHosts) == 0 && len(cfg.allowedSuffixes) == 0 && !cfg.sameHost {
-		return func(_ *http.Request, _ []*http.Request) error {
-			return errors.New("redirects not allowed")
+	if len(cfg.allowedHosts) == 0 && len(cfg.allowedSuffixes) == 0 && !cfg.sameHost && !cfg.sameOrigin {
+		return func(req *http.Request, _ []*http.Request) error {
+			return refuseHop(req.URL, RedirectNotAllowed)
 		}
 	}
 	maxHops := cfg.maxHops
 	if maxHops <= 0 {
 		maxHops = redirectCap
 	}
-	// Hostnames are case-insensitive (RFC 3986 §6.2.2.1) and suffixes are
-	// dot-anchored to prevent substring bypass; normalize once up front.
 	rp := &resolvedRedirect{
-		allowedHosts:   lowercaseAll(cfg.allowedHosts),
+		allowedHosts:   hostKeysOf(cfg.allowedHosts),
 		suffixes:       normalizeSuffixes(cfg.allowedSuffixes),
 		maxHops:        maxHops,
 		sameHost:       cfg.sameHost,
+		sameOrigin:     cfg.sameOrigin,
 		allowDowngrade: cfg.allowSchemeDowngrade,
 		preserveMethod: cfg.preserveMethod,
 	}
@@ -1026,21 +1154,25 @@ func RedirectPolicyFunc(opts ...RedirectOption) func(*http.Request, []*http.Requ
 // its options into one of these once and returns its check method as the
 // http.Client CheckRedirect.
 type resolvedRedirect struct {
-	allowedHosts   []string
+	allowedHosts   []hostKey
 	suffixes       []string
 	maxHops        int
 	sameHost       bool
+	sameOrigin     bool
 	allowDowngrade bool
 	preserveMethod bool
 }
 
 // check implements the CheckRedirect contract for a resolved policy: it caps
-// hops, refuses a target that is neither allowlisted nor (with sameHost) the
-// origin's own host, refuses a scheme downgrade unless allowed, and (with
-// preserveMethod) refuses a method-changing hop.
+// hops, refuses a target that is neither allowlisted nor (with sameHost or
+// sameOrigin) the original request's host or origin, refuses a scheme
+// downgrade unless allowed, and (with preserveMethod) refuses a
+// method-changing hop.
 func (rp *resolvedRedirect) check(req *http.Request, via []*http.Request) error {
-	if len(via) >= rp.maxHops {
-		return errors.New("too many redirects")
+	// net/http calls CheckRedirect with every request sent so far in via, so
+	// len(via) is the number of the hop being judged.
+	if len(via) > rp.maxHops {
+		return refuseHop(req.URL, RedirectTooMany)
 	}
 	// via[0] is the original request; net/http always populates its URL, but
 	// guard against a nil URL so the policy degrades gracefully rather than
@@ -1049,12 +1181,11 @@ func (rp *resolvedRedirect) check(req *http.Request, via []*http.Request) error 
 	if len(via) > 0 {
 		origURL = via[0].URL
 	}
-	host := asciiLower(req.URL.Hostname())
-	if !rp.targetAllowed(host, origURL) {
-		return fmt.Errorf("refusing redirect to %s", host)
+	if !rp.targetAllowed(req.URL, origURL) {
+		return refuseHop(req.URL, RedirectOtherOrigin)
 	}
 	if !rp.allowDowngrade && origURL != nil && isSchemeDowngrade(origURL.Scheme, req.URL.Scheme) {
-		return fmt.Errorf("refusing scheme downgrade to %s", host)
+		return refuseHop(req.URL, RedirectDowngrade)
 	}
 	// Ordered last on purpose: the refusals above are the stronger security
 	// decisions and must keep precedence, because they fail the request with a
@@ -1091,13 +1222,24 @@ func effectiveMethod(method string) string {
 	return method
 }
 
-// targetAllowed reports whether host is an allowed redirect target: an exact or
-// suffix allowlist match, or (with sameHost) the origin request's own host.
-func (rp *resolvedRedirect) targetAllowed(host string, origURL *url.URL) bool {
-	if redirectAllowed(host, rp.allowedHosts, rp.suffixes) {
+// targetAllowed reports whether target is an allowed redirect target: under
+// sameOrigin the original request's origin decides a hop to its host;
+// otherwise an exact or suffix allowlist match, or (with sameHost) the
+// original request's own host.
+func (rp *resolvedRedirect) targetAllowed(target, origURL *url.URL) bool {
+	to, ok := originKeyOf(target)
+	if !ok {
+		return false
+	}
+	from, fromOK := originKeyOf(origURL)
+	onOrigHost := fromOK && to.host == from.host
+	if rp.sameOrigin && onOrigHost {
+		return to == from
+	}
+	if redirectAllowed(to.host, rp.allowedHosts, rp.suffixes) {
 		return true
 	}
-	return rp.sameHost && origURL != nil && host == asciiLower(origURL.Hostname())
+	return rp.sameHost && onOrigHost
 }
 
 // isSchemeDowngrade reports whether redirecting from scheme `from` to scheme
@@ -1117,11 +1259,8 @@ func normalizeSuffixes(suffixes []string) []string {
 		if !strings.HasPrefix(s, ".") {
 			s = "." + s
 		}
-		// Drop an empty or label-less suffix (""/"."/whitespace): it would
-		// dot-anchor to a bare ".", which hostMatchesSuffix then matches
-		// against any trailing-dot FQDN ("evil.com.") and the empty host --
-		// a redirect-allowlist bypass. Dropping it fails closed: a policy
-		// left with no hosts and no suffixes refuses every redirect.
+		// A label-less suffix would dot-anchor to a bare ".", which matches
+		// every trailing-dot FQDN ("evil.com."): an allowlist bypass.
 		if len(s) <= 1 {
 			continue
 		}
@@ -1130,27 +1269,19 @@ func normalizeSuffixes(suffixes []string) []string {
 	return out
 }
 
-// lowercaseAll returns an ASCII-lowercased copy of in (RFC 3986 host comparison).
-func lowercaseAll(in []string) []string {
-	out := make([]string, len(in))
-	for i, s := range in {
-		out[i] = asciiLower(s)
+func hostKeysOf(hosts []string) []hostKey {
+	out := make([]hostKey, 0, len(hosts))
+	for _, h := range hosts {
+		if k, ok := hostKeyOf(h); ok {
+			out = append(out, k)
+		}
 	}
 	return out
 }
 
-// redirectAllowed reports whether host matches an exact allowed host or an
-// allowed (dot-anchored, lowercased) suffix.
-func redirectAllowed(host string, allowedHosts, normalizedSuffixes []string) bool {
-	if slices.Contains(allowedHosts, host) {
-		return true
-	}
-	for _, s := range normalizedSuffixes {
-		if hostMatchesSuffix(host, s) {
-			return true
-		}
-	}
-	return false
+func redirectAllowed(host hostKey, allowedHosts []hostKey, normalizedSuffixes []string) bool {
+	return slices.Contains(allowedHosts, host) ||
+		slices.ContainsFunc(normalizedSuffixes, host.matchesSuffix)
 }
 
 // defaultRedirectPolicy is the compiled same-host policy DefaultRedirectPolicy
@@ -1184,24 +1315,23 @@ func DefaultRedirectPolicy(req *http.Request, via []*http.Request) error {
 // Client.CheckRedirect or pass RedirectOption values to RedirectPolicyFunc for
 // other allowlists.
 func DockerGitHubRedirectPolicy(req *http.Request, via []*http.Request) error {
-	if len(via) >= redirectCap {
-		return errors.New("too many redirects")
+	if len(via) > redirectCap {
+		return refuseHop(req.URL, RedirectTooMany)
 	}
-	host := asciiLower(req.URL.Hostname())
-	switch {
-	case host == "hub.docker.com",
-		strings.HasSuffix(host, ".docker.com"),
-		host == "github.com",
-		strings.HasSuffix(host, ".github.com"),
-		strings.HasSuffix(host, ".githubusercontent.com"):
-		// Allowed host; still subject to the scheme-downgrade guard below.
-	default:
-		return fmt.Errorf("refusing redirect to %s", host)
+	if to, ok := originKeyOf(req.URL); !ok || !isDockerGitHubHost(to.host) {
+		return refuseHop(req.URL, RedirectOtherOrigin)
 	}
 	if len(via) > 0 && via[0].URL != nil && isSchemeDowngrade(via[0].URL.Scheme, req.URL.Scheme) {
-		return fmt.Errorf("refusing scheme downgrade to %s", host)
+		return refuseHop(req.URL, RedirectDowngrade)
 	}
 	return nil
+}
+
+func isDockerGitHubHost(k hostKey) bool {
+	return k.name == "github.com" ||
+		strings.HasSuffix(k.name, ".docker.com") ||
+		strings.HasSuffix(k.name, ".github.com") ||
+		strings.HasSuffix(k.name, ".githubusercontent.com")
 }
 
 // RefuseAllRedirects is a CheckRedirect policy that follows no redirect: the
