@@ -31,7 +31,7 @@ Every shipped policy refuses an `https` to `http` downgrade, even to an allowed 
 | `WithAllowSchemeDowngrade(bool)` | false | Allows an `https` to `http` hop |
 | `WithPreserveMethod(bool)` | false | Refuses a hop that would change the request method |
 
-With no allowed host, no suffix, no `WithSameHost(true)` and no `WithSameOrigin(true)`, the policy refuses every redirect. Host names compare without regard to ASCII case. A later option overrides an earlier one, so appending `WithSameHost(false)` turns the permission back off.
+With no allowed host, no suffix, no `WithSameHost(true)` and no `WithSameOrigin(true)`, the policy refuses every redirect. Host names compare without regard to ASCII case. An IP address compares by value, so `[2001:db8::a]` and `[2001:db8:0::a]` are one host, and its IPv6 zone compares exactly, so `[fe80::1%25eth0]` and `[fe80::1%25ETH0]` are two hosts. A suffix matches a host name only, never an IP address. A later option overrides an earlier one, so appending `WithSameHost(false)` turns the permission back off.
 
 ### Same origin
 
