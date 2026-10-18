@@ -211,11 +211,11 @@ func TestRedirect_case_insensitive_host_matching(t *testing.T) {
 // TestDockerGitHubRedirectPolicy_substring_and_bare_domain_refused pins the
 // dot-anchoring of the allowlist suffixes: a host that only CONTAINS an allowed
 // domain as a substring, a bare allowed domain, or an allowed domain used as a
-// left label must all be refused. DockerGitHubRedirectPolicy inlines its own
-// strings.HasSuffix checks (it shares no code with the fuzzed RedirectPolicyFunc),
-// so without these a regression dropping a leading dot (".docker.com" ->
-// "docker.com") would let maliciousdocker.com through and no other
-// DockerGitHubRedirectPolicy case would fail.
+// left label must all be refused. DockerGitHubRedirectPolicy matches its
+// domains with its own strings.HasSuffix checks, not the fuzzed suffix
+// matcher, so without these a regression dropping a leading dot
+// (".docker.com" -> "docker.com") would let maliciousdocker.com through and
+// no other DockerGitHubRedirectPolicy case would fail.
 func TestDockerGitHubRedirectPolicy_substring_and_bare_domain_refused(t *testing.T) {
 	for _, host := range []string{
 		"maliciousdocker.com",
@@ -231,14 +231,11 @@ func TestDockerGitHubRedirectPolicy_substring_and_bare_domain_refused(t *testing
 	}
 }
 
-// TestRedirectPolicyFunc_empty_suffix_fails_closed pins the fail-closed guard
-// in normalizeSuffixes: an empty, bare-dot, or whitespace-only allowed suffix
-// is DROPPED rather than dot-anchored to a bare ".", so a policy configured
-// with only such a suffix (and no hosts) refuses every redirect -- including a
-// trailing-dot FQDN, which a surviving "." suffix would otherwise match via
-// hostMatchesSuffix's strings.HasSuffix(host, ".") branch (the documented
-// redirect-allowlist bypass). FuzzRedirectPolicyFunc skips empty suffixes, so
-// this branch is otherwise unexercised.
+// TestRedirectPolicyFunc_empty_suffix_fails_closed pins that an empty,
+// dot-only or whitespace-only allowed suffix is dropped and matches no
+// target, a trailing-dot reg-name included, so a policy configured with only
+// such a suffix (and no hosts) refuses every redirect. FuzzRedirectPolicyFunc
+// skips empty suffixes, so nothing else exercises this.
 func TestRedirectPolicyFunc_empty_suffix_fails_closed(t *testing.T) {
 	for _, suffix := range []string{"", ".", "   "} {
 		policy := httpx.RedirectPolicyFunc(httpx.WithAllowedSuffixes(suffix))
@@ -817,7 +814,7 @@ func refusal(t *testing.T, err error, reason httpx.RedirectReason, origin string
 
 // TestSameOriginRefusesOtherPort pins the exact-origin rule (RFC 6454): under
 // WithSameOrigin(true) a hop is followed only to the original scheme, host
-// (ASCII-folded) and effective port, and WithSameHost(true) follows the
+// and effective port, and WithSameHost(true) follows the
 // first two hops this refuses, which is why a key-bearing client needs it.
 func TestSameOriginRefusesOtherPort(t *testing.T) {
 	refusedHops := []struct {
@@ -949,7 +946,8 @@ func TestRedirectRefusalsTyped(t *testing.T) {
 
 // TestRedirectRefusalsHandBuilt pins the policy on requests net/http never
 // builds: a nil or host-less URL refuses with an empty Origin instead of
-// panicking, and a scheme written in upper case still reads as its origin.
+// panicking, two empty hosts are never one host, and a scheme written in
+// upper case still reads as its origin.
 func TestRedirectRefusalsHandBuilt(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -970,6 +968,40 @@ func TestRedirectRefusalsHandBuilt(t *testing.T) {
 			policy: httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true)),
 			req:    &http.Request{URL: &url.URL{Path: "/b"}},
 			via:    []*http.Request{{}},
+			reason: httpx.RedirectOtherOrigin,
+		},
+		{
+			name:   "nil target URL under WithSameHost",
+			policy: httpx.RedirectPolicyFunc(httpx.WithSameHost(true)),
+			req:    &http.Request{},
+			via:    viaWithOrigin(t, "https://arr.example/a"),
+			reason: httpx.RedirectOtherOrigin,
+		},
+		{
+			name:   "empty allowlist entry never matches a host-less target",
+			policy: httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("")),
+			req:    &http.Request{URL: &url.URL{Path: "/b"}},
+			via:    viaWithOrigin(t, "https://arr.example/a"),
+			reason: httpx.RedirectOtherOrigin,
+		},
+		{
+			name:   "nil target URL under DockerGitHubRedirectPolicy",
+			policy: httpx.DockerGitHubRedirectPolicy,
+			req:    &http.Request{},
+			reason: httpx.RedirectOtherOrigin,
+		},
+		{
+			name:   "host-less target and host-less original URL under WithSameOrigin",
+			policy: httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true)),
+			req:    &http.Request{URL: &url.URL{Path: "/b"}},
+			via:    []*http.Request{{URL: &url.URL{Path: "/a"}}},
+			reason: httpx.RedirectOtherOrigin,
+		},
+		{
+			name:   "host-less target and host-less original URL under WithSameHost",
+			policy: httpx.RedirectPolicyFunc(httpx.WithSameHost(true)),
+			req:    &http.Request{URL: &url.URL{Path: "/b"}},
+			via:    []*http.Request{{URL: &url.URL{Path: "/a"}}},
 			reason: httpx.RedirectOtherOrigin,
 		},
 		{
@@ -1088,6 +1120,194 @@ func TestSameOriginComposition(t *testing.T) {
 			}
 			refusal(t, err, tt.reason, tt.origin)
 		})
+	}
+}
+
+// TestRedirectHostIdentity pins how every shipped policy decides that two
+// hosts are one. A reg-name folds ASCII case (RFC 3986 section 6.2.2.1).
+// An IP literal is its address: spelling is canonical, and the IPv6 zone,
+// whose format is implementation-defined (RFC 4007 section 11.2), compares
+// exactly after url.Parse decodes its %25 form once. A domain allowlist never
+// matches an IP literal, whose zone is free text.
+func TestRedirectHostIdentity(t *testing.T) {
+	sameOrigin := httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true))
+	sameHost := httpx.RedirectPolicyFunc(httpx.WithSameHost(true))
+	tests := []struct {
+		name         string
+		policy       httpx.CheckRedirect
+		orig, target string
+		reason       httpx.RedirectReason // zero: followed
+		origin       string
+	}{
+		{
+			name: "WithSameOrigin zone differing only in case", policy: sameOrigin,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1%25ETH0]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[fe80::1%25ETH0]",
+		},
+		{
+			name: "WithSameOrigin same zone in the same case", policy: sameOrigin,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1%25eth0]:443/b",
+		},
+		{
+			name: "WithSameOrigin zone dropped", policy: sameOrigin,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[fe80::1]",
+		},
+		{
+			name: "WithSameOrigin percent-encoded zone letter decodes to the same zone", policy: sameOrigin,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1%25%65th0]/b",
+		},
+		{
+			name: "WithSameOrigin percent-encoded zone letter decoding to another case", policy: sameOrigin,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1%25%45th0]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[fe80::1%25Eth0]",
+		},
+		{
+			name: "WithSameOrigin zone is decoded once, not twice", policy: sameOrigin,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1%25eth%2530]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[fe80::1%25eth%2530]",
+		},
+		{
+			name: "WithSameOrigin reg-name differing only in case", policy: sameOrigin,
+			orig: "https://arr.example/a", target: "HTTPS://ARR.Example/b",
+		},
+		{
+			name: "WithSameOrigin IPv6 spelled another way", policy: sameOrigin,
+			orig: "https://[2001:db8::a]/a", target: "https://[2001:DB8:0:0::A]:443/b",
+		},
+		{
+			name: "WithSameOrigin other IPv6 address", policy: sameOrigin,
+			orig: "https://[2001:db8::a]/a", target: "https://[2001:db8::b]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[2001:db8::b]",
+		},
+		{
+			name: "WithSameOrigin same IPv4 address", policy: sameOrigin,
+			orig: "http://192.0.2.1:8080/a", target: "http://192.0.2.1:8080/b",
+		},
+		{
+			name: "WithSameOrigin other IPv4 address", policy: sameOrigin,
+			orig: "http://192.0.2.1:8080/a", target: "http://192.0.2.2:8080/b",
+			reason: httpx.RedirectOtherOrigin, origin: "http://192.0.2.2:8080",
+		},
+		{
+			name: "WithSameOrigin IPv4-mapped IPv6 is not the IPv4 address", policy: sameOrigin,
+			orig: "http://192.0.2.1/a", target: "http://[::ffff:192.0.2.1]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "http://[::ffff:192.0.2.1]",
+		},
+		{
+			name: "WithSameOrigin IPv4 with leading zeros is a name, not the address", policy: sameOrigin,
+			orig: "http://192.0.2.1/a", target: "http://192.000.002.001/b",
+			reason: httpx.RedirectOtherOrigin, origin: "http://192.000.002.001",
+		},
+		{
+			name: "WithSameOrigin IP literal against a name", policy: sameOrigin,
+			orig: "https://127.0.0.1/a", target: "https://localhost/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://localhost",
+		},
+		{
+			name: "WithSameHost zone differing only in case", policy: sameHost,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1%25ETH0]:8443/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[fe80::1%25ETH0]:8443",
+		},
+		{
+			name: "WithSameHost same zone on another port", policy: sameHost,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1%25eth0]:8443/b",
+		},
+		{
+			name: "WithSameHost IPv6 spelled another way", policy: sameHost,
+			orig: "https://[2001:db8::a]/a", target: "https://[2001:db8:0::A]:8443/b",
+		},
+		{
+			name: "DefaultRedirectPolicy zone differing only in case", policy: httpx.DefaultRedirectPolicy,
+			orig: "https://[fe80::1%25eth0]/a", target: "https://[fe80::1%25Eth0]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[fe80::1%25Eth0]",
+		},
+		{
+			name:   "WithAllowedHosts zone differing only in case",
+			policy: httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("fe80::1%eth0")),
+			orig:   "https://api.example/a", target: "https://[fe80::1%25ETH0]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[fe80::1%25ETH0]",
+		},
+		{
+			name:   "WithAllowedHosts same zone",
+			policy: httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("fe80::1%eth0")),
+			orig:   "https://api.example/a", target: "https://[fe80::1%25eth0]/b",
+		},
+		{
+			name:   "WithAllowedHosts IPv6 spelled another way",
+			policy: httpx.RedirectPolicyFunc(httpx.WithAllowedHosts("2001:db8::a")),
+			orig:   "https://api.example/a", target: "https://[2001:db8:0::a]/b",
+		},
+		{
+			name:   "WithAllowedSuffixes does not match an IP literal's zone",
+			policy: httpx.RedirectPolicyFunc(httpx.WithAllowedSuffixes(".example.com")),
+			orig:   "https://api.example.com/a", target: "https://[::1%25x.example.com]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[::1%25x.example.com]",
+		},
+		{
+			name:   "WithAllowedSuffixes does not match an IPv4 literal",
+			policy: httpx.RedirectPolicyFunc(httpx.WithAllowedSuffixes(".2.1")),
+			orig:   "https://api.example/a", target: "https://192.0.2.1/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://192.0.2.1",
+		},
+		{
+			name: "WithSameOrigin port with leading zeros is the same port", policy: sameOrigin,
+			orig: "https://arr.example/a", target: "https://arr.example:0443/b",
+		},
+		{
+			name: "WithSameHost port out of range has no origin", policy: sameHost,
+			orig: "https://arr.example/a", target: "https://arr.example:70000/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://arr.example:70000",
+		},
+		{
+			name: "DockerGitHubRedirectPolicy does not match an IP literal's zone", policy: httpx.DockerGitHubRedirectPolicy,
+			orig: "https://hub.docker.com/a", target: "https://[::1%25.docker.com]/b",
+			reason: httpx.RedirectOtherOrigin, origin: "https://[::1%25.docker.com]",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.policy(reqTo(t, tt.target), viaWithOrigin(t, tt.orig))
+			if tt.reason == 0 {
+				if err != nil {
+					t.Errorf("%s -> %s = %v, want followed", tt.orig, tt.target, err)
+				}
+				return
+			}
+			refusal(t, err, tt.reason, tt.origin)
+		})
+	}
+}
+
+// TestRedirectHostIdentityEndToEnd pins the zone rule through net/http: a
+// 307 to the original IPv6 address under a zone differing only in case is
+// refused before a second request is sent.
+func TestRedirectHostIdentityEndToEnd(t *testing.T) {
+	var sent atomic.Int32
+	client := &http.Client{
+		CheckRedirect: httpx.RedirectPolicyFunc(httpx.WithSameOrigin(true)),
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			sent.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusTemporaryRedirect,
+				Header:     http.Header{"Location": {"https://[fe80::1%25ETH0]" + r.URL.Path}},
+				Body:       http.NoBody,
+				Request:    r,
+			}, nil
+		}),
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://[fe80::1%25eth0]/hook", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("a zone-changing 307 was followed, want it refused")
+	}
+	refusal(t, err, httpx.RedirectOtherOrigin, "https://[fe80::1%25ETH0]")
+	if got := sent.Load(); got != 1 {
+		t.Errorf("requests sent = %d, want 1 (the hop to another zone is never sent)", got)
 	}
 }
 

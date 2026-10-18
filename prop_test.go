@@ -4,7 +4,9 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -227,53 +229,62 @@ func FuzzRedirectPolicyFunc(f *testing.F) {
 	f.Add("docker.com", "docker.com", "")
 	f.Add("evil.com", ".example.org", "good.com")
 
+	f.Add("[fe80::1%25ETH0]", ".example.com", "fe80::1%eth0")
+	f.Add("[2001:db8:0::A]", ".example.com", "2001:db8::a")
+	f.Add("[::1%25x.example.com]", ".example.com", "")
+	f.Add("192.0.2.1", ".2.1", "")
+
 	f.Fuzz(func(t *testing.T, host, suffix, allowedHost string) {
 		if host == "" || suffix == "" {
 			return
 		}
-		// Skip hosts that would produce invalid URLs.
 		u, err := url.Parse("http://" + host + "/path")
-		if err != nil || u.Hostname() == "" {
+		if err != nil || u.Hostname() == "" || !dialablePort(u.Port()) {
 			return
 		}
-		host = u.Hostname() // use normalized hostname
+		host = u.Hostname()
 
 		var opts []RedirectOption
 		if allowedHost != "" {
 			opts = append(opts, WithAllowedHosts(allowedHost))
 		}
 		opts = append(opts, WithAllowedSuffixes(suffix))
-		policy := RedirectPolicyFunc(opts...)
+		err = RedirectPolicyFunc(opts...)(&http.Request{URL: u}, []*http.Request{{URL: &url.URL{Host: "origin.com"}}})
 
-		req := &http.Request{URL: u}
-		via := []*http.Request{{URL: &url.URL{Host: "origin.com"}}}
-		err = policy(req, via)
-
-		if err == nil {
-			// Policy accepted — verify the invariant using the SAME
-			// normalization the policy applies: ASCII case-insensitivity
-			// (RFC 3986 §6.2.2.1) AND normalizeSuffixes' TrimSpace config
-			// hygiene (a suffix like "docker.com " is the caller's typo for
-			// "docker.com", so the policy trims before dot-anchoring; the
-			// oracle must trim identically or it declares a false bypass —
-			// fuzz findings 8530bd888043e0d0 / 9dba641065fc8e1a).
-			lhost := asciiLower(host)
-			if lhost == asciiLower(allowedHost) {
-				return // exact allowed-host match
-			}
-			// Must match the normalized (trimmed, dot-anchored,
-			// ASCII-lowercased) suffix.
-			norm := strings.TrimSpace(suffix)
-			if !strings.HasPrefix(norm, ".") {
-				norm = "." + norm
-			}
-			norm = asciiLower(norm)
-			matched := len(norm) > 1 && hostMatchesSuffix(lhost, norm)
-			if !matched {
-				t.Fatalf("policy accepted host %q but it doesn't match suffix %q or allowedHost %q", host, suffix, allowedHost)
-			}
+		// The suffix is trimmed, dot-anchored and ASCII-lowercased, and
+		// matches a name only, never an IP literal.
+		norm := strings.TrimSpace(suffix)
+		if !strings.HasPrefix(norm, ".") {
+			norm = "." + norm
+		}
+		norm = asciiLower(norm)
+		_, ipErr := netip.ParseAddr(host)
+		lhost := asciiLower(host)
+		suffixMatch := ipErr != nil && len(norm) > 1 && (lhost == norm[1:] || strings.HasSuffix(lhost, norm))
+		if want := specSameHost(host, allowedHost) || suffixMatch; want != (err == nil) {
+			t.Fatalf("host %q, suffix %q, allowedHost %q: err = %v, want followed=%v", host, suffix, allowedHost, err, want)
 		}
 	})
+}
+
+// specSameHost is the host identity this package promises: a name by ASCII
+// folding, an IP literal by address with its zone exact, never an IP literal
+// equal to a name.
+func specSameHost(a, b string) bool {
+	aAddr, aErr := netip.ParseAddr(a)
+	bAddr, bErr := netip.ParseAddr(b)
+	if aErr == nil || bErr == nil {
+		return aErr == nil && bErr == nil && aAddr == bAddr
+	}
+	return a != "" && asciiLower(a) == asciiLower(b)
+}
+
+func dialablePort(port string) bool {
+	if port == "" {
+		return true
+	}
+	_, err := strconv.ParseUint(port, 10, 16)
+	return err == nil
 }
 
 // TestIsRetryableStatus_cross_classifier_invariants_property is the net over
@@ -377,33 +388,35 @@ func FuzzRedactURL(f *testing.F) {
 }
 
 // FuzzSameHostRedirect exercises the WithSameHost + WithAllowSchemeDowngrade
-// invariants (white-box, so it can reuse the policy's own asciiLower /
-// isSchemeDowngrade oracle): with WithSameHost and downgrades refused (the
-// default), a redirect is accepted iff its target host equals the origin host
-// AND it is not an https->http downgrade; with downgrades allowed, only the
-// same-host check gates acceptance. FuzzRedirectPolicyFunc seeds an empty origin
+// invariants against specSameHost: with downgrades refused (the default), a
+// redirect is accepted iff its target host equals the origin host AND it is
+// not an https->http downgrade; with downgrades allowed, only the same-host
+// check gates acceptance. FuzzRedirectPolicyFunc seeds an empty origin
 // scheme, so it never drives the scheme-downgrade branch this covers.
 func FuzzSameHostRedirect(f *testing.F) {
-	f.Add("https", "arr.example", "https", "arr.example")   // same origin
-	f.Add("http", "arr.example", "https", "arr.example")    // upgrade
-	f.Add("https", "arr.example", "http", "arr.example")    // downgrade
-	f.Add("https", "arr.example", "https", "other.example") // cross-host
-	f.Add("https", "ARR.example", "https", "arr.example")   // case-fold
+	f.Add("https", "arr.example", "https", "arr.example")            // same origin
+	f.Add("http", "arr.example", "https", "arr.example")             // upgrade
+	f.Add("https", "arr.example", "http", "arr.example")             // downgrade
+	f.Add("https", "arr.example", "https", "other.example")          // cross-host
+	f.Add("https", "ARR.example", "https", "arr.example")            // case-fold
+	f.Add("https", "[fe80::1%25eth0]", "https", "[fe80::1%25ETH0]")  // zone case
+	f.Add("https", "[2001:db8::a]", "https", "[2001:DB8:0::A]:8443") // IPv6 spelling
+	f.Add("http", "192.0.2.1", "http", "[::ffff:192.0.2.1]")         // IPv4-mapped
 
 	f.Fuzz(func(t *testing.T, origScheme, origHost, tgtScheme, tgtHost string) {
 		if (origScheme != "http" && origScheme != "https") || (tgtScheme != "http" && tgtScheme != "https") {
 			return
 		}
 		orig, err := url.Parse(origScheme + "://" + origHost + "/a")
-		if err != nil || orig.Hostname() == "" {
+		if err != nil || orig.Hostname() == "" || !dialablePort(orig.Port()) {
 			return
 		}
 		tgt, err := url.Parse(tgtScheme + "://" + tgtHost + "/b")
-		if err != nil || tgt.Hostname() == "" {
+		if err != nil || tgt.Hostname() == "" || !dialablePort(tgt.Port()) {
 			return
 		}
 		via := []*http.Request{{URL: orig}}
-		sameHost := asciiLower(tgt.Hostname()) == asciiLower(orig.Hostname())
+		sameHost := specSameHost(tgt.Hostname(), orig.Hostname())
 		downgrade := isSchemeDowngrade(orig.Scheme, tgt.Scheme)
 
 		// Default: downgrades refused.
@@ -420,17 +433,28 @@ func FuzzSameHostRedirect(f *testing.F) {
 	})
 }
 
-// TestSameOriginRedirect_property draws origin and target from random schemes,
-// hosts in random ASCII case and ports (absent, both defaults, another), and
-// checks WithSameOrigin(true) against the model built from those parts: a hop
-// is followed iff scheme, host and effective port are equal, and a refusal is
-// RedirectOtherOrigin naming the target's origin as drawn. Adding
-// WithSameHost(true) never changes the verdict, and WithSameHost(true) alone
-// follows every hop WithSameOrigin(true) follows.
+// TestSameOriginRedirect_property checks WithSameOrigin(true) against a model
+// over random schemes, ports and host spellings in random ASCII case: a hop
+// is followed iff scheme, host and effective port are equal, where a host is
+// its address for an IP literal, zone case kept, and its folded
+// name otherwise, and a refusal is RedirectOtherOrigin naming the target's
+// origin as drawn. Adding WithSameHost(true) never changes the verdict, and
+// WithSameHost(true) alone follows iff the hosts are equal and no https->http.
 func TestSameOriginRedirect_property(t *testing.T) {
 	t.Parallel()
 	schemes := []string{"http", "https"}
-	hosts := []string{"arr.example", "other.example", "127.0.0.1", "[::1]"}
+	type host struct {
+		id        string
+		spellings []string
+	}
+	hosts := []host{
+		{"arr.example", []string{"arr.example"}},
+		{"other.example", []string{"other.example"}},
+		{"127.0.0.1", []string{"127.0.0.1"}},
+		{"::1", []string{"[::1]", "[0:0::1]"}},
+		{"2001:db8::a", []string{"[2001:db8::a]", "[2001:db8:0:0::a]"}},
+		{"fe80::1%", []string{"[fe80::1%25eth0]", "[fe80:0::1%25eth0]"}},
+	}
 	ports := []string{"", "80", "443", "8989"}
 	effective := func(scheme, port string) string {
 		switch {
@@ -443,19 +467,22 @@ func TestSameOriginRedirect_property(t *testing.T) {
 	}
 	rapid.Check(t, func(t *rapid.T) {
 		type end struct{ scheme, host, written, port string }
-		draw := func(label string) end {
+		draw := func(label string, h host) end {
 			e := end{
 				scheme: rapid.SampledFrom(schemes).Draw(t, label+"Scheme"),
-				host:   rapid.SampledFrom(hosts).Draw(t, label+"Host"),
+				host:   h.id,
 				port:   rapid.SampledFrom(ports).Draw(t, label+"Port"),
 			}
-			b := []byte(e.host)
+			b := []byte(rapid.SampledFrom(h.spellings).Draw(t, label+"Spelling"))
 			for i, c := range b {
 				if 'a' <= c && c <= 'z' && rapid.Bool().Draw(t, label+"Upper") {
 					b[i] = c - ('a' - 'A')
 				}
 			}
 			e.written = string(b)
+			if _, zone, zoned := strings.Cut(e.written, "%25"); zoned {
+				e.host += strings.TrimSuffix(zone, "]")
+			}
 			return e
 		}
 		parse := func(e end, path string) *url.URL {
@@ -469,7 +496,12 @@ func TestSameOriginRedirect_property(t *testing.T) {
 			}
 			return u
 		}
-		o, g := draw("orig"), draw("target")
+		origHost := rapid.SampledFrom(hosts).Draw(t, "origHost")
+		targetHost := origHost
+		if !rapid.Bool().Draw(t, "targetOnOrigHost") {
+			targetHost = rapid.SampledFrom(hosts).Draw(t, "targetHost")
+		}
+		o, g := draw("orig", origHost), draw("target", targetHost)
 		via := []*http.Request{{URL: parse(o, "/a")}}
 		target := &http.Request{URL: parse(g, "/b?k=v")}
 		want := o.scheme == g.scheme && o.host == g.host && effective(o.scheme, o.port) == effective(g.scheme, g.port)
@@ -492,12 +524,80 @@ func TestSameOriginRedirect_property(t *testing.T) {
 		if (withHost == nil) != (err == nil) {
 			t.Fatalf("adding WithSameHost(true) changed the verdict: %v, then %v", err, withHost)
 		}
-		if want {
-			if hostOnly := RedirectPolicyFunc(WithSameHost(true))(target, via); hostOnly != nil {
-				t.Fatalf("WithSameHost(true) refused a same-origin hop %s -> %s: %v", via[0].URL, target.URL, hostOnly)
+		wantHost := o.host == g.host && (o.scheme != "https" || g.scheme != "http")
+		if hostOnly := RedirectPolicyFunc(WithSameHost(true))(target, via); wantHost != (hostOnly == nil) {
+			t.Fatalf("WithSameHost(true) %s -> %s = %v, want followed=%v", via[0].URL, target.URL, hostOnly, wantHost)
+		}
+	})
+}
+
+// FuzzSameOriginRedirect_host_identity checks host identity on any parsed
+// URL: under WithSameOrigin(true) it is same-origin with itself, with its IP
+// literal spelled canonically and with its name in other ASCII case, and
+// never with its IPv6 zone in other case, which WithSameHost(true) refuses
+// too.
+func FuzzSameOriginRedirect_host_identity(f *testing.F) {
+	f.Add("https://[fe80::1%25eth0]/a")
+	f.Add("http://[2001:DB8:0::A]:8080/a")
+	f.Add("https://Arr.Example/a")
+	f.Add("http://192.0.2.1/a")
+	f.Add("https://[::ffff:192.0.2.1%25Lo]:443/a")
+	f.Add("https://[fe80::1%25%45th0]/a")
+
+	f.Fuzz(func(t *testing.T, raw string) {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || !dialablePort(u.Port()) {
+			return
+		}
+		via := []*http.Request{{URL: u}}
+		withHost := func(hostname string) *url.URL {
+			v := *u
+			v.Host = hostname
+			if strings.Contains(hostname, ":") {
+				v.Host = "[" + hostname + "]"
+			}
+			if port := u.Port(); port != "" {
+				v.Host += ":" + port
+			}
+			return &v
+		}
+		sameOrigin := RedirectPolicyFunc(WithSameOrigin(true))
+		follows := func(v *url.URL) {
+			if err := sameOrigin(&http.Request{URL: v}, via); err != nil {
+				t.Fatalf("%s -> %s = %v, want followed", u, v, err)
+			}
+		}
+		follows(u)
+		addr, err := netip.ParseAddr(u.Hostname())
+		if err != nil {
+			follows(withHost(flipASCIICase(u.Hostname())))
+			return
+		}
+		follows(withHost(addr.String()))
+		zone := addr.Zone()
+		if flipped := flipASCIICase(zone); flipped != zone {
+			v := withHost(addr.WithZone(flipped).String())
+			for name, policy := range map[string]CheckRedirect{
+				"WithSameOrigin": sameOrigin,
+				"WithSameHost":   RedirectPolicyFunc(WithSameHost(true)),
+			} {
+				var refused *RedirectRefusedError
+				if err := policy(&http.Request{URL: v}, via); !errors.As(err, &refused) || refused.Reason != RedirectOtherOrigin {
+					t.Fatalf("%s %s -> %s = %v, want RedirectOtherOrigin", name, u, v, err)
+				}
 			}
 		}
 	})
+}
+
+func flipASCIICase(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' {
+			b[i] = c ^ ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // FuzzCaptureValidator fuzzes DoConditional's validator sanitizer against
