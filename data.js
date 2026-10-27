@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
   "lastUpdate": 1793139724148,
-  "repoUrl": "https://github.com/cplieger/ci",
+  "repoUrl": "https://github.com/cplieger/httpx",
   "entries": {
     "Benchmark": [
       {
@@ -3495,10 +3495,10 @@ window.BENCHMARK_DATA = {
             "username": "web-flow",
             "email": "noreply@github.com"
           },
-          "id": "a4adc2450f849e94a70171386398350c33f7b66f",
-          "message": "chore(deps): update cplieger/ci digest to a00f6a5 (#890)\n\nCo-authored-by: tribble-trouble[bot] <338123824+tribble-trouble[bot]@users.noreply.github.com>",
-          "timestamp": "2026-10-27T02:08:25Z",
-          "url": "https://github.com/cplieger/ci/commit/a4adc2450f849e94a70171386398350c33f7b66f"
+          "id": "16f5774d7e3ccef5761b51dfe521f0fa99bea4af",
+          "message": "chore(sync): synced file(s) with cplieger/ci (#620)\n\nCo-authored-by: tribble-trouble[bot] <338123824+tribble-trouble[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-27T02:52:07Z",
+          "url": "https://github.com/cplieger/httpx/commit/16f5774d7e3ccef5761b51dfe521f0fa99bea4af"
         },
         "date": 1793139723870,
         "tool": "customSmallerIsBetter",
