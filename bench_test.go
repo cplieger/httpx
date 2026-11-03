@@ -312,7 +312,7 @@ type capabilityError struct {
 	transient bool
 }
 
-func (e *capabilityError) Error() string     { return "capability error" }
+func (*capabilityError) Error() string       { return "capability error" }
 func (e *capabilityError) IsTransient() bool { return e.transient }
 
 // transientErrors are the classes IsTransient reports as retryable, one per
@@ -377,9 +377,9 @@ var nonTransientErrors = map[string]error{
 // file's fixtures do not depend on another file's helpers.
 type benchNetError struct{ timeout bool }
 
-func (e *benchNetError) Error() string   { return "bench net error" }
-func (e *benchNetError) Timeout() bool   { return e.timeout }
-func (e *benchNetError) Temporary() bool { return false }
+func (*benchNetError) Error() string   { return "bench net error" }
+func (e *benchNetError) Timeout() bool { return e.timeout }
+func (*benchNetError) Temporary() bool { return false }
 
 // TestIsTransientAllocations pins the classifier at zero allocations for every
 // error class it distinguishes, in both verdicts.

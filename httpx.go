@@ -151,7 +151,7 @@ func (e *PermanentError) Error() string { return e.Err.Error() }
 func (e *PermanentError) Unwrap() error { return e.Err }
 
 // Is allows errors.Is matching against other PermanentErrors.
-func (e *PermanentError) Is(target error) bool {
+func (*PermanentError) Is(target error) bool {
 	_, ok := target.(*PermanentError)
 	return ok
 }
@@ -186,7 +186,7 @@ func (e *transientError) Error() string { return e.Err.Error() }
 func (e *transientError) Unwrap() error { return e.Err }
 
 // IsTransient implements Transient: the caller marked this error retryable.
-func (e *transientError) IsTransient() bool { return true }
+func (*transientError) IsTransient() bool { return true }
 
 // MarkTransient wraps err so [IsTransient] reports true, overriding a
 // non-transient verdict already on it, for a failure your operation knows
@@ -218,7 +218,7 @@ func (e *attemptTimeoutError) Unwrap() error { return e.Err }
 
 // IsTransient implements Transient: a bound that governed a single attempt
 // expired, which is a retryable failure by construction.
-func (e *attemptTimeoutError) IsTransient() bool { return true }
+func (*attemptTimeoutError) IsTransient() bool { return true }
 
 // AttemptTimeout wraps err to declare that the timeout it reports bounded ONE
 // ATTEMPT rather than the caller's total budget, making it retryable:

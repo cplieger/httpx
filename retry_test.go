@@ -1077,8 +1077,8 @@ func TestGetBytes_cancel_during_backoff_aborts_before_next_attempt(t *testing.T)
 // exercising Do's RetryAfterHint honoring.
 type retryAfterHintErr struct{ d time.Duration }
 
-func (e *retryAfterHintErr) Error() string                 { return "rate limited" }
-func (e *retryAfterHintErr) IsTransient() bool             { return true }
+func (*retryAfterHintErr) Error() string                   { return "rate limited" }
+func (*retryAfterHintErr) IsTransient() bool               { return true }
 func (e *retryAfterHintErr) RetryAfterHint() time.Duration { return e.d }
 
 // TestDo_honorsRetryAfterHint proves a transient error that implements

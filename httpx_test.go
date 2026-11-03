@@ -123,9 +123,9 @@ func TestIsTransient(t *testing.T) {
 
 type fakeNetError struct{ timeout bool }
 
-func (e *fakeNetError) Error() string   { return "fake net error" }
-func (e *fakeNetError) Timeout() bool   { return e.timeout }
-func (e *fakeNetError) Temporary() bool { return false }
+func (*fakeNetError) Error() string   { return "fake net error" }
+func (e *fakeNetError) Timeout() bool { return e.timeout }
+func (*fakeNetError) Temporary() bool { return false }
 
 func TestDoRateLimitOnly(t *testing.T) {
 	t.Parallel()
