@@ -35,11 +35,11 @@ func TestRetryRoundTripper_MaxElapsedTime(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from MaxElapsedTime")
 	}
-	if !strings.Contains(err.Error(), "max elapsed time") {
-		t.Errorf("error = %v, want containing 'max elapsed time'", err)
+	if !strings.Contains(err.Error(), "max elapsed time 80ms exceeded") {
+		t.Errorf("error = %v, want it to name the 80ms ceiling", err)
 	}
-	// The always-503 server drives the lastErr==nil branch of sleepBeforeRetry,
-	// which must return a clean message (no fmt.Errorf("...: %w", nil) artifact).
+	// The always-503 server leaves RoundTrip's elapsed stop with no error to
+	// wrap, which must read cleanly (no fmt.Errorf("...: %w", nil) artifact).
 	if strings.Contains(err.Error(), "<nil>") || strings.Contains(err.Error(), "%!w") {
 		t.Errorf("clean nil-lastErr error expected, got %v", err)
 	}
@@ -71,6 +71,40 @@ func TestRetryRoundTripper_MaxElapsedTime_wraps_transport_error(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("transport calls = %d, want 1", got)
+	}
+}
+
+// TestRetryRoundTripper_MaxElapsedTime_stop_releases_discarded_response pins
+// that the elapsed stop still hands the discarded 503 to OnRetry and closes
+// its body, so the connection is not leaked.
+func TestRetryRoundTripper_MaxElapsedTime_stop_releases_discarded_response(t *testing.T) {
+	t.Parallel()
+	var closed, onRetry atomic.Int32
+	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     http.Header{"Retry-After": {"60"}},
+			Body:       &trackingCloser{Reader: strings.NewReader("busy"), onClose: func() { closed.Add(1) }},
+		}, nil
+	})
+	rt := httpx.NewRetryRoundTripper(transport, httpx.TransportConfig{
+		MaxElapsedTime: time.Second,
+		OnRetry:        func(int, *http.Request, *http.Response, error) { onRetry.Add(1) },
+	})
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com/elapsed-drain", http.NoBody)
+	resp, err := rt.RoundTrip(req)
+	if resp != nil {
+		resp.Body.Close()
+		t.Fatalf("RoundTrip resp = %d, want nil on the elapsed stop", resp.StatusCode)
+	}
+	if err == nil || !strings.Contains(err.Error(), "max elapsed time") {
+		t.Errorf("RoundTrip err = %v, want the max-elapsed-time stop", err)
+	}
+	if got := closed.Load(); got != 1 {
+		t.Errorf("discarded body closes = %d, want 1", got)
+	}
+	if got := onRetry.Load(); got != 1 {
+		t.Errorf("OnRetry calls = %d, want 1", got)
 	}
 }
 

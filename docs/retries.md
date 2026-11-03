@@ -4,7 +4,7 @@ This page is for a developer choosing between the three ways httpx retries a cal
 
 ## Three ways to retry
 
-Each has a different owner for the request, the body and the response. They share one backoff progression.
+Each has a different owner for the request, the body and the response. All three run one retry loop, with the same attempt budget, backoff and `Retry-After` handling, and differ only in how they judge an attempt.
 
 | Call | You give it | It returns | Use it when |
 | --- | --- | --- | --- |
@@ -49,26 +49,36 @@ Each has a different owner for the request, the body and the response. They shar
 | `OnRetry` | Called before each retry, with a 1-based attempt number. The transport logs nothing, so this is where to observe it |
 | `PrepareRetry` | Changes the cloned request before each retry, for example to set a fresh token |
 | `MaxElapsedTime` | Ceiling on total time across retries, honored `Retry-After` waits included. Checked between attempts. Zero means none |
-| `RetryNonIdempotent` | Also retries POST, PUT, PATCH and DELETE, replaying the body through `req.GetBody` |
+| `RetryNonIdempotent` | Also retries every other method, POST, PUT, PATCH and DELETE among them |
 
-The transport never changes your request. It clones it for each attempt. By default it retries only GET, HEAD, OPTIONS and TRACE. With `RetryNonIdempotent`, a request with a body is retried only when it has a `GetBody` function.
+The transport never changes your request. It clones it for each attempt. By default it retries only GET, HEAD, OPTIONS and TRACE, the safe methods of RFC 9110 section 9.2.1. Whatever the method, a request with a body is retried only when it has a `GetBody` function to replay the body.
 
 Each `RoundTrip` keeps its own backoff, so one `RetryRoundTripper` is safe to share between goroutines.
 
 ## What each one retries
 
-| Failure | `Do` | `GetBytes` | Transport |
+One status rule, `IsRetryableStatus`, decides for all three: 408, 429 and every status from 500 to 599 are worth another attempt, except the six whose answer repeats. Every other status is a settled answer.
+
+- 501 and 505 say the server does not support the method or the HTTP version (RFC 9110 sections 15.6.2 and 15.6.6).
+- 506 and 508 report a server configuration error and a loop (RFC 2295, RFC 5842).
+- 510 and 511 wait on the client to add an extension or sign in to the network (RFC 2774, RFC 6585).
+
+A 5xx code no RFC registers is retried like a 500, as RFC 9110 section 15 asks. A status of 600 or more is not a valid status, so it is not retried, though `ErrServerError` and `IsServerError` still count it as a server error.
+
+| Failure | `Do` over `CheckHTTPStatus` | `GetBytes` | Transport |
 | --- | --- | --- | --- |
 | Transient network error | yes | yes | yes |
-| 408 | sees no status | yes | no |
+| 408 | yes | yes | yes |
 | 429 | only with a rate-limit option | yes | yes |
-| 500, 501 and 505 to 599 | sees no status | yes | no |
-| 502, 503, 504 | sees no status | yes | yes |
-| Other 4xx | sees no status | no | no |
+| 500 to 599, except 501, 505, 506, 508, 510, 511 | yes | yes | yes |
+| 501, 505, 506, 508, 510, 511, and 600 or more | no | no | no |
+| Other 4xx | no | no | no |
 
-`Do` sees only the error your function returns, and `IsTransient` decides whether it is worth another attempt. When your function returns the error from `CheckHTTPStatus`, `Do` retries a 502, 503 or 504 and nothing else, because only those `*HTTPStatusError` values report themselves transient. A transient error is a network timeout, a connection reset, refused or broken pipe, an unexpected end of body, a DNS failure, or an error whose `IsTransient()` method says so. `IsTransient` never accepts a `*PermanentError`, an `*AuthError`, a `*RateLimitError` or an expired or canceled caller context.
+`Do` sees only the error your function returns, and `IsTransient` decides whether it is worth another attempt. When your function returns the error from `CheckHTTPStatus`, a `*HTTPStatusError` reports itself transient exactly when `IsRetryableStatus` accepts its code, and a 429 arrives as a `*RateLimitError` instead. A transient error is a network timeout, a connection reset, refused or broken pipe, a server that closed the connection before it answered, an unexpected end of body, a DNS failure, or an error whose `IsTransient()` method says so. `IsTransient` never accepts a `*PermanentError`, an `*AuthError`, a `*RateLimitError` or an expired or canceled caller context.
 
-Pass `IsRetryableStatus` through `TransportConfig.CheckRetry` to give the transport the same status set as `GetBytes`. `IsRetryableStatus(code)` is true for 408, 429 and any 5xx, and `GetBytes` calls it itself, so the two cannot drift apart.
+The transport's default policy retries an error `IsTransient` accepts and a status `IsRetryableStatus` accepts. `GetBytes` judges each attempt the same way. Set `TransportConfig.CheckRetry` to retry a different set.
+
+`Do` never sees the request, so whether repeating it is safe is your decision. Around a POST or another non-idempotent request, `Do` repeats what `IsTransient` accepts, and a server that failed after reading the request may already have applied it (RFC 9110 section 9.2.2). Return `Permanent(err)` for a failure you must not repeat, or send the request through the transport, which checks the method.
 
 ## Waits and Retry-After
 

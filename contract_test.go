@@ -574,7 +574,7 @@ func TestCapabilityInterfacesSatisfyError(t *testing.T) {
 // ordinary implementor needs nothing beyond the Error method it already had.
 type fixedHint struct{ d time.Duration }
 
-func (e *fixedHint) Error() string                 { return "hinted" }
+func (*fixedHint) Error() string                   { return "hinted" }
 func (e *fixedHint) RetryAfterHint() time.Duration { return e.d }
 
 var _ httpx.RetryAfterHint = (*fixedHint)(nil)

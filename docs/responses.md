@@ -1,6 +1,6 @@
 # Status codes, errors and bodies
 
-This page is for a developer handling what comes back from a call. It covers how httpx turns a status into an error, which error types to match, how bodies are capped and drained, and how a conditional GET works.
+This page is for a developer handling what comes back from a call. It covers how httpx turns a status into an error, which error types to match, how to name a failure below HTTP, how bodies are capped and drained, and how a conditional GET works.
 
 ## Status checking
 
@@ -12,7 +12,7 @@ This page is for a developer handling what comes back from a call. It covers how
 | 3xx | `*HTTPStatusError{Code}`, not transient, neither a client nor a server error |
 | 401, 403 | `*AuthError`, whose message carries `(401)` or `(403)` |
 | 429 | `*RateLimitError` with the raw, uncapped `Retry-After` value |
-| other 4xx and 5xx | `*HTTPStatusError{Code}`, transient for 502, 503 and 504 |
+| other 4xx and 5xx | `*HTTPStatusError{Code}`, transient when `IsRetryableStatus` accepts the code |
 | 1xx | `*HTTPStatusError{Code}`, not a completed response |
 
 A 3xx reaches your code only when the client does not follow redirects. That happens under `RefuseAllRedirects`, or any `CheckRedirect` returning `http.ErrUseLastResponse`, and net/http then returns the 3xx response itself with a nil error. A followed redirect never surfaces a 3xx, so a client on `DefaultRedirectPolicy` or an allowlist sees no difference.
@@ -25,11 +25,27 @@ A 3xx is an ordinary `*HTTPStatusError`, so the rest of the package handles it u
 
 - `*AuthError` for 401 and 403. Tell them apart by the `(401)` or `(403)` in its message.
 - `*RateLimitError` for 429. Its `RetryAfter` field is the raw header value, so bound it before sleeping on it. The rate-limit options of `Do` do.
-- `*HTTPStatusError` for every other non-2xx status, with the code in `Code`. It implements `Transient`, true for 502, 503 and 504.
+- `*HTTPStatusError` for every other non-2xx status, with the code in `Code`. It implements `Transient`, true when `IsRetryableStatus(Code)` is: 408 and 500 to 599, except 501, 505, 506, 508, 510 and 511. [Retries](retries.md) gives the reason for each.
 - `*StatusError` is what `GetBytes` returns for a status it does not retry. For a retried status it sits inside the exhaustion error. Its `Error()` text shows the redacted URL. The raw URL stays in the `URL` field for your code to use, so do not log or serialize that field.
 - `*ResponseTooLargeError` means a body went over its cap. It carries `Limit`, and no body is returned with it.
 - `*PermanentError` wraps an error that must not be retried. It works with `errors.Is`, `errors.As` and `Unwrap`.
-- `ErrRateLimited` and `ErrServerError` are sentinel errors.
+- `ErrRateLimited` and `ErrServerError` are sentinel errors. `ErrServerError` matches a `*StatusError` of 500 or more, the same band as `IsServerError`.
+
+## Why a request failed below HTTP
+
+`CauseOf(err)` names what happened to the connection or the body, for a health line or a log field. Its `String()` and its text encoding are the name in this table, so a JSON log field or stored value carries the name, not a number.
+
+| Cause | Name | What it means |
+| --- | --- | --- |
+| `CauseTooLarge` | `too_large` | A body went over its cap, a `*ResponseTooLargeError` or an `*http.MaxBytesError` |
+| `CauseTLS` | `tls` | The handshake failed: an untrusted or invalid certificate, a fatal alert from the peer, or a plain-HTTP answer to an HTTPS request |
+| `CauseDNS` | `dns` | The host name did not resolve, a `*net.DNSError` anywhere in the chain |
+| `CauseRefused` | `refused` | Nothing accepted the connection |
+| `CauseReset` | `reset` | The peer reset the connection, closed it before answering, or the body ended early |
+| `CauseTimeout` | `timeout` | A deadline or timeout expired, the caller's or one attempt's |
+| `CauseUnknown` | `unknown` | A nil error, a canceled context, a status answer, or anything else |
+
+`CauseOf` tries the causes in the table's order and the first match wins, so a DNS lookup that timed out reads `dns`. A TLS handshake that stalled reads `timeout`, because net/http reports it as a timeout that carries no TLS error. `CauseOf` sees through `Permanent`, `MarkTransient` and `AttemptTimeout`. `IsTransient` accepts the DNS, refused, reset and timeout causes unless the caller's own context ended, and never a TLS failure or an oversized body.
 
 ## Body helpers
 

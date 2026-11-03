@@ -281,3 +281,68 @@ func TestAttemptTimeout(t *testing.T) {
 		t.Error("IsTransient(context.DeadlineExceeded) = true, want false")
 	}
 }
+
+// TestWithAttemptTimeout_marks_only_the_attempts_own_deadline pins the three
+// conditions of the mark through Do's returned error and attempt count: the
+// caller still has budget, the attempt bound expired, and the error reports a
+// deadline. WithRateLimitOnly returns the final attempt's error even under an
+// ended caller context, which makes the first condition observable.
+func TestWithAttemptTimeout_marks_only_the_attempts_own_deadline(t *testing.T) {
+	t.Parallel()
+	t.Run("caller_out_of_budget", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		defer cancel()
+		attempts := 0
+		_, err := httpx.Do(ctx, blockUntilDone(&attempts),
+			httpx.WithAttemptTimeout(time.Hour),
+			httpx.WithRateLimitOnly(time.Millisecond),
+			httpx.WithLogger(discardLogger()))
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Do = %v, want the attempt's context.DeadlineExceeded", err)
+		}
+		if httpx.IsAttemptTimeout(err) {
+			t.Errorf("IsAttemptTimeout(%v) = true: the caller's deadline was marked as an attempt's", err)
+		}
+	})
+	t.Run("deadline_fn_holds_internally", func(t *testing.T) {
+		t.Parallel()
+		attempts := 0
+		_, err := httpx.Do(t.Context(), func(ctx context.Context) (struct{}, error) {
+			attempts++
+			inner, cancel := context.WithTimeout(ctx, time.Millisecond)
+			defer cancel()
+			<-inner.Done()
+			return struct{}{}, inner.Err()
+		},
+			httpx.WithAttemptTimeout(time.Hour),
+			httpx.WithMaxAttempts(3),
+			httpx.WithBaseDelay(time.Millisecond),
+			httpx.WithLogger(discardLogger()))
+		if attempts != 1 {
+			t.Errorf("attempts = %d, want 1 (a deadline fn holds itself stays terminal)", attempts)
+		}
+		if httpx.IsAttemptTimeout(err) {
+			t.Errorf("IsAttemptTimeout(%v) = true, want false", err)
+		}
+	})
+	t.Run("translated_error_is_not_a_deadline", func(t *testing.T) {
+		t.Parallel()
+		attempts := 0
+		_, err := httpx.Do(t.Context(), func(ctx context.Context) (struct{}, error) {
+			attempts++
+			<-ctx.Done()
+			return struct{}{}, errors.New("upstream gave up")
+		},
+			httpx.WithAttemptTimeout(time.Millisecond),
+			httpx.WithMaxAttempts(3),
+			httpx.WithBaseDelay(time.Millisecond),
+			httpx.WithLogger(discardLogger()))
+		if attempts != 1 {
+			t.Errorf("attempts = %d, want 1 (an error that is not a deadline gets no mark)", attempts)
+		}
+		if httpx.IsAttemptTimeout(err) {
+			t.Errorf("IsAttemptTimeout(%v) = true, want false", err)
+		}
+	})
+}
