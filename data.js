@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
   "lastUpdate": 1793744395019,
-  "repoUrl": "https://github.com/cplieger/ci",
+  "repoUrl": "https://github.com/cplieger/httpx",
   "entries": {
     "Benchmark": [
       {
@@ -3727,10 +3727,10 @@ window.BENCHMARK_DATA = {
             "username": "web-flow",
             "email": "noreply@github.com"
           },
-          "id": "9ead40e51a68dd7202d29b68a7ab6cbcb6e5d0cb",
-          "message": "chore(audit): expect AGPL-3.0 for grelot (#915)",
-          "timestamp": "2026-11-03T19:17:26Z",
-          "url": "https://github.com/cplieger/ci/commit/9ead40e51a68dd7202d29b68a7ab6cbcb6e5d0cb"
+          "id": "b48280bd0d6909db09ddd8ab73ec13b484fcee2c",
+          "message": "feat: name why a request failed and use one retry rule everywhere (#634)\n\n## Release note\n\nCauseOf names why a request failed, and one status rule now decides retries for Do over CheckHTTPStatus, GetBytes and the RetryRoundTripper. A 408, 500, 507 or unregistered 5xx answer and a server hang-up before any response byte are now retried, while 501, 505, 506, 508, 510, 511 and codes of 600 or more fail at once.",
+          "timestamp": "2026-11-03T18:23:08Z",
+          "url": "https://github.com/cplieger/httpx/commit/b48280bd0d6909db09ddd8ab73ec13b484fcee2c"
         },
         "date": 1793744394721,
         "tool": "customSmallerIsBetter",
