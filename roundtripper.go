@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -28,9 +29,7 @@ type PrepareRetry func(req *http.Request) error
 // non-idempotent replay.
 type TransportConfig struct {
 	// CheckRetry overrides the retry policy. nil means the default policy:
-	// transient transport errors plus 429/502/503/504 responses (deliberately
-	// narrower than GetBytes, which retries every 5xx; supply a custom policy
-	// to broaden the set when an upstream returns transient 500s).
+	// an error [IsTransient] accepts, or a status [IsRetryableStatus] accepts.
 	CheckRetry CheckRetry
 	// OnRetry is a hook called before each retry attempt, the transport's only
 	// observability seam (it logs nothing itself).
@@ -56,21 +55,19 @@ type TransportConfig struct {
 	// ResponseHeaderTimeout) and the whole call with the request context.
 	// Zero means no ceiling.
 	MaxElapsedTime time.Duration
-	// RetryNonIdempotent enables retry of non-idempotent methods (POST, PUT,
-	// PATCH, DELETE) when the request has a GetBody function for body replay.
+	// RetryNonIdempotent extends retries from the safe methods to every
+	// method (POST, PUT, PATCH, DELETE and the rest).
 	RetryNonIdempotent bool
 }
 
 // RetryRoundTripper implements http.RoundTripper with automatic retry.
 //
-// By default, only idempotent methods (GET, HEAD, OPTIONS, TRACE) are retried.
-// Use TransportConfig.RetryNonIdempotent to also retry POST/PUT/PATCH/DELETE
-// when the request has a GetBody function for body replay.
+// By default only the safe methods (GET, HEAD, OPTIONS, TRACE) are retried;
+// TransportConfig.RetryNonIdempotent extends that to every method. Either way
+// a request whose body has no GetBody to rewind it is sent once.
 //
-// Inspired by hashicorp/go-retryablehttp, but operates directly on stdlib
-// *http.Request without a custom request type, and counts TOTAL attempts
-// (TransportConfig.MaxAttempts) rather than go-retryablehttp's
-// retries-beyond-first.
+// Unlike hashicorp/go-retryablehttp, it takes a plain *http.Request and counts
+// total attempts (TransportConfig.MaxAttempts), not retries.
 type RetryRoundTripper struct {
 	next               http.RoundTripper
 	checkRetry         CheckRetry
@@ -101,72 +98,62 @@ func NewRetryRoundTripper(next http.RoundTripper, cfg TransportConfig) *RetryRou
 	}
 }
 
-// isIdempotent reports whether the HTTP method is safe to retry.
-func isIdempotent(method string) bool {
+// isSafeMethod reports a safe method (RFC 9110 section 9.2.1); an empty
+// method is GET.
+func isSafeMethod(method string) bool {
 	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
 		return true
 	}
 	return false
 }
 
-// canRetry reports whether this request is eligible for retry.
+// canRetry reports whether this request may be sent more than once: its
+// method allows it, and a body it carries can be rewound through GetBody.
 func (rt *RetryRoundTripper) canRetry(req *http.Request) bool {
-	if isIdempotent(req.Method) {
-		return true
-	}
-	if !rt.retryNonIdempotent {
+	if !isSafeMethod(req.Method) && !rt.retryNonIdempotent {
 		return false
 	}
-	if req.Body == nil || req.Body == http.NoBody {
-		return true
-	}
-	return req.GetBody != nil
+	return req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
 }
 
-// defaultCheckRetry is the built-in retry policy for RetryRoundTripper.
-// It retries transient transport errors and the following HTTP status codes:
-// 429 (Too Many Requests), 502 (Bad Gateway), 503 (Service Unavailable),
-// 504 (Gateway Timeout).
-//
-// This is deliberately narrower than GetBytes, which retries every 5xx
-// (including 500), and narrower than hashicorp/go-retryablehttp (all 5xx
-// except 501). A 500 Internal Server Error is NOT retried by default; supply
-// TransportConfig.CheckRetry to broaden the set when an upstream returns
-// transient 500s.
 func defaultCheckRetry(_ context.Context, resp *http.Response, err error) (bool, error) {
+	return retryableRoundTrip(resp, err), nil
+}
+
+// retryableRoundTrip is the default verdict on one round trip, GetBytes's and
+// the transport's: a transport error [IsTransient] accepts, or a status
+// [IsRetryableStatus] accepts.
+func retryableRoundTrip(resp *http.Response, err error) bool {
 	if err != nil {
-		return IsTransient(err), nil
+		return IsTransient(err)
 	}
-	if resp != nil {
-		switch resp.StatusCode {
-		case http.StatusTooManyRequests,
-			http.StatusBadGateway,
-			http.StatusServiceUnavailable,
-			http.StatusGatewayTimeout:
-			return true, nil
-		}
-	}
-	return false, nil
+	return resp != nil && IsRetryableStatus(resp.StatusCode)
 }
 
-// getMaxAttempts returns the total attempt count: zero means unset and takes
-// DefaultMaxAttempts; a negative value means exactly one attempt.
-func (rt *RetryRoundTripper) getMaxAttempts() int {
-	if rt.maxAttempts == 0 {
-		return DefaultMaxAttempts
+// retryAfterOf returns resp's Retry-After, capped at RetryAfterCap by
+// ParseRetryAfter so a hostile header cannot force an unbounded wait, or zero.
+func retryAfterOf(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 0
 	}
-	if rt.maxAttempts < 1 {
-		return 1
-	}
-	return rt.maxAttempts
+	return ParseRetryAfter(resp.Header.Get("Retry-After"))
 }
 
-func (rt *RetryRoundTripper) getBaseDelay() time.Duration {
-	if rt.baseDelay > 0 {
-		return rt.baseDelay
+// schedule returns the transport's budget: a zero MaxAttempts takes
+// DefaultMaxAttempts and a negative one means one attempt.
+func (rt *RetryRoundTripper) schedule() schedule {
+	s := schedule{attempts: rt.maxAttempts, baseDelay: rt.baseDelay, maxElapsed: rt.maxElapsedTime}
+	switch {
+	case s.attempts == 0:
+		s.attempts = DefaultMaxAttempts
+	case s.attempts < 0:
+		s.attempts = 1
 	}
-	return DefaultBaseDelay
+	if s.baseDelay <= 0 {
+		s.baseDelay = DefaultBaseDelay
+	}
+	return s
 }
 
 func (rt *RetryRoundTripper) transport() http.RoundTripper {
@@ -183,51 +170,63 @@ func (rt *RetryRoundTripper) getCheckRetry() CheckRetry {
 	return defaultCheckRetry
 }
 
-// RoundTrip implements http.RoundTripper. It retries eligible requests on
-// transient failures with jittered exponential backoff, honoring Retry-After.
-// Per the http.RoundTripper contract, the caller's request is never mutated.
+// RoundTrip implements http.RoundTripper: it retries an eligible request on a
+// failure its policy accepts, honoring Retry-After on every retried status
+// (RFC 9110 defines it for 503 and 3xx, RFC 6585 for 429), and never mutates req.
 //
-// When retries are exhausted the final response is returned, not an error:
-// if the last attempt produced a retryable response (e.g. a 503), RoundTrip
-// returns that *http.Response with a nil error, exactly as a non-retried
-// request would. The caller owns the returned body (must Close it) and MUST
-// inspect resp.StatusCode - a nil error does not imply a 2xx response.
+// When retries run out the last response comes back with a nil error, even a
+// retryable 503: the caller must close its body and check resp.StatusCode.
 func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !rt.canRetry(req) {
-		return rt.transport().RoundTrip(req)
+		return rt.roundTripOnce(req)
 	}
-
 	ctx := req.Context()
 	check := rt.getCheckRetry()
-	maxAttempts := rt.getMaxAttempts()
-
-	backoff := rt.getBaseDelay()
-	start := time.Now()
-
 	var resp *http.Response
 	var err error
-
-	for attempt := range maxAttempts {
-		if attempt > 0 {
-			if abortErr := rt.sleepBeforeRetry(ctx, attempt, req, resp, err, backoff, start); abortErr != nil {
-				return nil, abortErr
-			}
-			backoff = SafeDouble(backoff)
-		}
-
-		tryReq, buildErr := rt.buildAttemptRequest(ctx, req, attempt)
+	_, stopErr := rt.schedule().run(ctx, func(n int) (bool, time.Duration) {
+		tryReq, buildErr := rt.buildAttemptRequest(ctx, req, n)
 		if buildErr != nil {
-			return nil, buildErr
+			resp, err = nil, buildErr
+			return true, 0
 		}
-
-		resp, err = rt.transport().RoundTrip(tryReq)
-
-		if done, finalResp, finalErr := rt.evaluateAttempt(ctx, check, resp, err); done {
-			return finalResp, finalErr
+		resp, err = rt.roundTripOnce(tryReq) //nolint:bodyclose // the body goes back to the caller, or drainResp closes it in pause or on a stop
+		retry, checkErr := check(ctx, resp, err)
+		switch {
+		case checkErr != nil:
+			drainResp(resp)
+			resp, err = nil, checkErr
+			return true, 0
+		case !retry:
+			return true, 0
+		case ctx.Err() != nil:
+			drainResp(resp)
+			resp, err = nil, ctx.Err()
+			return true, 0
 		}
+		return false, retryAfterOf(resp)
+	}, func(retry int, _ time.Duration) {
+		if rt.onRetry != nil {
+			rt.onRetry(retry, req, resp, err)
+		}
+		drainResp(resp)
+	})
+	switch {
+	case errors.Is(stopErr, errElapsed) && err != nil:
+		return nil, fmt.Errorf("max elapsed time %s exceeded: %w", rt.maxElapsedTime, err)
+	case errors.Is(stopErr, errElapsed):
+		return nil, fmt.Errorf("max elapsed time %s exceeded", rt.maxElapsedTime)
+	case stopErr != nil:
+		return nil, stopErr
 	}
-
 	return resp, err
+}
+
+// roundTripOnce sends one attempt through the base transport, naming its bare
+// io.EOF hang-up so CheckRetry, OnRetry and the caller all see a reset.
+func (rt *RetryRoundTripper) roundTripOnce(req *http.Request) (*http.Response, error) {
+	resp, err := rt.transport().RoundTrip(req)
+	return resp, nameHangUp(err)
 }
 
 // buildAttemptRequest clones req for a single attempt. The caller's request is
@@ -251,77 +250,6 @@ func (rt *RetryRoundTripper) buildAttemptRequest(ctx context.Context, req *http.
 		}
 	}
 	return tryReq, nil
-}
-
-// evaluateAttempt applies the retry policy after an attempt. done==true means
-// RoundTrip stops and returns (finalResp, finalErr); done==false means retry.
-// A retryable response is drained only when stopping early on a policy or
-// context error; the success/no-retry path hands the body back to the caller.
-func (rt *RetryRoundTripper) evaluateAttempt(ctx context.Context, check CheckRetry, resp *http.Response, err error) (done bool, finalResp *http.Response, finalErr error) {
-	shouldRetry, checkErr := check(ctx, resp, err)
-	if checkErr != nil {
-		drainResp(resp)
-		return true, nil, checkErr
-	}
-	if !shouldRetry {
-		return true, resp, err
-	}
-	if ctx.Err() != nil {
-		drainResp(resp)
-		return true, nil, ctx.Err()
-	}
-	return false, nil, nil
-}
-
-// sleepBeforeRetry handles the pre-retry logic: hook, compute wait, honor
-// Retry-After, enforce the elapsed-time budget, drain, sleep.
-func (rt *RetryRoundTripper) sleepBeforeRetry(ctx context.Context, attempt int, req *http.Request, resp *http.Response, lastErr error, backoff time.Duration, start time.Time) error {
-	if rt.onRetry != nil {
-		rt.onRetry(attempt, req, resp, lastErr)
-	}
-
-	wait := JitteredBackoff(backoff)
-
-	// Honor Retry-After on any retryable response (429, 502, 503, 504).
-	// ParseRetryAfter caps at RetryAfterCap, so a hostile header cannot force
-	// an unbounded wait. Honored per RFC for 503/429; 502/504 is a pragmatic,
-	// harmless extension.
-	if resp != nil {
-		if ra := ParseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
-			wait = ra
-		}
-	}
-
-	// maxElapsedTime is a hard ceiling. The check (computed AFTER any honored
-	// Retry-After) aborts now rather than overshoot the budget by sleeping.
-	if rt.elapsedBudgetExceeded(wait, start) {
-		drainResp(resp)
-		if lastErr != nil {
-			return fmt.Errorf("max elapsed time %s exceeded: %w", rt.maxElapsedTime, lastErr)
-		}
-		return fmt.Errorf("max elapsed time %s exceeded", rt.maxElapsedTime)
-	}
-
-	drainResp(resp)
-
-	if sleepErr := SleepCtx(ctx, wait); sleepErr != nil {
-		return sleepErr
-	}
-
-	return nil
-}
-
-// elapsedBudgetExceeded reports whether sleeping for wait now would meet or pass
-// the maxElapsedTime ceiling. The comparison tests the remaining budget rather
-// than summing elapsed+wait, so a near-MaxInt64 wait cannot overflow (CWE-190);
-// maxElapsedTime-elapsed is evaluated only when elapsed < maxElapsedTime, so it
-// stays positive. A non-positive maxElapsedTime means "no ceiling".
-func (rt *RetryRoundTripper) elapsedBudgetExceeded(wait time.Duration, start time.Time) bool {
-	if rt.maxElapsedTime <= 0 {
-		return false
-	}
-	elapsed := time.Since(start)
-	return elapsed >= rt.maxElapsedTime || wait >= rt.maxElapsedTime-elapsed
 }
 
 // drainResp drains and closes a response body if present.

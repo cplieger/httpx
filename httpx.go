@@ -15,7 +15,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -78,13 +77,15 @@ type RetryAfterHint interface {
 // ErrRateLimited is a sentinel callers use with errors.Is to detect 429 responses.
 var ErrRateLimited = errors.New("rate limited")
 
-// ErrServerError is a sentinel for upstream 5xx responses.
+// ErrServerError is a sentinel for upstream 5xx responses, and for a status
+// of 600 or more, which RFC 9110 section 15 says to process as a 5xx. Which of
+// them are retried is [IsRetryableStatus]'s rule.
 var ErrServerError = errors.New("server error")
 
 // --- HTTP status errors ---
 
 // HTTPStatusError represents a non-2xx HTTP response not covered by AuthError
-// or RateLimitError. Implements the Transient interface for 502/503/504.
+// or RateLimitError. It implements [Transient] by [IsRetryableStatus].
 type HTTPStatusError struct {
 	Code int
 }
@@ -93,10 +94,8 @@ var _ Transient = (*HTTPStatusError)(nil)
 
 func (e *HTTPStatusError) Error() string { return fmt.Sprintf("HTTP %d", e.Code) }
 
-// IsTransient reports whether the status code is a retryable server failure (502/503/504).
-func (e *HTTPStatusError) IsTransient() bool {
-	return e.Code == 502 || e.Code == 503 || e.Code == 504
-}
+// IsTransient reports [IsRetryableStatus] for the code.
+func (e *HTTPStatusError) IsTransient() bool { return IsRetryableStatus(e.Code) }
 
 // IsServerError reports whether the status code is 5xx.
 func (e *HTTPStatusError) IsServerError() bool { return e.Code >= 500 }
@@ -121,7 +120,7 @@ func (e *StatusError) Is(target error) bool {
 	case ErrRateLimited:
 		return e.Code == http.StatusTooManyRequests
 	case ErrServerError:
-		return e.Code >= 500 && e.Code < 600
+		return e.Code >= 500
 	}
 	return false
 }
@@ -189,42 +188,12 @@ func (e *transientError) Unwrap() error { return e.Err }
 // IsTransient implements Transient: the caller marked this error retryable.
 func (e *transientError) IsTransient() bool { return true }
 
-// MarkTransient wraps err in a value satisfying the [Transient] interface with
-// a true verdict, so the retry doors treat it as a transient failure. Returns
-// nil for nil input. It is the mirror of [Permanent], which forces the opposite
-// verdict; the name is not the bare adjective only because [Transient] is the
-// interface it satisfies.
-//
-// It exists so a caller widening the retryable set for its own operation does
-// not have to declare a one-method wrapper type to do it. That wrapper is
-// pure boilerplate — an Error, an Unwrap and an IsTransient returning true —
-// and hand-rolling it invites the two mistakes this function cannot make:
-// forgetting Unwrap (which hides the cause from every errors.Is and errors.As
-// the caller's own callers run) and marking a nil error.
-//
-// The mark is the OUTERMOST verdict, so it overrides a non-transient verdict
-// already on the error: MarkTransient(&HTTPStatusError{Code: 500}) is
-// retryable even though a plain 500 is not. Use it for a failure your
-// operation knows is self-healing where the shared policy cannot know — a
-// server-side fault delivered inside a 200 envelope, for example, which no
-// status-based classification can see:
-//
-//	if env := serverFault(body); env != nil {
-//		return httpx.MarkTransient(env) // this clears; spend another attempt
-//	}
-//
-// [IsTransient]'s standing rejections still outrank the mark, because they
-// answer questions the caller is not the authority on:
-//
-//   - [Permanent] wins. Permanent(MarkTransient(err)) is not retried.
-//   - An *[AuthError] and a *[RateLimitError] stay terminal. Credentials do not
-//     fix themselves, and a rate limit is retried by naming a wait budget
-//     ([WithRateLimitRetry], [WithRateLimitOnly]), not by claiming transience.
-//   - A caller-context error stays terminal: the budget that authorized the
-//     work is gone, so another attempt has nothing to spend. For a timeout that
-//     bounded ONE attempt and therefore carries a deadline that is not the
-//     caller's, use [AttemptTimeout] — [IsTransient] consults that mark ahead of
-//     the context rejection, which is the whole reason it is a separate mark.
+// MarkTransient wraps err so [IsTransient] reports true, overriding a
+// non-transient verdict already on it, for a failure your operation knows
+// self-heals where the status rule cannot see it (a server fault inside a 200
+// envelope). [Permanent], an *[AuthError], a *[RateLimitError] and a caller
+// context error still win; for a per-attempt deadline use [AttemptTimeout].
+// Returns nil for nil input.
 func MarkTransient(err error) error {
 	if err == nil {
 		return nil
@@ -475,7 +444,7 @@ func ParseRetryAfterResponse(resp *http.Response) time.Duration {
 
 // CheckHTTPStatus returns nil for a 2xx and otherwise a typed error: 401/403
 // → *AuthError, 429 → *RateLimitError, anything else (1xx, 3xx, other 4xx,
-// 5xx) → *HTTPStatusError carrying the code, transient only for 502/503/504.
+// 5xx) → *HTTPStatusError carrying the code, transient by [IsRetryableStatus].
 // A 3xx reaches it only from a client that does not follow redirects (see
 // [RefuseAllRedirects]) and is reported as a failure, not a completed request.
 func CheckHTTPStatus(resp *http.Response) error {
@@ -493,44 +462,26 @@ func CheckHTTPStatus(resp *http.Response) error {
 	return &HTTPStatusError{Code: resp.StatusCode}
 }
 
-// IsRetryableStatus reports whether a response status is one the retry loop
-// treats as a transient failure worth another attempt: 408 Request Timeout,
-// 429 Too Many Requests, and any 5xx (a code >= 500). Everything else — every
-// 2xx, every 3xx, an informational 1xx, and every other 4xx — is a settled
-// answer this package does not repeat.
-//
-// It is the SAME rule the built-in retry uses, not a restatement of it:
-// [GetBytes]'s own attempt function calls this function to classify a
-// response, so a caller's verdict and the door's verdict cannot disagree.
-//
-// It exists for the caller that runs [GetBytes] under WithMaxAttempts(1)
-// inside its own outer retry budget (the sanctioned way to avoid multiplying
-// the two attempt counts). That caller receives the door's *[StatusError] and
-// owns the retry decision — GetBytes deliberately does not mark its exhaustion
-// error [Transient], because whether an exhausted GET is worth another outer
-// attempt is the caller's policy — so it needs to ask the question the door
-// would have asked:
-//
-//	if se, ok := errors.AsType[*httpx.StatusError](err); ok && httpx.IsRetryableStatus(se.Code) {
-//		return httpx.MarkTransient(err) // spend another of MY attempts
-//	}
-//
-// 408 is included because it is the server reporting that IT gave up waiting,
-// which self-heals and is safe to repeat on an idempotent GET. 429 is here
-// because this door retries a rate limit by default; [Do] does not (its
-// *[RateLimitError] is retryable only under [WithRateLimitRetry] or
-// [WithRateLimitOnly]), so pair this predicate with the door whose policy it
-// describes.
-//
-// The [RetryRoundTripper] is the one deliberate divergence: its default policy
-// retries 429/502/503/504 only, a narrower set than this, so a plain 500 that
-// this predicate calls retryable is not retried by the transport. Widen the
-// transport with [TransportConfig].CheckRetry (this predicate is a ready-made
-// one) rather than assuming the two agree.
+// IsRetryableStatus is the one status rule every retry door applies: true for
+// 408, 429 and 500 to 599 less the codes whose answer repeats, false for every
+// other status. A code of 600 or more is a server error ([ErrServerError]) but
+// not a valid status, so it is not retried. [GetBytes] and the
+// [RetryRoundTripper]'s default policy call it on each response, and
+// [HTTPStatusError.IsTransient] reports it, so [Do] over [CheckHTTPStatus]
+// retries the same set less 429, which arrives as a *[RateLimitError].
 func IsRetryableStatus(code int) bool {
-	return code == http.StatusRequestTimeout ||
-		code == http.StatusTooManyRequests ||
-		code >= 500
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	// Each is settled by its definition: RFC 9110 sections 15.6.2 and 15.6.6,
+	// RFC 2295 section 8.1, RFC 5842 section 7.2, RFC 2774 section 7, RFC 6585
+	// section 6. An unregistered 5xx reads as 500 (RFC 9110 section 15).
+	case http.StatusNotImplemented, http.StatusHTTPVersionNotSupported,
+		http.StatusVariantAlsoNegotiates, http.StatusLoopDetected,
+		http.StatusNotExtended, http.StatusNetworkAuthenticationRequired:
+		return false
+	}
+	return code >= 500 && code <= 599
 }
 
 // --- Backoff helpers ---
@@ -599,17 +550,13 @@ func ContextWithDefaultTimeout(ctx context.Context, def time.Duration) (context.
 
 // --- Transient classification ---
 
-// IsTransient returns true for errors likely caused by temporary server or
-// network issues worth retrying. Auth, rate-limit, permanent, and
-// caller-context errors are never transient.
-//
-// "Caller-context error" is decided by the sentinel actually being in the
-// error's unwrap chain, not by [errors.Is] — net/http's timeout errors match
-// [context.DeadlineExceeded] without carrying it, so an [http.Client.Timeout]
-// and a transport ResponseHeaderTimeout are per-ATTEMPT bounds and ARE
-// transient (see isCallerContextError). A caller's own expired deadline stays
-// terminal; [AttemptTimeout] marks a bound whose expiry this package cannot
-// otherwise tell apart from one.
+// IsTransient reports whether err is worth another attempt: a [Transient]
+// that says so, an [AttemptTimeout] mark, or an error whose [CauseOf] is DNS,
+// refused, reset or timeout. A [Permanent] mark, an *[AuthError], a
+// *[RateLimitError] and the caller's own expired or canceled context are never
+// transient. The caller's deadline is the sentinel itself in the chain, so an
+// [http.Client.Timeout] or a ResponseHeaderTimeout, which only match it, are
+// per-attempt bounds and retried (see isCallerContextError).
 func IsTransient(err error) bool {
 	if err == nil {
 		return false
@@ -641,34 +588,13 @@ func IsTransient(err error) bool {
 	if t, ok := errors.AsType[Transient](err); ok {
 		return t.IsTransient()
 	}
-	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+	// The transient causes are failures of this connection or this attempt; a
+	// TLS refusal and an oversized body repeat identically.
+	switch CauseOf(err) {
+	case CauseDNS, CauseRefused, CauseReset, CauseTimeout:
 		return true
 	}
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	// One class, three errnos: the connection cannot carry the request because
-	// the peer is not on the other end of it — nothing accepted it
-	// (ECONNREFUSED), or the peer tore down one we held (ECONNRESET, EPIPE).
-	// Which of the last two surfaces is a timing accident: a peer RST gives
-	// ECONNRESET on the first write and EPIPE on every later one, and Go
-	// ignores SIGPIPE so write(2) hands the errno to the caller instead of
-	// killing the process. Omitting EPIPE made one dropped connection
-	// retryable and the identical one terminal, decided by which side of that
-	// boundary the write fell on.
-	//
-	// Narrower than it reads, for a caller going through an *http.Client:
-	// net/http retries the common case itself (a reused persistent connection
-	// whose write put no bytes on the wire, when the body is empty or replayable
-	// via GetBody), so what reaches here is mostly the residue that transport
-	// refuses — a non-replayable request, a POST without GetBody above all.
-	if errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.ECONNREFUSED) ||
-		errors.Is(err, syscall.EPIPE) {
-		return true
-	}
-	_, isDNS := errors.AsType[*net.DNSError](err)
-	return isDNS
+	return false
 }
 
 // isCallerContextError reports whether err says the CALLER's context expired
@@ -1383,9 +1309,9 @@ func NewClient(timeout time.Duration) *http.Client {
 // not as "redaction succeeded".
 type Secret string
 
-// RedactTransportError unwraps *url.Error and redacts the secret from the
-// error message. Returns nil for nil input, and never nil for a non-nil one
-// (see urlErrorCause for the *url.Error that carries no cause of its own).
+// RedactTransportError reduces err as [LogSafeError] does, prefixes it, and
+// redacts the secret from its message. Returns nil for nil input, and never
+// nil for a non-nil one.
 // The replacement runs through RedactSecretString, whose doc comment carries the
 // ordering and representation rules for composing redaction with a normalizing
 // transform or a byte cap. An empty secret disables redaction: the (possibly
@@ -1395,9 +1321,7 @@ func RedactTransportError(err error, prefix string, secret Secret) error {
 	if err == nil {
 		return nil
 	}
-	if urlErr, ok := errors.AsType[*url.Error](err); ok {
-		err = urlErrorCause(urlErr)
-	}
+	err = reduceURLErrors(err)
 	var wrapped error
 	if prefix == "" {
 		wrapped = err
@@ -1516,23 +1440,38 @@ func redactURL(rawURL string) string {
 	return u.Redacted()
 }
 
-// LogSafeError returns an error whose message is safe to log. A transport
-// *url.Error embeds the full request URL (with any userinfo/query secrets), so
-// it is reduced to its underlying cause. Nil returns nil, and a non-nil error
-// NEVER reduces to nil (see urlErrorCause); *StatusError already renders a
-// redacted URL via Error(), so it (and everything else) passes through
-// unchanged — preserving errors.Is/As chains for callers.
-//
-// httpx applies this reduction to every transport error it logs or wraps; it
-// is exported so a caller wrapping transport errors into its own messages can
-// apply the same one (equivalent to RedactTransportError(err, "", "") — reach
-// for that variant when a known secret must also be scrubbed from the text).
+// LogSafeError returns an error whose message is safe to log: every *url.Error
+// in err's chain, which renders the raw request URL, is replaced by its cause
+// until none is left, and a chain nested more than eight deep reduces to a
+// contentless "request failed". Nil returns nil, a non-nil error never reduces
+// to nil, and any other error passes through unchanged, keeping errors.Is and
+// errors.As. It equals RedactTransportError(err, "", ""), the reduction httpx
+// applies to every transport error it logs or wraps.
 func LogSafeError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if urlErr, ok := errors.AsType[*url.Error](err); ok {
-		return urlErrorCause(urlErr)
+	return reduceURLErrors(err)
+}
+
+// maxURLErrorDepth bounds reduceURLErrors: net/http builds one *url.Error per
+// call, and more come only from a RoundTripper or CheckRedirect that returns
+// its own; a *url.Error whose Err is itself never reaches a fixpoint.
+const maxURLErrorDepth = 8
+
+// reduceURLErrors replaces err by the cause of the first *url.Error in its
+// chain until none is left. A chain still holding one after maxURLErrorDepth
+// reductions reduces to errRequestFailed rather than render a URL.
+func reduceURLErrors(err error) error {
+	for range maxURLErrorDepth {
+		urlErr, ok := errors.AsType[*url.Error](err)
+		if !ok {
+			return err
+		}
+		err = urlErrorCause(urlErr)
+	}
+	if _, ok := errors.AsType[*url.Error](err); ok {
+		return errRequestFailed
 	}
 	return err
 }
@@ -1543,25 +1482,13 @@ func LogSafeError(err error) error {
 // package exists to keep out of logs.
 var errRequestFailed = errors.New("request failed")
 
-// urlErrorCause returns the cause the redaction helpers reduce a *url.Error
-// to. That is urlErr.Err for every error net/http builds — it always populates
-// the field. A *url.Error whose Err is nil, or a typed-nil *url.Error (which
-// errors.As binds just as happily, and whose field access would panic), has no
-// cause to hand back, and both answers a reader might expect are wrong there:
-//
-//   - nil would turn a non-nil failure into "no error". Do logs every attempt
-//     error as "error", LogSafeError(err), so the diagnostic would vanish from
-//     the retry and exhaustion lines at exactly the moment it is needed, and a
-//     consumer that returns the reduced value as its own error (the reduction
-//     is exported for that) would report a failure as a success.
-//   - the original *url.Error would render its raw URL — the CWE-532 leak the
-//     reduction exists to prevent, and no less a leak for the cause being nil.
-//
-// So this path substitutes a fixed, URL-free stand-in: non-nil, log-safe, and
-// as informative as an error carrying no cause can be.
+// urlErrorCause returns the cause a *url.Error reduces to: urlErr.Err through
+// nameHangUp. A nil *url.Error or a nil Err reduces to errRequestFailed,
+// because nil would report the failure as a success and the *url.Error itself
+// renders the raw URL (CWE-532).
 func urlErrorCause(urlErr *url.Error) error {
 	if urlErr == nil || urlErr.Err == nil {
 		return errRequestFailed
 	}
-	return urlErr.Err
+	return nameHangUp(urlErr.Err)
 }

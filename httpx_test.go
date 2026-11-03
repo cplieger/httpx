@@ -93,7 +93,8 @@ func TestIsTransient(t *testing.T) {
 		{"http 502", &HTTPStatusError{Code: 502}, true},
 		{"http 503", &HTTPStatusError{Code: 503}, true},
 		{"http 504", &HTTPStatusError{Code: 504}, true},
-		{"http 500", &HTTPStatusError{Code: 500}, false},
+		{"http 500", &HTTPStatusError{Code: 500}, true},
+		{"http 408", &HTTPStatusError{Code: 408}, true},
 		{"http 400", &HTTPStatusError{Code: 400}, false},
 		{"net timeout", &fakeNetError{timeout: true}, true},
 		{"net non-timeout", &fakeNetError{timeout: false}, false},
@@ -583,18 +584,17 @@ func TestMarkTransient(t *testing.T) {
 
 	t.Run("overrides a non-transient verdict on the wrapped error", func(t *testing.T) {
 		t.Parallel()
-		// A plain 500 is not transient under the shared policy (only 502/503/504
-		// are). The mark is the outermost verdict, so the caller's knowledge that
-		// this upstream's 500 self-heals wins.
-		plain500 := &HTTPStatusError{Code: 500}
-		if IsTransient(plain500) {
-			t.Fatal("setup: IsTransient(HTTP 500) = true, want false")
+		// The mark is the outermost verdict, so the caller's knowledge that
+		// this upstream's 409 self-heals wins over the status rule.
+		plain409 := &HTTPStatusError{Code: 409}
+		if IsTransient(plain409) {
+			t.Fatal("setup: IsTransient(HTTP 409) = true, want false")
 		}
-		if !IsTransient(MarkTransient(plain500)) {
-			t.Error("IsTransient(MarkTransient(HTTP 500)) = false, want true")
+		if !IsTransient(MarkTransient(plain409)) {
+			t.Error("IsTransient(MarkTransient(HTTP 409)) = false, want true")
 		}
 		var hse *HTTPStatusError
-		if !errors.As(MarkTransient(plain500), &hse) || hse.Code != 500 {
+		if !errors.As(MarkTransient(plain409), &hse) || hse.Code != 409 {
 			t.Error("errors.As(*HTTPStatusError) through the mark failed, want the wrapped status error")
 		}
 	})
@@ -627,7 +627,7 @@ func TestMarkTransient(t *testing.T) {
 		_, err := Do(t.Context(), func(_ context.Context) (string, error) {
 			calls++
 			if calls == 1 {
-				return "", MarkTransient(&HTTPStatusError{Code: 500})
+				return "", MarkTransient(&HTTPStatusError{Code: 409})
 			}
 			return "ok", nil
 		}, WithMaxAttempts(3), WithBaseDelay(time.Millisecond), WithLabel("test"))
@@ -669,12 +669,16 @@ func TestHTTPStatusError_classification(t *testing.T) {
 	}{
 		{400, false, false, true},
 		{404, false, false, true},
+		{408, true, false, true},
 		{499, false, false, true},
-		{500, false, true, false},
+		{500, true, true, false},
 		{501, false, true, false},
 		{502, true, true, false},
 		{503, true, true, false},
 		{504, true, true, false},
+		{505, false, true, false},
+		{599, true, true, false},
+		{600, false, true, false},
 	}
 	for _, tt := range tests {
 		e := &HTTPStatusError{Code: tt.code}
@@ -940,6 +944,46 @@ func TestDo_no_retry_log_after_final_attempt(t *testing.T) {
 	// suppresses the second.
 	if got := strings.Count(buf.String(), "failed, retrying"); got != 1 {
 		t.Errorf("retry-log count = %d, want 1\n%s", got, buf.String())
+	}
+}
+
+// TestDo_success_wins_over_context_ended_during_attempt pins that only a
+// failed attempt yields to a canceled context: a success returns its value.
+func TestDo_success_wins_over_context_ended_during_attempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	got, err := Do(ctx, func(context.Context) (string, error) {
+		cancel()
+		return "ok", nil
+	}, WithBaseDelay(time.Microsecond))
+	if err != nil || got != "ok" {
+		t.Errorf("Do(success, context canceled during the attempt) = %q, %v, want \"ok\", nil", got, err)
+	}
+}
+
+// TestDo_permanent_error_on_final_attempt_is_not_exhaustion pins that a
+// non-retryable error on the last attempt returns as itself with no
+// exhaustion line: the budget was not what stopped the loop.
+func TestDo_permanent_error_on_final_attempt_is_not_exhaustion(t *testing.T) {
+	var buf bytes.Buffer
+	permanent := errors.New("permanent")
+	calls := 0
+	_, err := Do(t.Context(),
+		func(_ context.Context) (int, error) {
+			calls++
+			if calls == 1 {
+				return 0, MarkTransient(errors.New("flaky"))
+			}
+			return 0, permanent
+		},
+		WithMaxAttempts(2), WithBaseDelay(time.Microsecond), WithLogger(bufLogger(&buf)))
+	if !errors.Is(err, permanent) {
+		t.Errorf("Do(transient then permanent) err = %v, want %v", err, permanent)
+	}
+	if calls != 2 {
+		t.Errorf("fn calls = %d, want 2", calls)
+	}
+	if strings.Contains(buf.String(), "retries exhausted") {
+		t.Errorf("log = %q, want no exhaustion line", buf.String())
 	}
 }
 

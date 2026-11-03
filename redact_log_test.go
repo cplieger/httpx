@@ -3,6 +3,7 @@ package httpx_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -278,5 +279,70 @@ func TestSchemeDowngradeFoldIsUnicodeIndependent(t *testing.T) {
 	}
 	if u.Scheme != "https" {
 		t.Errorf("url.Parse(%q).Scheme = %q, want %q (net/url lowercases it)", "HTTPS://example.com/x", u.Scheme, "https")
+	}
+}
+
+// nestURLErrors wraps cause in depth *url.Error layers whose URL carries
+// secret as its password, each under a wrapper that re-renders the text below.
+func nestURLErrors(cause error, depth int, secret string) error {
+	err := cause
+	for i := range depth {
+		err = fmt.Errorf("hop %d: %w", i, &url.Error{
+			Op:  "Get",
+			URL: fmt.Sprintf("https://user:%s@hop%d.example/", secret, i),
+			Err: err,
+		})
+	}
+	return err
+}
+
+func TestLogSafeErrorFixpoint(t *testing.T) {
+	t.Parallel()
+	const secret = "test-key-nested"
+	reductions := map[string]func(error) error{
+		"LogSafeError":         httpx.LogSafeError,
+		"RedactTransportError": func(err error) error { return httpx.RedactTransportError(err, "", "") },
+	}
+	for name, reduce := range reductions {
+		t.Run(name+"_five_deep", func(t *testing.T) {
+			t.Parallel()
+			cause := errors.New("connection refused")
+			in := nestURLErrors(cause, 5, secret)
+			if !strings.Contains(in.Error(), secret) {
+				t.Fatal("setup: the input does not carry the secret")
+			}
+			got := reduce(in)
+			if strings.Contains(got.Error(), secret) || strings.Contains(got.Error(), "hop") {
+				t.Errorf("%s(five nested *url.Error) = %q, kept URL text", name, got)
+			}
+			if !errors.Is(got, cause) {
+				t.Errorf("%s(five nested *url.Error) = %v, want the innermost cause", name, got)
+			}
+		})
+		t.Run(name+"_past_the_bound", func(t *testing.T) {
+			t.Parallel()
+			got := reduce(nestURLErrors(errors.New("connection refused"), 9, secret))
+			if got == nil || got.Error() != "request failed" {
+				t.Errorf("%s(nine nested *url.Error) = %v, want the contentless %q", name, got, "request failed")
+			}
+		})
+		t.Run(name+"_self_referencing", func(t *testing.T) {
+			t.Parallel()
+			self := &url.Error{Op: "Get", URL: "https://user:" + secret + "@loop.example/"}
+			self.Err = self
+			done := make(chan error, 1)
+			go func() { done <- reduce(self) }()
+			select {
+			case got := <-done:
+				if _, ok := errors.AsType[*url.Error](got); ok {
+					t.Fatalf("%s(self-referencing *url.Error) returned a *url.Error, whose text recurses forever", name)
+				}
+				if got == nil || got.Error() != "request failed" {
+					t.Errorf("%s(self-referencing *url.Error) = %v, want the contentless %q", name, got, "request failed")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s(self-referencing *url.Error) did not return", name)
+			}
+		})
 	}
 }

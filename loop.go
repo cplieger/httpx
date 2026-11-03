@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// This file holds the two retry LOOP doors (Do and GetBytes) and their shared
-// option vocabulary. The transparent-transport door lives in roundtripper.go
-// with its own struct-based config (TransportConfig); the loop doors use
-// functional options because their dominant call pattern is zero to two
+// This file holds the retry loop every door runs (schedule.run), the two
+// loop doors (Do and GetBytes) and their option vocabulary. The transport
+// door in roundtripper.go takes a struct (TransportConfig); the loop doors
+// take functional options because their dominant call pattern is zero to two
 // options inline at a call expression.
 
 // --- Option vocabulary ---
@@ -278,7 +278,63 @@ func newGetConfig(opts []GetOption) getConfig {
 	return cfg
 }
 
-// --- Shared loop helpers ---
+// --- The retry loop ---
+
+// schedule is the attempt budget and backoff that Do, GetBytes and the
+// RetryRoundTripper all run; the three differ only in how they judge an
+// attempt.
+type schedule struct {
+	attempts   int
+	baseDelay  time.Duration
+	maxElapsed time.Duration // zero means no ceiling
+}
+
+// errElapsed stops a schedule whose next wait would meet or pass maxElapsed.
+var errElapsed = errors.New("max elapsed time exceeded")
+
+// run calls attempt with its 0-based index until attempt reports done or the
+// budget is spent, and reports which through exhausted. Between attempts it
+// resolves the wait (attempt's explicit wait, else the jittered backoff),
+// calls pause with the 1-based retry number and that wait, then sleeps. It
+// stops early with errElapsed, or with the sleep's error once ctx ends.
+// pause runs before either early stop, so a door's pause hook can release the
+// failed attempt's resources however the loop ends.
+func (s schedule) run(ctx context.Context, attempt func(n int) (done bool, wait time.Duration), pause func(retry int, wait time.Duration)) (exhausted bool, err error) {
+	start := time.Now()
+	backoff := s.baseDelay
+	for n := range s.attempts {
+		done, explicit := attempt(n)
+		if done {
+			return false, nil
+		}
+		if n == s.attempts-1 {
+			break
+		}
+		wait := resolveWait(explicit, backoff)
+		pause(n+1, wait)
+		if s.elapsedExceeded(wait, start) {
+			return false, errElapsed
+		}
+		if err := SleepCtx(ctx, wait); err != nil {
+			return false, err
+		}
+		backoff = SafeDouble(backoff)
+	}
+	return true, nil
+}
+
+// elapsedExceeded reports whether sleeping wait now would meet or pass
+// maxElapsed. It compares against the remaining budget rather than summing
+// elapsed and wait, so a near-MaxInt64 wait cannot overflow (CWE-190); a spent
+// budget leaves a remainder of zero or less, which every wait meets.
+func (s schedule) elapsedExceeded(wait time.Duration, start time.Time) bool {
+	return s.maxElapsed > 0 && wait >= s.maxElapsed-time.Since(start)
+}
+
+// schedule returns the loop doors' budget; normalize has clamped both fields.
+func (c *loopConfig) schedule() schedule {
+	return schedule{attempts: c.maxAttempts, baseDelay: c.baseDelay}
+}
 
 // logRetrySuccess emits the debug line when fn recovered after at least one
 // retry (attempt is 0-indexed, so attempt > 0 means a prior failure recovered).
@@ -288,22 +344,19 @@ func (c *loopConfig) logRetrySuccess(attempt int) {
 	}
 }
 
-// retryAfterHintWait extracts a positive Retry-After hint carried by err via
-// the RetryAfterHint interface (already capped by the implementer, see the
-// interface doc); zero means no hint.
+// retryAfterHintWait returns the Retry-After hint err carries through
+// RetryAfterHint (capped by the implementer, see the interface doc), or zero;
+// resolveWait ignores a non-positive one.
 func retryAfterHintWait(err error) time.Duration {
 	if h, ok := errors.AsType[RetryAfterHint](err); ok {
-		if d := h.RetryAfterHint(); d > 0 {
-			return d
-		}
+		return h.RetryAfterHint()
 	}
 	return 0
 }
 
 // resolveWait returns the wait before the next retry: a positive explicit
-// wait (a capped Retry-After hint or a rate-limit wait) takes precedence over
-// the jittered exponential backoff. It is the single wait-resolution point
-// for both loop doors.
+// wait (a capped Retry-After or a rate-limit wait) takes precedence over the
+// jittered exponential backoff.
 func resolveWait(explicit, backoff time.Duration) time.Duration {
 	if explicit > 0 {
 		return explicit
@@ -346,10 +399,7 @@ func (c *loopConfig) runAttempt[T any](ctx context.Context, fn func(ctx context.
 // Every ambiguous case therefore resolves to "leave it alone": the mark is
 // applied only when the attempt's own bound is provably the failing one.
 func markAttemptTimeout(ctx, attemptCtx context.Context, err error) error {
-	if err == nil || ctx.Err() != nil || attemptCtx.Err() == nil {
-		return err
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
+	if ctx.Err() != nil || attemptCtx.Err() == nil || !errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
 	return AttemptTimeout(err)
@@ -426,98 +476,84 @@ func Do[T any](ctx context.Context, fn func(ctx context.Context) (T, error), opt
 	if cfg.rlConflict {
 		return zero, errors.New("httpx: WithRateLimitRetry and WithRateLimitOnly are mutually exclusive")
 	}
-	var lastErr error
-	backoff := cfg.baseDelay
-	for attempt := range cfg.maxAttempts {
-		result, err := cfg.runAttempt(ctx, fn)
+	var result T
+	var err error
+	exhausted, stopErr := cfg.schedule().run(ctx, func(n int) (bool, time.Duration) {
+		result, err = cfg.runAttempt(ctx, fn)
 		if err == nil {
-			cfg.logRetrySuccess(attempt)
-			return result, nil
+			cfg.logRetrySuccess(n)
+			return true, 0
 		}
-		lastErr = err
 		if cfg.rlMode != rlOnly && ctx.Err() != nil {
-			return zero, ctx.Err()
+			err = ctx.Err()
+			return true, 0
 		}
-		retryable, explicitWait := cfg.classify(err)
-		if !retryable {
-			return zero, err
-		}
-		if attempt == cfg.maxAttempts-1 {
-			break
-		}
-		wait := resolveWait(explicitWait, backoff)
+		retryable, wait := cfg.classify(err)
+		return !retryable, wait
+	}, func(retry int, wait time.Duration) {
 		cfg.logger.Debug(cfg.label+" failed, retrying",
-			"attempt", attempt+1, "max", cfg.maxAttempts,
+			"attempt", retry, "max", cfg.maxAttempts,
 			"delay", wait.String(), "error", LogSafeError(err))
-		if err := SleepCtx(ctx, wait); err != nil {
-			return zero, err
-		}
-		backoff = SafeDouble(backoff)
-	}
-	if lastErr != nil {
+	})
+	switch {
+	case stopErr != nil:
+		return zero, stopErr
+	case err == nil:
+		return result, nil
+	case exhausted:
 		cfg.logger.Log(ctx, cfg.exhaustedLevel(), cfg.exhaustedMsg(),
-			"attempts", cfg.maxAttempts, "error", LogSafeError(lastErr))
+			"attempts", cfg.maxAttempts, "error", LogSafeError(err))
 	}
-	return zero, lastErr
+	return zero, err
 }
 
 // --- Door 2: GetBytes ---
 
-// GetBytes performs a GET, retrying 429, 5xx and transient transport errors
-// with bounded backoff (honoring Retry-After up to RetryAfterCap), and returns
-// the body read to WithMaxBodyBytes (*ResponseTooLargeError past it). Any
-// other non-2xx is a permanent *StatusError. Every logged url and returned
-// error is redacted. It keeps its own loop rather than wrapping
-// RetryRoundTripper, which has no body cap, redaction or 5xx-wide retry, so
-// merging the two would change this door's behavior.
+// GetBytes performs a GET, retrying every status IsRetryableStatus accepts and
+// transient transport errors with bounded backoff (honoring Retry-After up to
+// RetryAfterCap), and returns the body read to WithMaxBodyBytes
+// (*ResponseTooLargeError past it). Any other non-2xx is a permanent
+// *StatusError. Every logged url and returned error is redacted. Each attempt
+// is judged as the RetryRoundTripper's default policy judges a round trip.
 func GetBytes(ctx context.Context, client *http.Client, reqURL string, opts ...GetOption) ([]byte, error) {
 	cfg := newGetConfig(opts)
 	log := cfg.logger
 
 	start := time.Now()
-	var lastErr error
-	var overrideWait time.Duration
-	backoff := cfg.baseDelay
-	for attempt := range cfg.maxAttempts {
-		if attempt > 0 {
-			if err := SleepCtx(ctx, resolveWait(overrideWait, backoff)); err != nil {
-				return nil, err
-			}
-			backoff = SafeDouble(backoff)
-		}
+	var body []byte
+	var err error
+	var retryAfter time.Duration
+	exhausted, stopErr := cfg.schedule().run(ctx, func(int) (bool, time.Duration) {
 		attemptStart := time.Now()
-		body, retryAfter, err := getAttempt(ctx, client, reqURL, &cfg)
-		if body != nil {
+		var retry bool
+		body, retry, retryAfter, err = getAttempt(ctx, client, reqURL, &cfg)
+		if err == nil {
 			logSlowUpstream(log, reqURL, attemptStart)
-			return body, nil
 		}
-		if err != nil && !isRetryStatus(err) {
-			return nil, LogSafeError(err)
-		}
-		lastErr = err
-		overrideWait = retryAfter
-		if attempt == cfg.maxAttempts-1 {
-			break
-		}
+		return !retry, retryAfter
+	}, func(retry int, _ time.Duration) {
 		log.Debug("http request failed, will retry",
-			"url", redactURL(reqURL), "attempt", attempt+1, "max", cfg.maxAttempts, "error", LogSafeError(err))
+			"url", redactURL(reqURL), "attempt", retry, "max", cfg.maxAttempts, "error", LogSafeError(err))
+	})
+	switch {
+	case stopErr != nil:
+		return nil, stopErr
+	case err == nil:
+		return body, nil
+	case !exhausted:
+		return nil, LogSafeError(err)
 	}
-	elapsed := time.Since(start)
+	elapsed := time.Since(start).Round(time.Millisecond)
 	log.Log(ctx, cfg.exhaustedLevel(), "http retries exhausted",
-		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed.Round(time.Millisecond), "error", LogSafeError(lastErr))
-	exhausted := fmt.Errorf("retries exhausted after %s: %w", elapsed.Round(time.Millisecond), LogSafeError(lastErr))
-	// Carry the last attempt's capped Retry-After out on the returned error.
-	// Without this the hint dies in overrideWait, which only the NEXT iteration
-	// of this loop reads - so a caller running GetBytes with WithMaxAttempts(1)
-	// inside its own outer retry loop (the sanctioned no-3x3-amplification
-	// pattern) silently lost the upstream-requested wait and fell back to
-	// jittered backoff. Do already honors RetryAfterHint on a transient error,
-	// so the two doors now compose: the hint is already capped by
-	// ParseRetryAfter, satisfying the interface's pre-capped contract.
-	if overrideWait > 0 {
-		return nil, &retryAfterError{err: exhausted, hint: overrideWait}
+		"url", redactURL(reqURL), "attempts", cfg.maxAttempts, "elapsed", elapsed, "error", LogSafeError(err))
+	exhaustedErr := fmt.Errorf("retries exhausted after %s: %w", elapsed, LogSafeError(err))
+	// The last attempt's Retry-After rides out on the error, so a caller running
+	// this door as one attempt (WithMaxAttempts(1)) inside its own loop can
+	// still honor it; ParseRetryAfter capped it, as RetryAfterHint requires.
+	if retryAfter > 0 {
+		return nil, &retryAfterError{err: exhaustedErr, hint: retryAfter}
 	}
-	return nil, exhausted
+	return nil, exhaustedErr
 }
 
 // retryAfterError carries a capped Retry-After hint on GetBytes's exhaustion
@@ -545,33 +581,26 @@ func logSlowUpstream(log *slog.Logger, reqURL string, attemptStart time.Time) {
 	}
 }
 
-// getAttempt performs a single HTTP GET attempt. Returns (body, 0, nil) on
-// success, (nil, retryAfter, err) on retryable failure, or (nil, 0, err) on
-// permanent failure.
-func getAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *getConfig) ([]byte, time.Duration, error) {
+// getAttempt performs a single HTTP GET attempt and returns the body on
+// success, or the failure with whether to retry it and the response's capped
+// Retry-After.
+func getAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *getConfig) (body []byte, retry bool, retryAfter time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
 	if err != nil {
-		return nil, 0, fmt.Errorf("create request: %w", err)
+		return nil, false, 0, err
 	}
 	if cfg.setHeaders != nil {
 		cfg.setHeaders(req)
 	}
 	resp, err := client.Do(req) //nolint:bodyclose // resp.Body is closed on every path: DrainClose (429/5xx, non-2xx) or ReadLimitedBody's deferred close (2xx); bodyclose can't trace the close through the helper.
+	retry = retryableRoundTrip(resp, err)
 	if err != nil {
-		if !IsTransient(err) {
-			return nil, 0, err
-		}
-		return nil, 0, &retryableError{err: err}
+		return nil, retry, 0, err
 	}
-	// 408, 429 and 5xx are all retryable and handled identically (each honors a
-	// capped Retry-After); one guard avoids three byte-identical copies. The set
-	// itself lives in IsRetryableStatus, which is exported so a caller running
-	// this door under WithMaxAttempts(1) inside its own retry budget can ask the
-	// same question rather than restating the table.
-	if IsRetryableStatus(resp.StatusCode) {
-		ra := ParseRetryAfter(resp.Header.Get("Retry-After"))
+	if retry {
+		retryAfter = retryAfterOf(resp)
 		DrainClose(resp.Body)
-		return nil, ra, &retryableError{err: &StatusError{Code: resp.StatusCode, URL: reqURL}}
+		return nil, true, retryAfter, &StatusError{Code: resp.StatusCode, URL: reqURL}
 	}
 	// Success is any 2xx. Everything else is a permanent failure for this
 	// door: it returns body bytes, and a redirect stub or an error page is not
@@ -582,30 +611,18 @@ func getAttempt(ctx context.Context, client *http.Client, reqURL string, cfg *ge
 	// consumers type-assert on, where the classifier's errors are URL-less.
 	if CheckHTTPStatus(resp) != nil {
 		DrainClose(resp.Body)
-		return nil, 0, &StatusError{Code: resp.StatusCode, URL: reqURL}
+		return nil, false, 0, &StatusError{Code: resp.StatusCode, URL: reqURL}
 	}
 	// Read the body with overflow detection: an over-limit body fails loud with
 	// *ResponseTooLargeError rather than being silently truncated (a truncated
 	// payload that looks complete is a corruption hazard). ReadLimitedBody owns
 	// the cap+1 probe, its int64-overflow guard, and closing the body.
-	body, err := ReadLimitedBody(resp.Body, cfg.maxBodyBytes)
+	body, err = ReadLimitedBody(resp.Body, cfg.maxBodyBytes)
 	if err != nil {
 		if _, ok := errors.AsType[*ResponseTooLargeError](err); ok {
-			return nil, 0, err
+			return nil, false, 0, err
 		}
-		return nil, 0, fmt.Errorf("read response: %w", err)
+		return nil, false, 0, fmt.Errorf("read response: %w", err)
 	}
-	return body, 0, nil
-}
-
-// retryableError is an internal marker for errors that should be retried.
-type retryableError struct{ err error }
-
-func (e *retryableError) Error() string { return e.err.Error() }
-func (e *retryableError) Unwrap() error { return e.err }
-
-// isRetryStatus reports whether an error from getAttempt is retryable.
-func isRetryStatus(err error) bool {
-	_, ok := errors.AsType[*retryableError](err)
-	return ok
+	return body, false, 0, nil
 }

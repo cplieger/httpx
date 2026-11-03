@@ -325,6 +325,7 @@ var transientErrors = map[string]error{
 	"attempt_timeout":           AttemptTimeout(context.DeadlineExceeded),
 	"attempt_timeout_wrapped":   wrapChain(AttemptTimeout(context.DeadlineExceeded), 8),
 	"capability_says_transient": &capabilityError{transient: true},
+	"http_500":                  &HTTPStatusError{Code: 500},
 	"http_502":                  &HTTPStatusError{Code: 502},
 	"http_503":                  &HTTPStatusError{Code: 503},
 	"marked_transient":          MarkTransient(errors.New("upstream 500 always clears")),
@@ -340,6 +341,8 @@ var transientErrors = map[string]error{
 	"dns_error":                 &net.DNSError{Err: "no such host", Name: "api.example"},
 	"dns_error_wrapped":         fmt.Errorf("dial: %w", &net.DNSError{Err: "no such host"}),
 	"url_error_over_eof":        &url.Error{Op: "Get", URL: "https://api.example/x", Err: io.ErrUnexpectedEOF},
+	"url_error_over_hang_up":    &url.Error{Op: "Get", URL: "https://api.example/x", Err: io.EOF},
+	"server_closed":             errServerClosed,
 }
 
 // nonTransientErrors are the classes IsTransient refuses, one per standing
@@ -361,8 +364,9 @@ var nonTransientErrors = map[string]error{
 	"capability_says_not_transient": &capabilityError{transient: false},
 	"net_non_timeout":               &benchNetError{timeout: false},
 	"net_op_error_timeout_text":     &net.OpError{Op: "read", Net: "tcp", Err: errors.New("i/o timeout")},
-	"http_500":                      &HTTPStatusError{Code: 500},
 	"http_400":                      &HTTPStatusError{Code: 400},
+	"http_501":                      &HTTPStatusError{Code: 501},
+	"bare_eof":                      io.EOF,
 	"unrecognized":                  errors.New("something else went wrong"),
 	"unrecognized_depth_8":          wrapChain(errors.New("something else went wrong"), 8),
 }

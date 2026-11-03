@@ -287,21 +287,11 @@ func dialablePort(port string) bool {
 	return err == nil
 }
 
-// TestIsRetryableStatus_cross_classifier_invariants_property is the net over
-// the THREE status classifications this package exposes, which are written
-// independently and must stay in a fixed relationship. The status_test.go sweep
-// enumerates the whole wire-observable band against the door's real behavior;
-// this pins the relationships that must hold for any status code at all,
-// including the ones no server should send:
-//
-//   - Nothing CheckHTTPStatus calls success is ever retried. A retry that
-//     repeated a delivered 2xx would double a side effect.
-//   - Every status the shared *HTTPStatusError verdict calls transient
-//     (502/503/504) is retryable here too, so the door's set is a SUPERSET of
-//     it: moving a call from the transport's narrower default onto this
-//     predicate can never lose a retry it used to get.
-//   - The only client errors repeated are 408 and 429. Any other 4xx is the
-//     caller's own fault and identical on the next attempt.
+// TestIsRetryableStatus_cross_classifier_invariants_property pins, for any
+// code, that the status classifiers agree: one retry verdict across the status
+// error and the transport default, one server band across HTTPStatusError and
+// StatusError, nothing CheckHTTPStatus calls success retried, and 408 and 429
+// the only retried client errors.
 func TestIsRetryableStatus_cross_classifier_invariants_property(t *testing.T) {
 	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
@@ -310,8 +300,14 @@ func TestIsRetryableStatus_cross_classifier_invariants_property(t *testing.T) {
 		if retryable && CheckHTTPStatus(&http.Response{StatusCode: code, Header: http.Header{}}) == nil {
 			t.Fatalf("IsRetryableStatus(%d) = true but CheckHTTPStatus calls it success: a delivered 2xx must never be repeated", code)
 		}
-		if (&HTTPStatusError{Code: code}).IsTransient() && !retryable {
-			t.Fatalf("HTTPStatusError{%d}.IsTransient() = true but IsRetryableStatus = false: the door's set must be a superset", code)
+		if got := (&HTTPStatusError{Code: code}).IsTransient(); got != retryable {
+			t.Fatalf("HTTPStatusError{%d}.IsTransient() = %v, IsRetryableStatus = %v", code, got, retryable)
+		}
+		if got, _ := defaultCheckRetry(t.Context(), &http.Response{StatusCode: code}, nil); got != retryable {
+			t.Fatalf("defaultCheckRetry(HTTP %d) = %v, IsRetryableStatus = %v", code, got, retryable)
+		}
+		if got, want := errors.Is(&StatusError{Code: code}, ErrServerError), (&HTTPStatusError{Code: code}).IsServerError(); got != want {
+			t.Fatalf("errors.Is(StatusError{%d}, ErrServerError) = %v, HTTPStatusError.IsServerError = %v", code, got, want)
 		}
 		if retryable && code >= 400 && code < 500 &&
 			code != http.StatusRequestTimeout && code != http.StatusTooManyRequests {
