@@ -129,8 +129,8 @@ func TestCheckHTTPStatus_non_2xx_is_error_even_below_200(t *testing.T) {
 
 // TestCheckHTTPStatus_3xx_classification pins the type choice for the v4
 // breaking change: a surfaced redirect is a *HTTPStatusError, so it reads
-// correctly through every existing classifier — not transient (only 502/503/504
-// are), neither a server nor a client error — and passes through LogSafeError
+// correctly through every existing classifier — not transient, neither a
+// server nor a client error — and passes through LogSafeError
 // untouched, since it embeds no URL to redact.
 func TestCheckHTTPStatus_3xx_classification(t *testing.T) {
 	t.Parallel()
@@ -161,10 +161,7 @@ func TestCheckHTTPStatus_3xx_classification(t *testing.T) {
 	}
 }
 
-// TestIsRetryableStatus pins the exported predicate's verdicts: the three
-// self-healing classes the retry loop repeats (408 Request Timeout, 429 Too
-// Many Requests, any 5xx) against the settled answers it does not (2xx, 3xx,
-// and every other 4xx).
+// TestIsRetryableStatus pins IsRetryableStatus's verdict code by code, invalid codes outside 100-599 included.
 func TestIsRetryableStatus(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -178,7 +175,19 @@ func TestIsRetryableStatus(t *testing.T) {
 		{"502 Bad Gateway", http.StatusBadGateway, true},
 		{"503 Service Unavailable", http.StatusServiceUnavailable, true},
 		{"504 Gateway Timeout", http.StatusGatewayTimeout, true},
+		{"507 Insufficient Storage", http.StatusInsufficientStorage, true},
+		{"520 unregistered", 520, true},
 		{"599 top of 5xx", 599, true},
+		{"501 Not Implemented", http.StatusNotImplemented, false},
+		{"505 HTTP Version Not Supported", http.StatusHTTPVersionNotSupported, false},
+		{"506 Variant Also Negotiates", http.StatusVariantAlsoNegotiates, false},
+		{"508 Loop Detected", http.StatusLoopDetected, false},
+		{"510 Not Extended", http.StatusNotExtended, false},
+		{"511 Network Authentication Required", http.StatusNetworkAuthenticationRequired, false},
+		{"600 invalid", 600, false},
+		{"999 invalid", 999, false},
+		{"000 invalid", 0, false},
+		{"099 invalid", 99, false},
 		{"200 OK", http.StatusOK, false},
 		{"204 No Content", http.StatusNoContent, false},
 		{"301 Moved Permanently", http.StatusMovedPermanently, false},
@@ -203,16 +212,15 @@ func TestIsRetryableStatus(t *testing.T) {
 // TestIsRetryableStatus_agrees_with_the_GetBytes_loop is the delegation pin:
 // the exported predicate is the SAME decision the built-in retry makes, so for
 // every status code on the wire the door must retry exactly when the predicate
-// says retryable. It sweeps the whole observable band (100-599) against the
-// door's real behavior — a second attempt is made or it is not — rather than
-// against a second copy of the table, so re-inlining a divergent guard in
-// getAttempt fails here even though the predicate alone would still look right.
-// The >= 500 tail past 599 is shared by construction (one expression, one
-// caller) and is not reachable through a status line net/http will parse.
+// says retryable. It sweeps every three-digit code net/http parses from a
+// status line (000-999) against the door's real behavior — a second attempt is
+// made or it is not — rather than against a second copy of the table, so
+// re-inlining a divergent guard in getAttempt fails here even though the
+// predicate alone would still look right.
 func TestIsRetryableStatus_agrees_with_the_GetBytes_loop(t *testing.T) {
 	t.Parallel()
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for code := 100; code <= 599; code++ {
+	for code := range 1000 {
 		var calls atomic.Int32
 		client := &http.Client{
 			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -273,9 +281,10 @@ func TestStatusError_IsServerError(t *testing.T) {
 		{502, true},
 		{503, true},
 		{599, true},
+		{600, true},
 		{429, false},
 		{400, false},
-		{600, false},
+		{499, false},
 	}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%d", tt.code), func(t *testing.T) {

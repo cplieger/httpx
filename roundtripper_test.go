@@ -584,6 +584,105 @@ func TestRetryRoundTripper_HEAD_retried(t *testing.T) {
 	}
 }
 
+// TestRetryRoundTripper_safe_methods_retried pins the default method set at
+// the safe methods of RFC 9110 section 9.2.1.
+func TestRetryRoundTripper_safe_methods_retried(t *testing.T) {
+	t.Parallel()
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace} {
+		t.Run(method, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			rt := httpx.NewRetryRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{}, Body: http.NoBody}, nil
+			}), httpx.TransportConfig{BaseDelay: time.Nanosecond, MaxAttempts: 2})
+			req, err := http.NewRequestWithContext(t.Context(), method, "http://example.com/safe", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := rt.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip(%s) err = %v", method, err)
+			}
+			resp.Body.Close()
+			if got := calls.Load(); got != 2 {
+				t.Errorf("RoundTrip(%s) calls = %d, want 2", method, got)
+			}
+		})
+	}
+}
+
+// TestRetryRoundTripper_base_breaking_the_RoundTripper_contract pins that a
+// base transport answering a nil response, or a response with a nil Body,
+// gets that answer back without a panic.
+func TestRetryRoundTripper_base_breaking_the_RoundTripper_contract(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		resp      *http.Response
+		wantCalls int32
+	}{
+		{"nil_response", nil, 1},
+		{"nil_body", &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{}}, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			rt := httpx.NewRetryRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return tc.resp, nil
+			}), httpx.TransportConfig{BaseDelay: time.Nanosecond, MaxAttempts: 2})
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com/contract", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := rt.RoundTrip(req)
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			if err != nil || resp != tc.resp {
+				t.Errorf("RoundTrip = %v, %v, want the base's answer and nil", resp, err)
+			}
+			if got := calls.Load(); got != tc.wantCalls {
+				t.Errorf("base calls = %d, want %d", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
+// TestRetryRoundTripper_CheckRetry_error_closes_response pins that a policy
+// error discards the response it judged and closes its body.
+func TestRetryRoundTripper_CheckRetry_error_closes_response(t *testing.T) {
+	t.Parallel()
+	var closed atomic.Int32
+	policyErr := errors.New("policy refused")
+	rt := httpx.NewRetryRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       &trackingCloser{Reader: strings.NewReader("judged"), onClose: func() { closed.Add(1) }},
+		}, nil
+	}), httpx.TransportConfig{CheckRetry: func(context.Context, *http.Response, error) (bool, error) {
+		return false, policyErr
+	}})
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com/policy", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rt.RoundTrip(req)
+	if resp != nil {
+		resp.Body.Close()
+		t.Fatalf("RoundTrip resp = %d, want nil with the policy error", resp.StatusCode)
+	}
+	if !errors.Is(err, policyErr) {
+		t.Errorf("RoundTrip err = %v, want %v", err, policyErr)
+	}
+	if got := closed.Load(); got != 1 {
+		t.Errorf("body closes = %d, want 1", got)
+	}
+}
+
 func TestRetryRoundTripper_PermanentError_stops_retry(t *testing.T) {
 	var calls atomic.Int32
 	permErr := httpx.Permanent(errors.New("do not retry"))
@@ -637,7 +736,7 @@ func TestRetryRoundTripper_GetBody_error_aborts_retry(t *testing.T) {
 }
 
 func TestRetryRoundTripper_cancel_after_retryable_response_skips_onRetry(t *testing.T) {
-	var calls atomic.Int32
+	var calls, closed atomic.Int32
 	var onRetryCalls atomic.Int32
 	ctx, cancel := context.WithCancel(t.Context())
 	transport := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
@@ -645,7 +744,7 @@ func TestRetryRoundTripper_cancel_after_retryable_response_skips_onRetry(t *test
 		cancel()
 		return &http.Response{
 			StatusCode: http.StatusServiceUnavailable,
-			Body:       io.NopCloser(strings.NewReader("")),
+			Body:       &trackingCloser{Reader: strings.NewReader(""), onClose: func() { closed.Add(1) }},
 			Header:     http.Header{},
 		}, nil
 	})
@@ -666,11 +765,14 @@ func TestRetryRoundTripper_cancel_after_retryable_response_skips_onRetry(t *test
 	if got := onRetryCalls.Load(); got != 0 {
 		t.Errorf("OnRetry calls = %d, want 0 (no retry once context is cancelled)", got)
 	}
+	if got := closed.Load(); got != 1 {
+		t.Errorf("discarded body closes = %d, want 1", got)
+	}
 }
 
-// TestRetryRoundTripper_defaultCheckRetry_status_table pins the built-in policy:
-// 429/502/503/504 retry; 200/4xx and (notably) 500 do NOT. The 500 exclusion is
-// a documented divergence from the one-shot Retry helper.
+// TestRetryRoundTripper_defaultCheckRetry_status_table pins the built-in
+// policy at IsRetryableStatus: 408, 429 and 5xx retry; 2xx, other 4xx, the
+// repeating 5xx answers and an invalid 6xx do not.
 func TestRetryRoundTripper_defaultCheckRetry_status_table(t *testing.T) {
 	t.Parallel()
 	statusCalls := func(t *testing.T, code, wantCalls int) {
@@ -694,10 +796,10 @@ func TestRetryRoundTripper_defaultCheckRetry_status_table(t *testing.T) {
 			t.Errorf("code %d: calls = %d, want %d", code, got, wantCalls)
 		}
 	}
-	for _, code := range []int{200, 400, 401, 403, 404, 500} {
+	for _, code := range []int{200, 400, 401, 403, 404, 501, 505, 511, 600} {
 		statusCalls(t, code, 1) // not retried
 	}
-	for _, code := range []int{429, 502, 503, 504} {
+	for _, code := range []int{408, 429, 500, 502, 503, 504} {
 		statusCalls(t, code, 3) // retried to exhaustion
 	}
 }

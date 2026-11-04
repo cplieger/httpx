@@ -9,10 +9,14 @@ import (
 	"log"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/iotest"
 	"testing/synctest"
@@ -214,6 +218,38 @@ func TestGetBytes_exhausts_on_persistent_failure(t *testing.T) {
 	}
 }
 
+// TestGetBytes_permanent_status_on_final_attempt_is_not_exhaustion pins that a
+// settled answer on the last attempt is returned as itself: the budget was not
+// what stopped the loop.
+func TestGetBytes_permanent_status_on_final_attempt_is_not_exhaustion(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	_, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL,
+		httpx.WithMaxAttempts(2), httpx.WithBaseDelay(time.Millisecond), httpx.WithLogger(bufLogger(&buf)))
+	statusErr, ok := errors.AsType[*httpx.StatusError](err)
+	if !ok || statusErr.Code != http.StatusNotFound {
+		t.Fatalf("GetBytes(503 then 404) err = %v, want a *StatusError with Code 404", err)
+	}
+	if strings.Contains(err.Error(), "retries exhausted") {
+		t.Errorf("GetBytes(503 then 404) err = %q, want no exhaustion wrap", err)
+	}
+	if strings.Contains(buf.String(), "retries exhausted") {
+		t.Errorf("log = %q, want no exhaustion line", buf.String())
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("server call count = %d, want 2", got)
+	}
+}
+
 // TestGetBytes_aborts_on_context_cancellation pins that a cancel landing during
 // a backoff sleep aborts the loop instead of spending another attempt.
 //
@@ -273,6 +309,9 @@ func TestGetBytes_body_size_limit(t *testing.T) {
 	}
 	if tooLarge.Limit != 10<<20 {
 		t.Errorf("ResponseTooLargeError.Limit = %d, want %d", tooLarge.Limit, int64(10<<20))
+	}
+	if err.Error() != tooLarge.Error() {
+		t.Errorf("Retry(oversize) error = %q, want the *ResponseTooLargeError itself, unwrapped", err)
 	}
 }
 
@@ -412,6 +451,9 @@ func TestGetBytes_returns_typed_StatusError_on_exhaustion(t *testing.T) {
 	if target.Code != 503 {
 		t.Errorf("Code = %d, want 503", target.Code)
 	}
+	if target.URL != srv.URL {
+		t.Errorf("URL = %q, want %q", target.URL, srv.URL)
+	}
 	if !errors.Is(err, httpx.ErrServerError) {
 		t.Error("want errors.Is(ErrServerError)")
 	}
@@ -451,6 +493,9 @@ func TestGetBytes_4xx_returns_typed_StatusError(t *testing.T) {
 	}
 	if target.Code != 404 {
 		t.Errorf("Code = %d, want 404", target.Code)
+	}
+	if target.URL != srv.URL {
+		t.Errorf("URL = %q, want %q", target.URL, srv.URL)
 	}
 }
 
@@ -592,6 +637,88 @@ func TestGetBytes_non_transient_transport_error_fails_fast(t *testing.T) {
 	if strings.Contains(err.Error(), "retries exhausted") {
 		t.Error("non-transient transport error should fail fast, not exhaust retries")
 	}
+}
+
+// TestGetBytes_non_retryable_transport_error_is_redacted pins GetBytes's
+// contract that every returned error is redacted: net/http's *url.Error
+// carries the request URL, query secret included.
+func TestGetBytes_non_retryable_transport_error_is_redacted(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("permanent transport failure")
+		}),
+	}
+	_, err := httpx.GetBytes(t.Context(), client, "http://example.com/feed?api_key=hunter2", shortOpts()...)
+	if err == nil {
+		t.Fatal("GetBytes err = nil, want the transport failure")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("GetBytes err = %q, want the URL's secret absent", err)
+	}
+}
+
+// TestGetBytes_exhausted_transport_error_is_redacted pins the same contract on
+// the exhaustion path, which wraps the last attempt's *url.Error.
+func TestGetBytes_exhausted_transport_error_is_redacted(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, io.ErrUnexpectedEOF
+		}),
+	}
+	_, err := httpx.GetBytes(t.Context(), client, "http://example.com/feed?api_key=hunter2",
+		httpx.WithMaxAttempts(2), httpx.WithBaseDelay(time.Millisecond))
+	if err == nil || !strings.Contains(err.Error(), "retries exhausted") {
+		t.Fatalf("GetBytes err = %v, want the exhaustion error", err)
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("GetBytes err = %q, want the URL's secret absent", err)
+	}
+}
+
+// TestGetBytes_closes_every_discarded_body pins that a retried status and a
+// permanent one both release their response, so no connection is leaked.
+func TestGetBytes_closes_every_discarded_body(t *testing.T) {
+	var closed atomic.Int32
+	var calls atomic.Int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			code := http.StatusServiceUnavailable
+			if calls.Add(1) == 2 {
+				code = http.StatusNotFound
+			}
+			return &http.Response{
+				StatusCode: code,
+				Header:     http.Header{},
+				Body:       &trackingCloser{Reader: strings.NewReader("discarded"), onClose: func() { closed.Add(1) }},
+			}, nil
+		}),
+	}
+	_, err := httpx.GetBytes(t.Context(), client, "http://example.com/feed", shortOpts()...)
+	if _, ok := errors.AsType[*httpx.StatusError](err); !ok {
+		t.Fatalf("GetBytes(503 then 404) err = %v, want a *StatusError", err)
+	}
+	if got := closed.Load(); got != 2 {
+		t.Errorf("body closes = %d, want 2 (the 503 and the 404)", got)
+	}
+}
+
+// TestGetBytes_logs_slow_successful_attempt pins that GetBytes reports an
+// attempt slower than 10s; the fake clock makes the handler's delay instant.
+func TestGetBytes_logs_slow_successful_attempt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(11 * time.Second)
+			_, _ = w.Write([]byte("ok"))
+		}))
+		var buf bytes.Buffer
+		body, err := httpx.GetBytes(t.Context(), srv.Client(), srv.URL, httpx.WithLogger(bufLogger(&buf)))
+		if err != nil || string(body) != "ok" {
+			t.Fatalf("GetBytes = %q, %v, want \"ok\", nil", body, err)
+		}
+		if !strings.Contains(buf.String(), "slow upstream response") {
+			t.Errorf("log = %q, want the slow-upstream line", buf.String())
+		}
+	})
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -950,8 +1077,8 @@ func TestGetBytes_cancel_during_backoff_aborts_before_next_attempt(t *testing.T)
 // exercising Do's RetryAfterHint honoring.
 type retryAfterHintErr struct{ d time.Duration }
 
-func (e *retryAfterHintErr) Error() string                 { return "rate limited" }
-func (e *retryAfterHintErr) IsTransient() bool             { return true }
+func (*retryAfterHintErr) Error() string                   { return "rate limited" }
+func (*retryAfterHintErr) IsTransient() bool               { return true }
 func (e *retryAfterHintErr) RetryAfterHint() time.Duration { return e.d }
 
 // TestDo_honorsRetryAfterHint proves a transient error that implements
@@ -1023,5 +1150,164 @@ func TestDo_ignoresNonPositiveHint(t *testing.T) {
 		}, httpx.WithMaxAttempts(2), httpx.WithBaseDelay(time.Millisecond), httpx.WithLabel("hint-test"))
 	if err != nil || got != 7 || calls != 2 {
 		t.Fatalf("err=%v got=%d calls=%d, want nil/7/2", err, got, calls)
+	}
+}
+
+// TestOneRetryRule pins one status rule behind every door: over every code
+// net/http parses from a status line (000-999), a status error reports itself
+// transient, and the transport's default policy retries it, exactly when
+// IsRetryableStatus says so; every transport-error class gets one verdict from
+// IsTransient and the transport alike.
+func TestOneRetryRule(t *testing.T) {
+	t.Parallel()
+	transportRetries := func(t *testing.T, answer func() (*http.Response, error)) bool {
+		t.Helper()
+		var calls atomic.Int32
+		rt := httpx.NewRetryRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return answer()
+		}), httpx.TransportConfig{MaxAttempts: 2, BaseDelay: time.Nanosecond})
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com/rule", http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp, err := rt.RoundTrip(req); err == nil {
+			resp.Body.Close()
+		}
+		return calls.Load() == 2
+	}
+	for code := range 1000 {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			t.Parallel()
+			want := httpx.IsRetryableStatus(code)
+			if got := (&httpx.HTTPStatusError{Code: code}).IsTransient(); got != want {
+				t.Errorf("HTTPStatusError{%d}.IsTransient() = %v, IsRetryableStatus = %v", code, got, want)
+			}
+			got := transportRetries(t, func() (*http.Response, error) {
+				return &http.Response{StatusCode: code, Body: http.NoBody, Header: http.Header{}}, nil
+			})
+			if got != want {
+				t.Errorf("transport default retried HTTP %d = %v, IsRetryableStatus = %v", code, got, want)
+			}
+		})
+	}
+	classes := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"timeout", &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}, true},
+		{"reset", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, true},
+		{"refused", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, true},
+		{"broken_pipe", &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}, true},
+		{"unexpected_eof", io.ErrUnexpectedEOF, true},
+		{"dns", &net.DNSError{Err: "no such host", Name: "example.invalid", IsNotFound: true}, true},
+		{"permanent", httpx.Permanent(syscall.ECONNRESET), false},
+		{"caller_canceled", context.Canceled, false},
+		{"plain", errors.New("plain"), false},
+	}
+	for _, tc := range classes {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := httpx.IsTransient(tc.err); got != tc.want {
+				t.Errorf("IsTransient(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+			if got := transportRetries(t, func() (*http.Response, error) { return nil, tc.err }); got != tc.want {
+				t.Errorf("transport default retried %v = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+	t.Run("server_closed", func(t *testing.T) {
+		t.Parallel()
+		addr, accepts := hangUpServer(t, false)
+		err := get(t, &http.Client{}, "http://"+addr+"/")
+		if !httpx.IsTransient(err) {
+			t.Errorf("IsTransient(%v) = false, want true", err)
+		}
+		client := &http.Client{Transport: httpx.NewRetryRoundTripper(nil, httpx.TransportConfig{MaxAttempts: 2, BaseDelay: time.Nanosecond})}
+		_ = get(t, client, "http://"+addr+"/")
+		if got := accepts.Load(); got != 3 {
+			t.Errorf("connections = %d, want 3: one for the plain client, two for the transport's retry", got)
+		}
+	})
+	t.Run("server_closed_post_not_retried", func(t *testing.T) {
+		t.Parallel()
+		addr, accepts := hangUpServer(t, false)
+		client := &http.Client{Transport: httpx.NewRetryRoundTripper(nil, httpx.TransportConfig{MaxAttempts: 2, BaseDelay: time.Nanosecond})}
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+addr+"/", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			t.Fatal("POST to a hang-up server succeeded, want a transport error")
+		}
+		if got := accepts.Load(); got != 1 {
+			t.Errorf("connections = %d, want 1: a POST is sent once", got)
+		}
+		if !errors.Is(err, io.EOF) {
+			t.Errorf("errors.Is(%v, io.EOF) = false, want true", err)
+		}
+		if !strings.Contains(err.Error(), "server closed the connection before responding") {
+			t.Errorf("err = %q, want the hang-up named", err)
+		}
+	})
+}
+
+// TestRetryRoundTripper_empty_method_is_GET pins that a request with no method,
+// which net/http sends as a GET, is retried as one.
+func TestRetryRoundTripper_empty_method_is_GET(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	rt := httpx.NewRetryRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody, Header: http.Header{}}, nil
+	}), httpx.TransportConfig{BaseDelay: time.Nanosecond})
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.invalid/", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Method = ""
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip err = %v, want the 503", err)
+	}
+	resp.Body.Close()
+	if got := calls.Load(); got != httpx.DefaultMaxAttempts {
+		t.Errorf("calls = %d, want %d", got, httpx.DefaultMaxAttempts)
+	}
+}
+
+// TestRetryRoundTripper_body_without_GetBody_is_sent_once pins that a request
+// whose body cannot be rewound is never replayed, whatever its method: a retry
+// would send the drained body.
+func TestRetryRoundTripper_body_without_GetBody_is_sent_once(t *testing.T) {
+	t.Parallel()
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			rt := httpx.NewRetryRoundTripper(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				_, _ = io.Copy(io.Discard, r.Body)
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody, Header: http.Header{}}, nil
+			}), httpx.TransportConfig{BaseDelay: time.Nanosecond, RetryNonIdempotent: true})
+			req, err := http.NewRequestWithContext(t.Context(), method, "http://example.invalid/", io.NopCloser(strings.NewReader("payload")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.GetBody != nil {
+				t.Fatal("setup: GetBody set, want a body that cannot be rewound")
+			}
+			resp, err := rt.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip err = %v, want the 503", err)
+			}
+			resp.Body.Close()
+			if got := calls.Load(); got != 1 {
+				t.Errorf("calls = %d, want 1", got)
+			}
+		})
 	}
 }

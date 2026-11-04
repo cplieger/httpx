@@ -65,7 +65,7 @@ if err := httpx.CheckHTTPStatus(resp); err != nil {
 
 - Retry: `Do[T]`, `GetBytes`, `NewRetryRoundTripper`, `NewRetryClient` and `NewClient`, with their options, `TransportConfig` and `ContextWithDefaultTimeout`.
 - Backoff and Retry-After: `JitteredBackoff`, `SafeDouble`, `SleepCtx`, `ParseRetryAfter`, `ParseRetryAfterResponse`.
-- Classification: `IsTransient`, `Permanent`, `MarkTransient`, `AttemptTimeout`, `IsRetryableStatus`, the `Transient` and `RetryAfterHint` interfaces.
+- Classification: `IsTransient`, `Permanent`, `MarkTransient`, `AttemptTimeout`, `IsRetryableStatus`, `CauseOf` with its `Cause` names, the `Transient` and `RetryAfterHint` interfaces.
 - Status and errors: `CheckHTTPStatus` and the `AuthError`, `RateLimitError`, `HTTPStatusError`, `StatusError` and `ResponseTooLargeError` types.
 - Redirects: `DefaultRedirectPolicy`, `RefuseAllRedirects` and `RedirectPolicyFunc` with its options, and the `RedirectRefusedError` every hard refusal returns.
 - TLS: `CATransport` pins a private CA, `CloneDefaultTransport`, and the `certtest` package for tests.
@@ -78,7 +78,7 @@ The full reference is on [pkg.go.dev](https://pkg.go.dev/github.com/cplieger/htt
 
 `Do`, `GetBytes` and the retrying transport each count total attempts, three by default. Between attempts they wait a random time between half and all of a delay that starts at one second and doubles. In `GetBytes` and the transport, a `Retry-After` header replaces that wait, capped at 60 seconds.
 
-The three entry points retry different failures on purpose. All of them retry transient network errors. `GetBytes` also retries 408, 429 and every 5xx. The transport also retries 429, 502, 503 and 504. It retries only GET, HEAD, OPTIONS and TRACE unless you set `RetryNonIdempotent`. With that set, a request with a body is retried only when it has a `GetBody` function to replay the body. `Do` treats a `*RateLimitError` as final unless you pass `WithRateLimitRetry`.
+All three entry points retry transient network errors and apply one status rule, `IsRetryableStatus`: 408, 429 and 500 to 599, except the 501, 505, 506, 508, 510 and 511 answers that repeat. `Do` gets a 429 from `CheckHTTPStatus` as a `*RateLimitError`, which it treats as final unless you pass `WithRateLimitRetry`. The transport retries only GET, HEAD, OPTIONS and TRACE unless you set `RetryNonIdempotent`, and a request with a body only when it has a `GetBody` function to replay the body. `Do` never sees the request, so around a non-idempotent one, return `Permanent(err)` for a failure you must not repeat.
 
 When the transport runs out of attempts, it hands back the last response as a normal response, with a nil error, even when that response is a 503. So check `resp.StatusCode` and close the body.
 
