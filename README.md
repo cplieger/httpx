@@ -1,5 +1,8 @@
 # httpx
 
+> Moved to [`github.com/cplieger/go/httpclient`](https://github.com/cplieger/go/tree/dev/httpclient) and renamed `httpclient`.
+> **Archived 2026-11-07. This repository is read-only. The published Go module stays available.**
+
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/httpx/v5.svg)](https://pkg.go.dev/github.com/cplieger/httpx/v5) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/httpx)](https://github.com/cplieger/httpx/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/httpx/badges/mutation.json)](https://github.com/cplieger/httpx/issues?q=label%3Agremlins-tracker)
 
 httpx makes your Go HTTP calls survive flaky servers, with retries, backoff and Retry-After built in.
